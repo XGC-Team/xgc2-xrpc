@@ -64,8 +64,8 @@ pub struct Limits {
     pub header_timeout: Duration,
     pub idle_timeout: Duration,
     pub client_reference_idle_timeout: Duration,
-    /// Configured per-reference ceiling. HTTP uses one native connection per
-    /// endpoint and transport-policy session, even when this ceiling is larger.
+    /// HTTP connection ceiling per endpoint and compatible transport policy.
+    /// The lazy pool also respects the selected Runtime's global ceiling.
     pub client_connections: usize,
     pub call_timeout: Duration,
     pub shutdown_timeout: Duration,

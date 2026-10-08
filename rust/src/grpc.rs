@@ -1185,6 +1185,7 @@ impl Service<Request<BoxBody>> for GrpcClient {
         )
     }
     fn call(&mut self, mut request: Request<BoxBody>) -> Self::Future {
+        let started = Instant::now();
         let session = self.session.clone();
         let instance = self.instance_id.clone();
         Box::pin(async move {
@@ -1224,6 +1225,7 @@ impl Service<Request<BoxBody>> for GrpcClient {
             let budget = deadline(request.headers(), Duration::from_secs(86400))
                 .map_err(|e| call_error(Disposition::NotSent, e.to_string()))?
                 .min(limits.call_timeout);
+            let deadline = started + budget;
             // The native deadline itself is shortened, including streaming receives.
             request
                 .headers_mut()
@@ -1243,6 +1245,12 @@ impl Service<Request<BoxBody>> for GrpcClient {
                 .sum::<usize>();
             if request.headers().len() > limits.header_count || header_bytes > limits.header_bytes {
                 return Err(call_error(Disposition::NotSent, "metadata exceeds limit"));
+            }
+            if Instant::now() >= deadline {
+                return Err(call_error(
+                    Disposition::NotSent,
+                    "gRPC caller deadline exceeded before admission",
+                ));
             }
             let local = session
                 .calls
@@ -1266,14 +1274,13 @@ impl Service<Request<BoxBody>> for GrpcClient {
                 .0
                 .ensure_open()
                 .map_err(|e| call_error(Disposition::NotSent, e.to_string()))?;
-            let deadline = Instant::now() + budget;
             let selected = session.runtime.0.handle.clone();
             let sent = Arc::new(AtomicU8::new(0));
             let work_sent = sent.clone();
             // The channel, native timer and request encoding are polled on the
             // chosen process runtime, even when a consumer has another Tokio loop.
             let work = selected.spawn(async move {
-                let request = request.map(|body| {
+                let mut request = request.map(|body| {
                     GuardBody::retaining(
                         body,
                         session.limits.rpc.body_bytes,
@@ -1287,6 +1294,29 @@ impl Service<Request<BoxBody>> for GrpcClient {
                     std::future::poll_fn(|cx| channel.poll_ready(cx))
                         .await
                         .map_err(|e| call_error(Disposition::NotSent, e.to_string()))?;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(call_error(
+                            Disposition::NotSent,
+                            "gRPC caller deadline exceeded before send",
+                        ));
+                    }
+                    request
+                        .headers_mut()
+                        .insert("grpc-timeout", timeout_header(remaining).parse().unwrap());
+                    let header_bytes = request
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| k.as_str().len() + v.as_bytes().len() + 32)
+                        .sum::<usize>();
+                    if request.headers().len() > session.limits.rpc.header_count
+                        || header_bytes > session.limits.rpc.header_bytes
+                    {
+                        return Err(call_error(
+                            Disposition::NotSent,
+                            "metadata exceeds limit after native timeout encoding",
+                        ));
+                    }
                     work_sent.store(1, Ordering::Release);
                     channel
                         .call(request)

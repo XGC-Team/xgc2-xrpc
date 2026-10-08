@@ -34,6 +34,7 @@ struct Message {
 #[derive(Default)]
 struct Work {
     calls: AtomicUsize,
+    received_budget: Mutex<Option<Duration>>,
     entered: Mutex<bool>,
     released: Mutex<bool>,
     changed: Condvar,
@@ -88,6 +89,9 @@ impl UnaryService<Message> for Unary {
                     .to_str()
                     .unwrap()
             );
+            if request.get_ref().text == "remaining-budget" {
+                *work.received_budget.lock().unwrap() = Some(context.remaining());
+            }
             if request.get_ref().text == "starve" {
                 *work.entered.lock().unwrap() = true;
                 work.changed.notify_all();
@@ -1380,6 +1384,206 @@ impl Stream for LatePoll {
         }
     }
 }
+#[test]
+fn native_client_propagates_remaining_budget_after_queued_future() {
+    use http_body_util::BodyExt;
+    use prost::Message as _;
+    let dir = private_dir();
+    let path = dir.path().join("grpc.sock");
+    let mut runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let work = Arc::new(Work::default());
+    let mut host = GrpcHost::bind(
+        &runtime,
+        &path,
+        "instance.1".into(),
+        GrpcLimits::default(),
+        false,
+        Echo(work.clone()),
+    )
+    .unwrap();
+    let mut client = GrpcClient::unix(&runtime.handle(), &path, "instance.1").unwrap();
+    native_runtime().block_on(async {
+        std::future::poll_fn(|cx| client.poll_ready(cx))
+            .await
+            .unwrap();
+        let payload = Message {
+            text: "remaining-budget".into(),
+        }
+        .encode_to_vec();
+        let mut wire = vec![0];
+        wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire.extend(payload);
+        let body = http_body_util::Full::new(bytes::Bytes::from(wire))
+            .map_err(|never| -> Status { match never {} })
+            .boxed_unsync();
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://localhost/test.Echo/Unary")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("x-request-id", "remaining.1")
+            .header("x-xrpc-instance-id", "instance.1")
+            .header("grpc-timeout", "200m")
+            .body(body)
+            .unwrap();
+        let future = client.call(request);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let response = future.await.unwrap();
+        let initial = response.headers().get("grpc-status").cloned();
+        let body = response.into_body().collect().await.unwrap();
+        let status = initial.or_else(|| {
+            body.trailers()
+                .and_then(|trailers| trailers.get("grpc-status").cloned())
+        });
+        assert_eq!(status.unwrap().to_str().unwrap(), "0");
+        assert_eq!(work.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            work.received_budget.lock().unwrap().unwrap() <= Duration::from_millis(100),
+            "the server must receive only the original call's remaining budget"
+        );
+    });
+    drop(client);
+    host.close().unwrap();
+    runtime.close(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn native_client_rechecks_metadata_cap_when_remaining_timeout_encoding_grows() {
+    use http_body_util::BodyExt;
+    use prost::Message as _;
+    let dir = private_dir();
+    let path = dir.path().join("grpc.sock");
+    let mut runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let work = Arc::new(Work::default());
+    let mut host = GrpcHost::bind(
+        &runtime,
+        &path,
+        "instance.1".into(),
+        GrpcLimits::default(),
+        false,
+        Echo(work.clone()),
+    )
+    .unwrap();
+    let mut limits = GrpcLimits::default();
+    limits.rpc.header_bytes = 8192;
+    let mut client =
+        GrpcClient::unix_with_limits(&runtime.handle(), &path, "instance.1", limits).unwrap();
+    native_runtime().block_on(async {
+        std::future::poll_fn(|cx| client.poll_ready(cx))
+            .await
+            .unwrap();
+        let payload = Message {
+            text: "bounded-metadata".into(),
+        }
+        .encode_to_vec();
+        let mut wire = vec![0];
+        wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire.extend(payload);
+        let body = http_body_util::Full::new(bytes::Bytes::from(wire))
+            .map_err(|never| -> Status { match never {} })
+            .boxed_unsync();
+        let mut request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://localhost/test.Echo/Unary")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("x-request-id", "metadata-grow.1")
+            .header("x-xrpc-instance-id", "instance.1")
+            .header("grpc-timeout", "100000u")
+            .body(body)
+            .unwrap();
+        let initial_bytes = request
+            .headers()
+            .iter()
+            .map(|(key, value)| key.as_str().len() + value.as_bytes().len() + 32)
+            .sum::<usize>();
+        let padding = "x".repeat(8192 - initial_bytes - "x-budget-pad".len() - 32);
+        request
+            .headers_mut()
+            .insert("x-budget-pad", padding.parse().unwrap());
+        assert_eq!(
+            request
+                .headers()
+                .iter()
+                .map(|(key, value)| key.as_str().len() + value.as_bytes().len() + 32)
+                .sum::<usize>(),
+            8192
+        );
+        let future = client.call(request);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let error = future.await.unwrap_err();
+        assert_eq!(error.disposition, xgc2_xrpc::Disposition::NotSent);
+        assert!(error.message.contains("after native timeout encoding"));
+        assert_eq!(work.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.handle().stats().outbound_calls, 0);
+    });
+    drop(client);
+    host.close().unwrap();
+    runtime.close(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn native_client_call_entry_budget_includes_time_before_future_first_poll() {
+    use http_body_util::BodyExt;
+    use prost::Message as _;
+    let dir = private_dir();
+    let path = dir.path().join("grpc.sock");
+    let mut runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let work = Arc::new(Work::default());
+    let mut host = GrpcHost::bind(
+        &runtime,
+        &path,
+        "instance.1".into(),
+        GrpcLimits::default(),
+        false,
+        Echo(work.clone()),
+    )
+    .unwrap();
+    let mut client = GrpcClient::unix(&runtime.handle(), &path, "instance.1").unwrap();
+    native_runtime().block_on(async {
+        unary(
+            client.clone(),
+            request("entry-positive", Some(Duration::from_millis(200))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(work.calls.load(Ordering::SeqCst), 1);
+        std::future::poll_fn(|cx| client.poll_ready(cx))
+            .await
+            .unwrap();
+        let payload = Message {
+            text: "expired-before-poll".into(),
+        }
+        .encode_to_vec();
+        let mut wire = vec![0];
+        wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire.extend(payload);
+        let body = http_body_util::Full::new(bytes::Bytes::from(wire))
+            .map_err(|never| -> Status { match never {} })
+            .boxed_unsync();
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://localhost/test.Echo/Unary")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("x-request-id", "entry-expired.1")
+            .header("x-xrpc-instance-id", "instance.1")
+            .header("grpc-timeout", "20m")
+            .body(body)
+            .unwrap();
+        let future = client.call(request);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let error = future.await.unwrap_err();
+        assert_eq!(error.disposition, xgc2_xrpc::Disposition::NotSent);
+        assert!(error.message.contains("before admission"));
+        assert_eq!(work.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.handle().stats().outbound_calls, 0);
+    });
+    drop(client);
+    host.close().unwrap();
+    runtime.close(Duration::from_secs(2)).unwrap();
+}
+
 #[test]
 fn native_stream_does_not_publish_late_frame_or_successful_eof() {
     for text in ["postpoll-frame", "postpoll-eof"] {
