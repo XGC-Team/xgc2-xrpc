@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xgc2-xrpc"
+version = "0.1.0"
+description = "Bounded XGC HTTP RPC hosts and clients"
+requires-python = ">=3.10"
+dependencies = ["aiohttp==3.14.4", "httpx==0.28.1", "httpcore==1.0.9"]
+license = {text = "Apache-2.0"}
+
+[project.optional-dependencies]
+grpc = ["grpcio==1.84.0"]
+
+[tool.setuptools.package-data]
+xgc2_xrpc = ["_runtime_policy.json"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xgc2_xrpc*"]
