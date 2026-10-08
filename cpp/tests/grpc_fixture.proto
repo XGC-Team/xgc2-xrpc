@@ -1,0 +1,15 @@
+syntax = "proto3";
+package xgc2.xrpc.test;
+// Test-only domain fixture; never installed as an SDK/domain contract.
+message Packet { string value = 1; }
+service Fixture {
+  rpc Echo(Packet) returns (Packet);
+  rpc Upload(stream Packet) returns (Packet);
+  rpc Watch(Packet) returns (stream Packet);
+  rpc Chat(stream Packet) returns (stream Packet);
+  rpc Discover(Packet) returns (Packet);
+  rpc InvalidStreamingDiscovery(stream Packet) returns (stream Packet);
+}
+// Two independent generated services share one host/admission in the test.
+service ReverseOne { rpc Connect(stream Packet) returns (stream Packet); }
+service ReverseTwo { rpc Connect(stream Packet) returns (stream Packet); }
