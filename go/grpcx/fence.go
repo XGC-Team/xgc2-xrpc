@@ -62,9 +62,12 @@ func validateAuthMetadata(md metadata.MD) error {
 	return nil
 }
 
-func clientMetadata(ctx context.Context, ref xrpc.ServiceRef, auth metadata.MD) (context.Context, error) {
+func clientMetadata(ctx context.Context, ref xrpc.ServiceRef, auth metadata.MD, boundAuthorization bool) (context.Context, error) {
 	md, _ := metadata.FromOutgoingContext(ctx)
 	md = md.Copy()
+	if boundAuthorization && len(md.Get("authorization")) != 0 {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: caller authorization belongs to bootstrap owner"))
+	}
 	for name := range md {
 		if name != strings.ToLower(name) {
 			return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: metadata names must be canonical lowercase"))
@@ -174,7 +177,7 @@ func clientUnary(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, b
 		ctx, cancel := context.WithTimeout(ctx, limits.MaxCallTime)
 		defer cancel()
 		var err error
-		ctx, err = clientMetadata(ctx, ref, limits.Metadata)
+		ctx, err = clientMetadata(ctx, ref, limits.Metadata, limits.boundAuthorization)
 		if err != nil {
 			return err
 		}
@@ -209,7 +212,7 @@ func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, 
 		}
 		ctx, budgetCancel := context.WithTimeout(ctx, limits.MaxCallTime)
 		var err error
-		ctx, err = clientMetadata(ctx, ref, limits.Metadata)
+		ctx, err = clientMetadata(ctx, ref, limits.Metadata, limits.boundAuthorization)
 		if err != nil {
 			budgetCancel()
 			return nil, err

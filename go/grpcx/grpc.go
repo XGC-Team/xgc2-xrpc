@@ -30,6 +30,7 @@ import (
 )
 
 type DialOptions struct {
+	boundAuthorization   bool
 	LocalTargetID        string
 	DialContext          xrpc.DialContext
 	TLSConfig            *tls.Config
@@ -136,6 +137,9 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 }
 
 type HostOptions struct {
+	// Authorize establishes the injected transport caller grant. Product
+	// method/scope checks remain in its native interceptors.
+	Authorize                                  func(context.Context) bool
 	MaxConnections                             int
 	MaxConcurrentStreams                       uint32
 	MaxMessageBytes                            int
@@ -305,7 +309,7 @@ func serveOwned(listener net.Listener, lease *unixlease.Lease, register func(grp
 	defaults := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(limits.MaxConcurrentStreams), grpc.MaxRecvMsgSize(limits.MaxRequestBytes), grpc.MaxSendMsgSize(limits.MaxResponseBytes), grpc.MaxHeaderListSize(limits.MaxHeaderBytes),
 		grpc.ConnectionTimeout(limits.HandshakeTimeout), grpc.KeepaliveParams(connectionPolicy),
-		grpc.ChainUnaryInterceptor(func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
+		grpc.UnaryInterceptor(func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
 			if edge != nil {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, limits.MaxCallTime)
@@ -316,18 +320,36 @@ func serveOwned(listener net.Listener, lease *unixlease.Lease, register func(grp
 				return nil, err
 			}
 			defer release()
+			if limits.Authorize != nil {
+				allowed := limits.Authorize(ctx)
+				if ctx.Err() != nil {
+					return nil, status.FromContextError(ctx.Err()).Err()
+				}
+				if !allowed {
+					return nil, status.Error(codes.PermissionDenied, "caller authorization rejected")
+				}
+			}
 			result, err := next(ctx, request)
 			if err == nil && ctx.Err() != nil {
 				return nil, status.FromContextError(ctx.Err()).Err()
 			}
 			return result, err
 		}),
-		grpc.ChainStreamInterceptor(func(server any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, next grpc.StreamHandler) error {
+		grpc.StreamInterceptor(func(server any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, next grpc.StreamHandler) error {
 			release, err := admit(stream.Context())
 			if err != nil {
 				return err
 			}
 			defer release()
+			if limits.Authorize != nil {
+				allowed := limits.Authorize(stream.Context())
+				if stream.Context().Err() != nil {
+					return status.FromContextError(stream.Context().Err()).Err()
+				}
+				if !allowed {
+					return status.Error(codes.PermissionDenied, "caller authorization rejected")
+				}
+			}
 			err = next(server, stream)
 			if err == nil && stream.Context().Err() != nil {
 				return status.FromContextError(stream.Context().Err()).Err()
@@ -339,7 +361,11 @@ func serveOwned(listener net.Listener, lease *unixlease.Lease, register func(grp
 	// silently disable the SDK's transport allocation/admission caps.
 	args := append(defaults[6:], options...)
 	args = append(args, defaults[:6]...)
-	host.server = grpc.NewServer(args...)
+	var err error
+	host.server, err = newOwnedServer(args...)
+	if err != nil {
+		return nil, err
+	}
 	register(host.server)
 	go func() {
 		var serving net.Listener = limited
@@ -359,6 +385,19 @@ func serveOwned(listener net.Listener, lease *unixlease.Lease, register func(grp
 		}
 	}()
 	return host, nil
+}
+
+// Primary interceptors are reserved by the SDK. grpc-go prepends them to
+// Chain* hooks; permitting a product primary could bypass admission and auth.
+// Native duplicate-primary options panic before NewServer allocates resources.
+func newOwnedServer(options ...grpc.ServerOption) (server *grpc.Server, err error) {
+	defer func() {
+		if recover() != nil {
+			server = nil
+			err = errors.New("xrpc: invalid gRPC server options; primary interceptors belong to SDK, use ChainUnaryInterceptor/ChainStreamInterceptor")
+		}
+	}()
+	return grpc.NewServer(options...), nil
 }
 
 type tlsListener struct{ net.Listener }

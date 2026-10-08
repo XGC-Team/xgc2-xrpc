@@ -167,11 +167,11 @@ func TestKnownNotSentSurvivesProfileMapping(t *testing.T) {
 func TestMetadataCannotDuplicateWireIdentity(t *testing.T) {
 	ref := xrpc.ServiceRef{InstanceID: "boot"}
 	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(RequestIDMetadata, "a", RequestIDMetadata, "b"))
-	if _, err := clientMetadata(ctx, ref, nil); xrpc.Code(err) != "invalid_argument" {
+	if _, err := clientMetadata(ctx, ref, nil, false); xrpc.Code(err) != "invalid_argument" {
 		t.Fatal("duplicate request identity", err)
 	}
 	ctx = metadata.NewOutgoingContext(context.Background(), metadata.Pairs(InstanceIDMetadata, "other"))
-	if _, err := clientMetadata(ctx, ref, nil); xrpc.Code(err) != "invalid_argument" {
+	if _, err := clientMetadata(ctx, ref, nil, false); xrpc.Code(err) != "invalid_argument" {
 		t.Fatal("instance override", err)
 	}
 	if err := validateAuthMetadata(metadata.Pairs(RequestIDMetadata, "owned")); err == nil {

@@ -152,3 +152,11 @@ The fixture's 33 wire cases also run over real Unix sockets in an independent
 process. These tests do not claim the entire remote loss/CPU pause/OOM matrix,
 worst-case RSS, durable power-loss recovery, every product chain, or deployment
 ABI/install validation has passed. Those remain joint release evidence.
+
+Native gRPC hosts reserve `grpc.UnaryInterceptor` and `grpc.StreamInterceptor`
+for SDK admission, instance/deadline checks and caller authorization. Product
+interceptors must use `grpc.ChainUnaryInterceptor` and
+`grpc.ChainStreamInterceptor`; these run inside the SDK gate. Supplying a
+primary interceptor returns a startup error instead of bypassing that gate or
+panicking the process. SDK native message, header, stream and connection limits
+remain last in server option application and cannot be loosened by product options.
