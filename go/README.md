@@ -207,3 +207,25 @@ credential snapshots, FIFO/permission/link/size failures, and expired grant
 callbacks retaining actual work/lease ownership. These checks do not establish
 end-to-end product acceptance or sustained CPU/cache/allocation/RSS/latency
 performance; controlled heavy workloads remain separately measured.
+
+One applied process policy can provide explicit numeric role views through
+`xrpc.DerivePolicy(parent, role, map[string]int64{...})`. Existing `WithPolicy`
+adapters accept the returned view. Effective budgets are the minimum of the
+validated parent value and the declared role cap; the parent still rejects
+invalid environment values/global-ceiling violations before derivation. Views
+cannot change enums/TLS/identity, derive another view, update administrative
+settings, or create another Diagnostics owner. Inputs and query maps are copied.
+Queries include the parent value/source/global ceiling, role cap, final value
+and the shared applied revision. Different hosts still own separate actual
+admission/connection pools.
+
+Only `Diagnostics.UpdatePolicy` publishes an actually applied verbosity
+revision to the parent and all role views, using their shared atomic snapshot
+pointer and existing sink. `Policy.Update` returns a validated proposal and
+does not itself apply a logger; unpublished proposals cannot be role parents.
+A process policy permits one live Diagnostics owner, retained until its actual
+writer and owned sink finish. Derived startup checks use that same owner;
+concurrent queries and log updates do not construct independent revisions or
+read the environment again. Tests cover two native hosts enforcing 4/8-byte
+role response budgets and concurrent live updates/querying under the race
+checker.

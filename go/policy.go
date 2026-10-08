@@ -10,6 +10,12 @@ type EffectivePolicyField = policy.EffectiveField
 // ResolvePolicy consumes exactly the caller-provided startup snapshot.
 func ResolvePolicy(options PolicyOptions) (*Policy, error) { return policy.Resolve(options) }
 
+// DerivePolicy creates a read-only numeric intersection of one applied parent.
+// It shares the parent's actual revision and diagnostics owner.
+func DerivePolicy(parent *Policy, role string, ceilings map[string]int64) (*Policy, error) {
+	return policy.Derive(parent, role, ceilings)
+}
+
 var sdkDefaults = func() *Policy {
 	p, err := policy.Resolve(policy.Options{})
 	if err != nil {

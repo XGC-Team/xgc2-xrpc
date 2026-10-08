@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 //go:embed registry.json
@@ -53,25 +54,38 @@ type Options struct {
 }
 
 type EffectiveField struct {
-	Value      any    `json:"value"`
-	Source     string `json:"source"`
-	Detail     string `json:"source_detail,omitempty"`
-	Dynamic    bool   `json:"dynamic"`
-	Ceiling    int64  `json:"ceiling,omitempty"`
-	Unit       string `json:"unit,omitempty"`
-	Capability string `json:"capability"`
+	Value         any    `json:"value"`
+	Source        string `json:"source"`
+	Detail        string `json:"source_detail,omitempty"`
+	Dynamic       bool   `json:"dynamic"`
+	Ceiling       int64  `json:"ceiling,omitempty"`
+	Unit          string `json:"unit,omitempty"`
+	Capability    string `json:"capability"`
+	ParentValue   any    `json:"parent_value,omitempty"`
+	ParentSource  string `json:"parent_source,omitempty"`
+	ParentCeiling int64  `json:"parent_ceiling,omitempty"`
+	RoleCap       int64  `json:"role_cap,omitempty"`
 }
 
 type Snapshot struct {
 	Revision uint64                    `json:"revision"`
 	Fields   map[string]EffectiveField `json:"fields"`
+	Role     string                    `json:"role,omitempty"`
+	RoleCaps map[string]int64          `json:"role_caps,omitempty"`
+	Parent   *Snapshot                 `json:"parent,omitempty"`
 }
 
-// Policy is immutable. Snapshot returns a copy, safe to expose through an
-// owner's existing authenticated administrative interface.
+// Policy holds an immutable startup declaration and a shared pointer to the
+// parent's actually applied diagnostic revision. Role views have no updater or
+// independent owner. Effective returns copies for an administrative interface.
 type Policy struct {
-	revision uint64
-	fields   map[string]EffectiveField
+	revision        uint64
+	fields          map[string]EffectiveField
+	current         *atomic.Pointer[Policy]
+	role            string
+	roleCaps        map[string]int64
+	appliedFlag     atomic.Bool
+	diagnosticClaim *atomic.Bool
 }
 
 var supported = map[string]bool{
@@ -196,15 +210,68 @@ func Resolve(options Options) (*Policy, error) {
 		}
 		policy.fields[field.Name] = EffectiveField{Value: value, Source: source, Detail: detail, Dynamic: field.Dynamic, Ceiling: ceiling, Unit: field.Unit, Capability: field.Capability}
 	}
+	policy.current = &atomic.Pointer[Policy]{}
+	policy.current.Store(policy)
+	policy.appliedFlag.Store(true)
+	policy.diagnosticClaim = &atomic.Bool{}
 	return policy, nil
 }
 
-func (p *Policy) Effective() Snapshot {
-	if p == nil {
-		return Snapshot{}
+// applied reads one immutable revision; no owner locks or environment reads.
+func (p *Policy) applied() *Policy {
+	if p == nil || p.current == nil {
+		return nil
 	}
+	current := p.current.Load()
+	// Update returns a validated proposal before a Diagnostics owner applies
+	// it. Its own snapshot remains readable; actual parent/view queries still
+	// follow the published revision, and unpublished proposals cannot derive.
+	if p.role == "" && p.revision > current.revision {
+		return p
+	}
+	return current
+}
+
+func snapshot(p *Policy) Snapshot {
 	result := Snapshot{Revision: p.revision, Fields: make(map[string]EffectiveField, len(p.fields))}
 	for name, field := range p.fields {
+		result.Fields[name] = field
+	}
+	return result
+}
+
+func (p *Policy) Effective() Snapshot {
+	base := p.applied()
+	if base == nil {
+		return Snapshot{}
+	}
+	result := snapshot(base)
+	if p.role == "" {
+		return result
+	}
+	parent := snapshot(base)
+	result.Parent = &parent
+	result.Role = p.role
+	result.RoleCaps = make(map[string]int64, len(p.roleCaps))
+	for name, cap := range p.roleCaps {
+		result.RoleCaps[name] = cap
+	}
+	for name, field := range result.Fields {
+		field.ParentValue = field.Value
+		field.ParentSource = field.Source
+		field.ParentCeiling = field.Ceiling
+		if cap, ok := p.roleCaps[name]; ok {
+			field.RoleCap = cap
+			if value := field.Value.(int64); cap < value {
+				field.Value = cap
+				field.Source = "role_cap"
+			}
+			if field.Ceiling == 0 {
+				field.Ceiling = cap
+			} else {
+				field.Ceiling = min(field.Ceiling, cap)
+			}
+		}
 		result.Fields[name] = field
 	}
 	return result
@@ -214,10 +281,17 @@ func (p *Policy) Integer(name string) (int64, error) {
 	if p == nil {
 		return 0, fmt.Errorf("xrpc: resolved runtime policy is required")
 	}
-	field, ok := p.fields[name]
+	base := p.applied()
+	if base == nil {
+		return 0, fmt.Errorf("xrpc: resolved runtime policy is required")
+	}
+	field, ok := base.fields[name]
 	value, integer := field.Value.(int64)
 	if !ok || !integer {
 		return 0, fmt.Errorf("xrpc: runtime policy field %s is not supported", name)
+	}
+	if cap, ok := p.roleCaps[name]; ok {
+		value = min(value, cap)
 	}
 	return value, nil
 }
@@ -225,6 +299,10 @@ func (p *Policy) Integer(name string) (int64, error) {
 // Update returns a new snapshot only for declared live fields, after revision
 // validation. Logging verbosity can change live; transport fields require restart.
 func (p *Policy) Update(expected uint64, updates map[string]string) (*Policy, error) {
+	if p != nil && p.role != "" {
+		return nil, fmt.Errorf("xrpc: role policy is read-only; update the parent diagnostics owner")
+	}
+	p = p.applied()
 	if p == nil || expected != p.revision {
 		return nil, fmt.Errorf("xrpc: runtime policy revision conflict")
 	}
@@ -243,7 +321,7 @@ func (p *Policy) Update(expected uint64, updates map[string]string) (*Policy, er
 			return nil, fmt.Errorf("xrpc: runtime policy field %s requires restart", name)
 		}
 	}
-	result := &Policy{revision: p.revision + 1, fields: make(map[string]EffectiveField, len(p.fields))}
+	result := &Policy{revision: p.revision + 1, fields: make(map[string]EffectiveField, len(p.fields)), current: p.current, diagnosticClaim: p.diagnosticClaim}
 	for name, field := range p.fields {
 		result.fields[name] = field
 	}
@@ -266,4 +344,87 @@ func (p *Policy) Update(expected uint64, updates map[string]string) (*Policy, er
 		result.fields[name] = field
 	}
 	return result, nil
+}
+
+// Derive intersects supported numeric budgets after strict parent resolution.
+// It never resolves another environment, changes enums or creates an owner.
+func Derive(parent *Policy, role string, ceilings map[string]int64) (*Policy, error) {
+	if parent == nil || parent.current == nil || parent.role != "" || !parent.appliedFlag.Load() {
+		return nil, fmt.Errorf("xrpc: applied resolved parent policy required")
+	}
+	if len(role) == 0 || len(role) > 128 {
+		return nil, fmt.Errorf("xrpc: canonical role identity required")
+	}
+	for _, c := range role {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._:-", c)) {
+			return nil, fmt.Errorf("xrpc: canonical role identity required")
+		}
+	}
+	base := parent.current.Load()
+	caps := make(map[string]int64, len(ceilings))
+	for name, cap := range ceilings {
+		var field Field
+		found := false
+		for _, known := range registry.Fields {
+			if known.Name == name {
+				field = known
+				found = true
+				break
+			}
+		}
+		if !found || field.Type != "integer" {
+			return nil, fmt.Errorf("xrpc: role ceiling requires a supported integer budget %s", name)
+		}
+		if _, ok := base.fields[name]; !ok {
+			return nil, fmt.Errorf("xrpc: role ceiling requires a supported integer budget %s", name)
+		}
+		maximum := registry.IntegerMax
+		if field.Maximum > 0 {
+			maximum = min(maximum, field.Maximum)
+		}
+		if cap < 1 || cap > maximum {
+			return nil, fmt.Errorf("xrpc: role ceiling exceeds numeric range %s", name)
+		}
+		caps[name] = cap
+	}
+	return &Policy{current: parent.current, role: role, roleCaps: caps, diagnosticClaim: parent.diagnosticClaim}, nil
+}
+func IsRole(p *Policy) bool { return p != nil && p.role != "" }
+
+// PublishApplied is called only after the existing diagnostic owner applies
+// verbosity. Staged Policy.Update proposals do not claim actual activation.
+func PublishApplied(next *Policy, expected uint64) error {
+	if next == nil || next.current == nil || next.role != "" {
+		return fmt.Errorf("xrpc: applied parent policy required")
+	}
+	current := next.current.Load()
+	if current.revision != expected {
+		return fmt.Errorf("xrpc: runtime policy revision conflict")
+	}
+	if next.revision == expected {
+		return nil
+	}
+	if next.revision != expected+1 || !next.current.CompareAndSwap(current, next) {
+		return fmt.Errorf("xrpc: runtime policy revision conflict")
+	}
+	next.appliedFlag.Store(true)
+	return nil
+}
+
+func ClaimDiagnostic(p *Policy) error {
+	if p == nil || p.current == nil || p.role != "" || !p.appliedFlag.Load() || p.diagnosticClaim == nil {
+		return fmt.Errorf("xrpc: applied parent diagnostic policy required")
+	}
+	if !p.diagnosticClaim.CompareAndSwap(false, true) {
+		return fmt.Errorf("xrpc: parent diagnostics owner already exists")
+	}
+	return nil
+}
+func ReleaseDiagnostic(p *Policy) {
+	if p != nil && p.diagnosticClaim != nil {
+		p.diagnosticClaim.Store(false)
+	}
+}
+func SameOwner(a, b *Policy) bool {
+	return a != nil && b != nil && a.current != nil && a.current == b.current
 }

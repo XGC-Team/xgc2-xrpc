@@ -72,6 +72,17 @@ Different immutable host roles may declare different defaults and ceilings,
 but there is no dynamically invented `XGC2_XRPC_<ROBOT>_*` namespace. Any
 necessary new key is first added to the common registry and conformance tests.
 
+An explicit immutable role view intersects numeric budgets with the already
+validated parent policy: `effective = min(parent value, role cap)`. This is an
+intersection of two declared boundaries, not correction of an invalid parent.
+Parent parsing still rejects invalid values or a value exceeding a global
+ceiling. A role cannot widen a parent budget, alter enums/TLS/identity, read the
+environment again, allocate another diagnostics owner or maintain its own
+mutable revision. Queries show the parent's value/source/global ceiling, the
+role cap and final value. Only the parent accepts administrative LOG_LEVEL
+updates; views follow that same revision and shared diagnostic sink. Sharing
+policy does not mean independent hosts share an actual concurrency pool.
+
 ## Configuration delivery and online application
 
 The process owner passes a versioned, bounded domain configuration document or
