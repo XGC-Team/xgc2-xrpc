@@ -6,7 +6,7 @@ const { randomUUID } = require("node:crypto");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { WebSocket, WebSocketServer } = require("ws");
-const { resolvePolicy, PolicyError, policyOptions } = require("./policy.cjs");
+const { resolvePolicy, derivePolicy, PolicyError, policyOptions } = require("./policy.cjs");
 const { HTTPClient, TransportError } = require("./client.cjs");
 const { BootstrapBinding, readBootstrapBinding, loadBootstrapInput } = require("./bootstrap.cjs");
 const { Diagnostics, DiagnosticCloseError, DiagnosticSinkError } = require("./diagnostics.cjs");
@@ -448,4 +448,4 @@ function createBoundHTTPHost(handler, options) {
     return handler(req,res,context);
   }, { ...options, tls: credentials.tls });
 }
-module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, resolvePolicy, PolicyError, HTTPClient, TransportError };
+module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, resolvePolicy, derivePolicy, PolicyError, HTTPClient, TransportError };

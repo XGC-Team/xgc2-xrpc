@@ -7,7 +7,16 @@ const { writeSync } = require("node:fs");
 // A stalled write keeps the worker alive. Main-thread close must report failed
 // quiescence, not terminate/unref the worker or abandon the admitted record.
 const queue = new Array(workerData.maxPendingRecords);
-let head = 0, length = 0, active = false;
+let head = 0, length = 0, active = false, closing = false;
+
+function maybeExit() {
+  if (!closing || active || length) return;
+  // All admitted writes have completed and their ACKs were posted. Closing the
+  // port alone does not stop a Bun worker; exit this owned worker explicitly.
+  // The parent still waits for the native Worker exit event before completing.
+  parentPort.close();
+  process.exit(0);
+}
 
 async function writeRecord(message) {
   let ok = false;
@@ -46,10 +55,11 @@ async function pump() {
     await writeRecord(message);
   }
   active = false;
+  maybeExit();
 }
 
 parentPort.on("message", (message) => {
-  if (message.kind === "close") { parentPort.close(); return; }
+  if (message.kind === "close") { closing = true; maybeExit(); return; }
   if (message.kind !== "record") return;
   if (length >= queue.length) { parentPort.postMessage({ kind: "ack", id: message.id, ok: false }); return; }
   queue[(head + length) % queue.length] = message; length++;

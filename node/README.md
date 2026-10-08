@@ -86,6 +86,26 @@ native TLS and authorization before dispatch. No credential environment
 variables or guessed paths are introduced. Native applications retain
 ownership of listen/readiness/drain/exit and create a fresh instance ID.
 
+Resolve one parent policy in the application's composition root. Where native
+host/client roles need stricter numeric budgets, use a declared immutable view:
+
+```js
+const { derivePolicy } = require("@xgc2/xrpc");
+const storagePolicy = derivePolicy(policy, {
+  role: "storage-client", ceilings: { MAX_RESPONSE_BYTES: 4 * 1024 * 1024 },
+});
+const storageClient = new HTTPClient({ policy: storagePolicy });
+```
+
+The effective budget is the smaller parent value and role cap; a view cannot
+raise a parent limit. Its query includes parent value/source/ceiling, role cap
+and final value. It shares the parent's revision, live log level and diagnostics
+owner, without another environment read or administrative update entry point.
+Invalid parent settings still fail before derivation. Hosts/clients accept
+genuine resolved or derived owners, rather than copied policy-shaped objects.
+The client intersects each finite caller timeout with `CALL_TIMEOUT_MS`,
+including role caps, before connection setup and body transmission.
+
 `createRPCHost` supplies strict metadata gating for conformance and explicitly
 owned native HTTP listeners. It does **not** add a Unix lease. It cannot be
 advertised as a complete UDS internal provider. Its handler receives deadline,

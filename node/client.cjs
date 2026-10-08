@@ -78,6 +78,7 @@ class HTTPClient {
       CLIENT_MAX_CONNECTIONS: "maxConnections", CLIENT_MAX_REFERENCES: "maxReferences",
       CLIENT_REFERENCE_IDLE_TIMEOUT_MS: "referenceIdleTimeoutMs", HOST_MAX_IN_FLIGHT: "maxInFlight",
       MAX_HEADER_BYTES: "maxHeaderBytes", MAX_REQUEST_BYTES: "maxRequestBytes", MAX_RESPONSE_BYTES: "maxResponseBytes",
+      CALL_TIMEOUT_MS: "callTimeoutMs",
     });
     this.#tls = secureClientTLS(options.tls);
     this.options = Object.freeze({ ...options, tls: undefined });
@@ -87,6 +88,8 @@ class HTTPClient {
     this.maxRequestBytes = positive(options.maxRequestBytes, 1048576, "maxRequestBytes");
     this.maxResponseBytes = positive(options.maxResponseBytes, 1048576, "maxResponseBytes");
     this.maxHeaderBytes = positive(options.maxHeaderBytes, 16384, "maxHeaderBytes");
+    this.callTimeoutMs = positive(options.callTimeoutMs, 30000, "callTimeoutMs");
+    if (this.callTimeoutMs > 86400000) throw new RangeError("callTimeoutMs exceeds wire maximum");
     this.idleMs = positive(options.referenceIdleTimeoutMs, 30000, "referenceIdleTimeoutMs");
     this.pools = new Map(); this.active = new Set(); this.closed = false;
     this.sockets = new Set(); this.shutdownReported = false;
@@ -166,6 +169,7 @@ class HTTPClient {
       identity.request_id = requestId;
       timeoutMs = positive(options.timeoutMs, null, "timeoutMs");
       if (timeoutMs > 86400000) throw new RangeError("timeoutMs exceeds wire maximum");
+      timeoutMs = Math.min(timeoutMs, this.callTimeoutMs);
       if (options.signal?.aborted) throw new TransportError("cancelled", "not_sent", "caller cancelled before admission");
       body = options.body;
       if (body != null && !Buffer.isBuffer(body) && !(body instanceof Uint8Array) && typeof body !== "string") throw new TypeError("body must be bytes or string");

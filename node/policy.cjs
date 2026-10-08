@@ -1,7 +1,10 @@
 "use strict";
 const registry = require("./runtime-policy.json");
 const { Diagnostics } = require("./diagnostics.cjs");
+const { isProxy } = require("node:util").types;
 const supported = ["host", "http", "rpc", "transport", "client_pool", "client_registry"];
+const owners = new WeakMap(); // Identity branding only; no ambient runtime owner.
+const knownFields = new Map(registry.fields.map((field) => [field.name, field]));
 class PolicyError extends Error {
   constructor(field, reason) { super(`${field}: ${reason}`); this.name = "PolicyError"; this.field = field; }
 }
@@ -88,12 +91,62 @@ function resolvePolicy({ environment, defaults = {}, ceilings = {}, capabilities
     },
   });
   if (diagnostics) diagnostics._bindPolicy(owner);
+  owners.set(owner, "resolved");
   return owner;
+}
+function derivePolicy(parent, options = {}) {
+  if (owners.get(parent) !== "resolved") throw new TypeError("genuine resolved parent policy required");
+  // Startup role descriptions are plain data. Reject executable inputs before
+  // invoking their traps/getters or constructing any partial derived view.
+  const dataObject = (value, name) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) || isProxy(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw new TypeError(`${name}: plain data object required`);
+  };
+  dataObject(options, "role options");
+  for (const name of Reflect.ownKeys(options)) if (!["role", "ceilings"].includes(name)) throw new PolicyError(typeof name === "string" ? name : "role", "unsupported role setting");
+  const dataValue = (object, name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(object, name);
+    if (!descriptor) return undefined;
+    if (!Object.hasOwn(descriptor, "value")) throw new PolicyError(name, "own data value required");
+    return descriptor.value;
+  };
+  const role = dataValue(options, "role"), rawCeilings = dataValue(options, "ceilings");
+  const ceilings = rawCeilings === undefined ? {} : rawCeilings;
+  if (typeof role !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(role)) throw new PolicyError("role", "canonical ASCII role token of 1..128 bytes required");
+  dataObject(ceilings, "role ceilings");
+  const parentSnapshot = parent.effective();
+  const caps = {};
+  for (const name of Reflect.ownKeys(ceilings)) {
+    const field = knownFields.get(name), raw = dataValue(ceilings, name);
+    if (!field || field.type !== "integer" || !parentSnapshot.fields[name]) throw new PolicyError(typeof name === "string" ? name : "role", "role ceiling requires a supported integer budget");
+    if (!Number.isSafeInteger(raw) || raw <= 0 || raw > Math.min(registry.integer_max, field.maximum ?? registry.integer_max)) throw new PolicyError(name, "role ceiling requires a positive bounded integer number");
+    caps[name] = raw;
+  }
+  const roleCaps = Object.freeze(caps); // No retention of the supplied cap object.
+  let cachedParent, cached;
+  const effective = () => {
+    const snapshot = parent.effective();
+    if (cachedParent === snapshot) return cached;
+    const fields = Object.freeze(Object.fromEntries(Object.entries(snapshot.fields).map(([name, entry]) => {
+      const roleCap = roleCaps[name] ?? null;
+      const value = roleCap === null ? entry.value : Math.min(entry.value, roleCap);
+      const ceiling = roleCap === null ? entry.ceiling : entry.ceiling === null ? roleCap : Math.min(entry.ceiling, roleCap);
+      return [name, Object.freeze({ ...entry, value, ceiling,
+        source: value === entry.value ? entry.source : "role_cap",
+        parentValue: entry.value, parentSource: entry.source, parentCeiling: entry.ceiling, roleCap,
+      })];
+    })));
+    cached = Object.freeze({ revision: snapshot.revision, role, parent: snapshot, roleCaps, fields });
+    cachedParent = snapshot;
+    return cached;
+  };
+  const view = Object.freeze({ role, get revision() { return parent.revision; }, get fields() { return effective().fields; }, diagnostics: parent.diagnostics, effective });
+  owners.set(view, "role");
+  return view;
 }
 function policyOptions(options, mapping) {
   const out = { ...options };
-  if (!options.policy) return out;
-  if (!Number.isSafeInteger(options.policy.revision) || options.policy.revision < 1 || !options.policy.fields) throw new TypeError("resolved policy required");
+  if (options.policy == null) return out;
+  if (!owners.has(options.policy)) throw new TypeError("genuine resolved or derived policy required");
   for (const [field, option] of Object.entries(mapping)) {
     const entry = options.policy.fields[field];
     if (!entry) continue;
@@ -102,4 +155,4 @@ function policyOptions(options, mapping) {
   }
   return out;
 }
-module.exports = { resolvePolicy, PolicyError, policyOptions };
+module.exports = { resolvePolicy, derivePolicy, PolicyError, policyOptions };

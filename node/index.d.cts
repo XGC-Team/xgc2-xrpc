@@ -2,7 +2,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
 export interface HostOptions {
-  policy?: Policy;
+  policy?: PolicyView;
   tls?: import("node:https").ServerOptions;
   maxConnections?: number;
   maxInFlight?: number;
@@ -73,13 +73,28 @@ export function proxyWebSocket(request: IncomingMessage, socket: Duplex, head: B
   forwardHeaders?: string[];
   onOpen?: (info: { protocol: string }) => void;
 }): { close(): void };
-export interface Policy {
-  readonly revision: number;
-  readonly fields: Readonly<Record<string, { readonly value: number | string; readonly source: string; readonly dynamic: boolean; readonly ceiling: number | null }>>;
-  effective(): { revision: number; fields: Policy["fields"] };
-  readonly diagnostics?: Diagnostics;
-  update(changes: { LOG_LEVEL: "trace" | "debug" | "info" | "warn" | "error" }, options: { expectedRevision: number }): ReturnType<Policy["effective"]>;
+export interface PolicyField {
+  readonly value: number | string; readonly source: string; readonly dynamic: boolean; readonly ceiling: number | null;
+  readonly parentValue?: number | string; readonly parentSource?: string; readonly parentCeiling?: number | null; readonly roleCap?: number | null;
 }
+export interface PolicySnapshot { readonly revision: number; readonly fields: Readonly<Record<string, PolicyField>> }
+export interface PolicyView {
+  readonly revision: number;
+  readonly fields: PolicySnapshot["fields"];
+  effective(): PolicySnapshot;
+  readonly diagnostics?: Diagnostics;
+}
+export interface Policy extends PolicyView {
+  update(changes: { LOG_LEVEL: "trace" | "debug" | "info" | "warn" | "error" }, options: { expectedRevision: number }): PolicySnapshot;
+}
+export interface RolePolicySnapshot extends PolicySnapshot {
+  readonly role: string; readonly parent: PolicySnapshot; readonly roleCaps: Readonly<Record<string, number>>;
+}
+export interface DerivedPolicy extends PolicyView {
+  readonly role: string;
+  effective(): RolePolicySnapshot;
+}
+export function derivePolicy(parent: Policy, options: { role: string; ceilings?: Readonly<Record<string, number>> }): DerivedPolicy;
 export interface DiagnosticStatus {
   readonly state: string; readonly failed: boolean; readonly workerStarted: boolean; readonly workerAlive: boolean;
   readonly pendingRecords: number; readonly queueCapacity: number; readonly maxRecordBytes: number;
@@ -111,9 +126,10 @@ export interface CallOptions {
 }
 export class HTTPClient {
   constructor(options?: {
-    policy?: Policy; localTarget?: string; tls?: ClientTLSOptions;
+    policy?: PolicyView; localTarget?: string; tls?: ClientTLSOptions;
     maxConnections?: number; maxReferences?: number; maxInFlight?: number;
     maxRequestBytes?: number; maxResponseBytes?: number; maxHeaderBytes?: number;
+    callTimeoutMs?: number;
     referenceIdleTimeoutMs?: number;
   });
   call(ref: ServiceRef, path: string, options: CallOptions): Promise<{ status: number; headers: import("node:http").IncomingHttpHeaders; body: Buffer; requestId: string }>;
