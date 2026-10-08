@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const InstanceIDMetadata = "x-xrpc-instance-id"
@@ -33,6 +34,10 @@ func WithRequestID(ctx context.Context, requestID string) (context.Context, erro
 }
 
 func validateRequestMetadata(ctx context.Context, instanceID string) error {
+	return validateRequestMetadataFor(ctx, instanceID, false)
+}
+
+func validateRequestMetadataFor(ctx context.Context, instanceID string, discovery bool) error {
 	ids := metadata.ValueFromIncomingContext(ctx, RequestIDMetadata)
 	if len(ids) != 1 || !xrpc.ValidID(ids[0]) {
 		return status.Error(codes.InvalidArgument, "one canonical request identity required")
@@ -42,7 +47,7 @@ func validateRequestMetadata(ctx context.Context, instanceID string) error {
 		if len(instances) > 1 {
 			return status.Error(codes.InvalidArgument, "one instance identity required")
 		}
-		if len(instances) != 1 || instances[0] != instanceID {
+		if !(discovery && len(instances) == 0) && (len(instances) != 1 || instances[0] != instanceID) {
 			return status.Error(codes.FailedPrecondition, "server instance does not match service reference")
 		}
 	}
@@ -111,12 +116,9 @@ func BoundService(instanceID string, maximum time.Duration, inFlight int) []grpc
 		inFlight = 64
 	}
 	slots := make(chan struct{}, inFlight)
-	admit := func(ctx context.Context) (context.Context, func(), error) {
+	admit := func(ctx context.Context, stream bool) (context.Context, func(), error) {
 		if err := validateRequestMetadata(ctx, instanceID); err != nil {
 			return nil, nil, err
-		}
-		if instanceID != "" {
-			_ = grpc.SetHeader(ctx, metadata.Pairs(InstanceIDMetadata, instanceID))
 		}
 		remaining, err := xrpc.Remaining(ctx)
 		if err != nil {
@@ -124,7 +126,7 @@ func BoundService(instanceID string, maximum time.Duration, inFlight int) []grpc
 		}
 		// grpc-go owns the stream's transport context. A derived Context cannot
 		// interrupt its RecvMsg/SendMsg; only accept native budgets we can honor.
-		if remaining > maximum {
+		if stream && remaining > maximum {
 			return nil, nil, status.Error(codes.InvalidArgument, "caller deadline exceeds host maximum")
 		}
 		select {
@@ -132,15 +134,20 @@ func BoundService(instanceID string, maximum time.Duration, inFlight int) []grpc
 		default:
 			return nil, nil, status.Error(codes.ResourceExhausted, "host concurrency exhausted")
 		}
+		if !stream {
+			bounded, cancel := context.WithTimeout(ctx, maximum)
+			return bounded, func() { <-slots; cancel() }, nil
+		}
 		return ctx, func() { <-slots }, nil
 	}
 	return []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
-			ctx, release, err := admit(ctx)
+			ctx, release, err := admit(ctx, false)
 			if err != nil {
 				return nil, err
 			}
 			defer release()
+			ctx = admittedContext(ctx, instanceID)
 			result, err := next(ctx, request)
 			if err == nil && ctx.Err() != nil {
 				return nil, status.FromContextError(ctx.Err()).Err()
@@ -148,11 +155,13 @@ func BoundService(instanceID string, maximum time.Duration, inFlight int) []grpc
 			return result, err
 		}),
 		grpc.ChainStreamInterceptor(func(server any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, next grpc.StreamHandler) error {
-			ctx, release, err := admit(stream.Context())
+			ctx, release, err := admit(stream.Context(), true)
 			if err != nil {
 				return err
 			}
 			defer release()
+			ctx = admittedContext(ctx, instanceID)
+			stream = &readyStream{ServerStream: stream}
 			err = next(server, &boundedStream{ServerStream: stream, ctx: ctx})
 			if err == nil && ctx.Err() != nil {
 				return status.FromContextError(ctx.Err()).Err()
@@ -168,6 +177,59 @@ type boundedStream struct {
 }
 
 func (s *boundedStream) Context() context.Context { return s.ctx }
+
+// Flush pending native identity metadata before a domain's first receive. A
+// peer may wait for initial metadata before sending its first message. Keeping
+// the flush at the IO boundary also lets product Chain* hooks add their native
+// authorization/instance headers before the initial HEADERS are written.
+type readyStream struct {
+	grpc.ServerStream
+	mu   sync.Mutex
+	sent bool
+}
+
+func (s *readyStream) SetHeader(md metadata.MD) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ServerStream.SetHeader(md)
+}
+
+func (s *readyStream) SendHeader(md metadata.MD) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.ServerStream.SendHeader(md)
+	if err == nil {
+		s.sent = true
+	}
+	return err
+}
+
+func (s *readyStream) ready() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sent {
+		return nil
+	}
+	if err := s.ServerStream.SendHeader(nil); err != nil {
+		return err
+	}
+	s.sent = true
+	return nil
+}
+
+func (s *readyStream) RecvMsg(message any) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	return s.ServerStream.RecvMsg(message)
+}
+
+func (s *readyStream) SendMsg(message any) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	return s.ServerStream.SendMsg(message)
+}
 
 func clientUnary(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, budget *dialBudget) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, request, reply any, connection *grpc.ClientConn, next grpc.UnaryInvoker, options ...grpc.CallOption) error {
@@ -200,9 +262,12 @@ func clientUnary(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, b
 		var header metadata.MD
 		err = next(ctx, method, request, reply, connection, append(options, grpc.MaxCallRecvMsgSize(limits.MaxResponseBytes), grpc.MaxCallSendMsgSize(limits.MaxRequestBytes), grpc.Header(&header))...)
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return err
+			}
+			return responseError(err, ref, outgoingRequestID(ctx), header)
 		}
-		return checkInstance(ref, header)
+		return checkResponse(ref, outgoingRequestID(ctx), header)
 	}
 }
 func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, budget *dialBudget) grpc.StreamClientInterceptor {
@@ -246,7 +311,7 @@ func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, 
 			finish()
 			return nil, err
 		}
-		return &fencedStream{ClientStream: stream, ref: ref, cancel: finish}, nil
+		return &fencedStream{ClientStream: stream, ref: ref, requestID: outgoingRequestID(ctx), ctx: ctx, cancel: finish}, nil
 	}
 }
 func checkInstance(ref xrpc.ServiceRef, header metadata.MD) error {
@@ -260,10 +325,29 @@ func checkInstance(ref xrpc.ServiceRef, header metadata.MD) error {
 	return nil
 }
 
+func outgoingRequestID(ctx context.Context) string {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	ids := md.Get(RequestIDMetadata)
+	if len(ids) == 1 {
+		return ids[0]
+	}
+	return ""
+}
+
+func checkResponse(ref xrpc.ServiceRef, requestID string, header metadata.MD) error {
+	ids := header.Get(RequestIDMetadata)
+	if len(ids) != 1 || ids[0] != requestID || !xrpc.ValidID(requestID) {
+		return xrpc.Failure("conflict", xrpc.OutcomeUnknown, status.Error(codes.FailedPrecondition, "server request identity changed or identity missing"))
+	}
+	return checkInstance(ref, header)
+}
+
 type fencedStream struct {
 	grpc.ClientStream
-	ref    xrpc.ServiceRef
-	cancel context.CancelFunc
+	ref       xrpc.ServiceRef
+	requestID string
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func (s *fencedStream) Header() (metadata.MD, error) {
@@ -272,7 +356,7 @@ func (s *fencedStream) Header() (metadata.MD, error) {
 		s.cancel()
 		return nil, err
 	}
-	err = checkInstance(s.ref, header)
+	err = checkResponse(s.ref, s.requestID, header)
 	if err != nil {
 		s.cancel()
 	}
@@ -303,20 +387,33 @@ func (s *fencedStream) RecvMsg(value any) error {
 	// Empty metadata may mean an error before response headers; preserve that
 	// native error, but never accept a successful empty stream without fencing.
 	if len(header) > 0 {
-		if err = checkInstance(s.ref, header); err != nil {
+		if err = checkResponse(s.ref, s.requestID, header); err != nil {
+			// A partial identity header can precede a native admission error.
+			// Preserve that original status without letting a successful message
+			// mutate the caller's output before the response fence is satisfied.
+			if message, ok := value.(proto.Message); ok {
+				if nativeErr := s.ClientStream.RecvMsg(message.ProtoReflect().New().Interface()); nativeErr != nil && !errors.Is(nativeErr, io.EOF) {
+					s.cancel()
+					return nativeErr
+				}
+			}
 			s.cancel()
 			return err
 		}
 	}
 	err = s.ClientStream.RecvMsg(value)
 	if err == nil || errors.Is(err, io.EOF) {
-		if fenceErr := checkInstance(s.ref, header); fenceErr != nil {
+		if fenceErr := checkResponse(s.ref, s.requestID, header); fenceErr != nil {
 			s.cancel()
 			return fenceErr
 		}
 	}
 	if err != nil {
+		if s.ctx.Err() == nil {
+			err = responseError(err, s.ref, s.requestID, header)
+		}
 		s.cancel()
+		return err
 	}
 	return err
 }

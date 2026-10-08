@@ -70,6 +70,26 @@ and HTTP/2 preface IO use caller-owned setup deadlines; native outgoing-header
 observation releases that setup bound so established pooled connections survive
 a previous caller's deadline.
 
+Unary handlers receive the smaller of the finite caller budget and host budget;
+their admission and lease remain owned until actual handler return. Exact
+`HostOptions.DiscoveryMethods` permits unary description calls with an absent
+instance. Supplied empty/mismatched instances remain rejected. Streams flush
+native identity metadata before their first blocking receive or send, after
+product interceptor headers have been assembled.
+
+`grpcx.Profile` separates `MaxRequestJSONBytes`/`MaxResponseJSONBytes` from
+native `MaxRequestBytes`/`MaxResponseBytes`. JSON defaults to twice its wire
+budget; decoded `proto.Size` and native gRPC limits still enforce the original
+wire caps. A legal bytes field's base64 representation does not raise that cap.
+
+`grpcx.ApplicationError(ctx, err)` explicitly marks a known domain failure from
+an admitted, instance-bound handler with standard `google.rpc.ErrorInfo`.
+The client accepts exactly one `xgc2.xrpc` / `APPLICATION_ERROR` marker only
+after matching both request and instance identities to the response fence.
+It then reports `response_received`; this does not promise rollback or replay.
+Unmarked errors, bad/duplicate markers, cancellation and local receive-size
+failures keep `outcome_unknown` and retain the original native status.
+
 Persistent public/domain gRPC streams use `ServeEdgeWithOptions` with explicit
 `EdgeOptions{Limits: ..., OwnerStreamLifetime: ..., ConnectionGrace: ...}`.
 The lifetime must be positive and at most 24h. `ServeEdgeTLS` supplies native TLS;
@@ -78,6 +98,13 @@ These streams are independent of the short internal RPC budget. Native aging
 is adjusted for its +/-10% jitter; an immutable accepted-socket deadline enforces
 the actual owner IO boundary even through handshake deadline resets and native
 graceful-close delays. There is no per-stream polling/timer worker.
+
+`PrepareEdgeTLS` accepts an error-returning native registration callback and
+performs no serving. Its returned `Host.Serve()` runs the accept loop once in
+the application's lifecycle. Successful preparation transfers listener/lease
+ownership; registration failure stops the partial server and leaves those
+resources with the caller. `Stop`/`Shutdown` also close and drain a prepared
+host before its first Serve; a stopped host cannot restart.
 
 ## Ownership and status
 

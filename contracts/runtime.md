@@ -98,6 +98,15 @@ bounded by idle time; clients reuse their transport rather than create one
 per call. A product may close a connection, but one-call-per-connection is not
 a compatibility requirement.
 
+Pinned Python grpcio 1.84.0 enforces `grpc.max_allowed_incoming_connections`
+per native listener, including connections before TLS/HTTP2 handshaking. Each
+managed Python gRPC Host therefore owns one UDS or numeric-address listener and
+reserves its positive connection cap below `INT_MAX` from the shared Runtime
+before serving. Other gRPC Hosts reserve from the same budget; HTTP admission
+uses the remainder. Failed drain retains the reservation until actual owner
+quiescence. Report the reserved amount and unknown native active count honestly;
+this listener cap is not a total process FD or RSS bound.
+
 The wire contract is shared across languages, including negative cases:
 
 - Internal requests contain exactly one X-Xrpc-Timeout-Ms in canonical ASCII
@@ -170,6 +179,19 @@ resource_exhausted, deadline_exceeded, cancelled, unavailable and internal.
 HTTP uses status codes and structured error responses, gRPC uses its native
 status codes. Unknown outcome is a client-side result property, not a claim
 that the server rejected a request. Domain errors may extend this vocabulary.
+
+A known gRPC application failure may explicitly carry one standard
+`google.rpc.ErrorInfo` detail with `domain = "xgc2.xrpc"`,
+`reason = "APPLICATION_ERROR"`, and exactly two metadata entries:
+`request_id` and `instance_id`, taken from the admitted call. A client reports
+response-received only when this single valid marker matches its request and
+the verified response instance metadata. Status code or instance metadata
+alone is insufficient: a local receive-size failure after a committed mutation
+can have the same status as an application quota rejection. Missing, duplicate
+or invalid markers leave an unsuccessful call outcome-unknown. The marker
+preserves the native error code and does not imply rollback, safe replay or
+physical completion; those meanings remain with the domain. Hosts do not
+automatically mark arbitrary transport, cancellation or handler failures.
 
 Handlers own domain payloads and state. An async HTTP reply completes at most
 once and may complete from another thread. Fixed host workers/event loops
