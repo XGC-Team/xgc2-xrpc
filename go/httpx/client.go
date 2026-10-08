@@ -31,11 +31,12 @@ const InstanceIDHeader = "X-Xrpc-Instance-ID"
 var ErrResponseTooLarge = errors.New("xrpc: HTTP response exceeds byte limit")
 
 type Config struct {
-	LocalTargetID string
-	Service       xrpc.ServiceRef
-	DialContext   xrpc.DialContext
-	TLSConfig     *tls.Config
-	TLSForService func(xrpc.ServiceRef) (*tls.Config, error)
+	boundAuthorization bool
+	LocalTargetID      string
+	Service            xrpc.ServiceRef
+	DialContext        xrpc.DialContext
+	TLSConfig          *tls.Config
+	TLSForService      func(xrpc.ServiceRef) (*tls.Config, error)
 	// Headers are copied at construction. Wire-owned identity/budget headers
 	// are rejected; authentication remains an explicitly supplied capability.
 	Headers              map[string]string
@@ -223,6 +224,13 @@ func (c *Client) DoStream(ctx context.Context, method, path, requestID, contentT
 }
 
 func (c *Client) doStream(ctx context.Context, method, path, requestID, contentType string, body []byte, headers map[string]string) (*http.Response, error) {
+	if c.config.boundAuthorization {
+		for name := range headers {
+			if strings.EqualFold(name, "Authorization") {
+				return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: caller authorization belongs to bootstrap owner"))
+			}
+		}
+	}
 	if err := validateHeaders(headers); err != nil {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
 	}
@@ -447,6 +455,10 @@ func statusCode(status int) string {
 	switch status {
 	case 400:
 		return "invalid_argument"
+	case 401:
+		return "unauthenticated"
+	case 403:
+		return "permission_denied"
 	case 404:
 		return "not_found"
 	case 409:

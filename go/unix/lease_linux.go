@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/XGC-Team/xgc2-xrpc/go"
@@ -186,6 +187,46 @@ func (l *Lease) Listen() (net.Listener, error) {
 	}
 	return listener, nil
 }
+
+// ValidateListener checks the native socket's bound address and retained
+// pathname inode against this still-live lease. It accepts Lease.Listen and
+// native external binders that used BindPath followed by RecordBound.
+func (l *Lease) ValidateListener(listener net.Listener) error {
+	if l == nil || listener == nil {
+		return errors.New("xrpc: matching endpoint lease required")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || l.bound == nil {
+		return errors.New("xrpc: bound endpoint lease required")
+	}
+	current, err := l.stat()
+	if err != nil || !same(current, l.bound) {
+		return errors.New("xrpc: leased endpoint was replaced")
+	}
+	connection, ok := listener.(syscall.Conn)
+	if !ok {
+		return errors.New("xrpc: native leased Unix listener required")
+	}
+	raw, err := connection.SyscallConn()
+	if err != nil {
+		return err
+	}
+	matched := false
+	var socketError error
+	err = raw.Control(func(fd uintptr) {
+		address, lookupErr := sys.Getsockname(int(fd))
+		socketError = lookupErr
+		if address, ok := address.(*sys.SockaddrUnix); ok {
+			matched = address.Name == l.BindPath()
+		}
+	})
+	if err != nil || socketError != nil || !matched {
+		return errors.New("xrpc: listener does not belong to endpoint lease")
+	}
+	return nil
+}
+
 func (l *Lease) recordBound() error {
 	st, err := l.stat()
 	if err != nil {

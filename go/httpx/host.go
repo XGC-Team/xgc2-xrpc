@@ -18,6 +18,9 @@ import (
 )
 
 type HostOptions struct {
+	// Authorize runs after finite admission and before domain dispatch. It must
+	// return true while the request context remains live.
+	Authorize func(*http.Request) bool
 	// DiscoveryPaths names GET-only public description routes. All other routes stay instance-bound.
 	DiscoveryPaths   []string
 	InstanceID       string
@@ -143,7 +146,18 @@ func Handler(next http.Handler, options HostOptions) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, options.MaxBodyBytes)
 		w.Header().Set(RequestIDHeader, r.Header.Get(RequestIDHeader))
 		bounded := &responseLimitWriter{ResponseWriter: w, remaining: options.MaxResponseBytes, head: r.Method == http.MethodHead, maxHeaderBytes: int64(options.MaxHeaderBytes)}
-		next.ServeHTTP(bounded, r.WithContext(ctx))
+		request := r.WithContext(ctx)
+		if options.Authorize != nil {
+			allowed := options.Authorize(request)
+			if ctx.Err() != nil {
+				panic(http.ErrAbortHandler)
+			}
+			if !allowed {
+				writeError(bounded, 403, "permission_denied", "caller authorization rejected")
+				return
+			}
+		}
+		next.ServeHTTP(bounded, request)
 		bounded.checkHeaders()
 		if bounded.abort {
 			panic(http.ErrAbortHandler)

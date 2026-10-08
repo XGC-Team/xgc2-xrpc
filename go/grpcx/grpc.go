@@ -128,7 +128,9 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 		if config.InsecureSkipVerify {
 			return nil, errors.New("xrpc: authenticated gRPC cannot skip TLS verification")
 		}
-		args = append(args, grpc.WithTransportCredentials(credentials.NewTLS(config.Clone())))
+		cloned := config.Clone()
+		cloned.MinVersion = max(cloned.MinVersion, tls.VersionTLS12)
+		args = append(args, grpc.WithTransportCredentials(credentials.NewTLS(cloned)))
 		args = append(args, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return dial(ctx, "tcp", ref.Endpoint.Address) }))
 	default:
 		return nil, errors.New("xrpc: unsupported gRPC endpoint")
@@ -574,6 +576,10 @@ func callError(err error) error {
 	switch status.Code(err) {
 	case codes.InvalidArgument:
 		code = "invalid_argument"
+	case codes.Unauthenticated:
+		code = "unauthenticated"
+	case codes.PermissionDenied:
+		code = "permission_denied"
 	case codes.NotFound:
 		code = "not_found"
 	case codes.AlreadyExists, codes.Aborted, codes.FailedPrecondition:

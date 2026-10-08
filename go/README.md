@@ -160,3 +160,50 @@ interceptors must use `grpc.ChainUnaryInterceptor` and
 primary interceptor returns a startup error instead of bypassing that gate or
 panicking the process. SDK native message, header, stream and connection limits
 remain last in server option application and cannot be loosened by product options.
+
+For an actual service owner, `xrpc.LoadBootstrapInput(explicitPath,
+xrpc.BootstrapServer)` reads the common `--bootstrap-input` document once. Use
+`xrpc.BootstrapClient` for an outbound owner, or resolve additional explicit
+bindings through `binding.ResolveCredentials(input.ResolveGrant, role)`.
+`input.Binding()` and `input.Application()` return copied metadata and opaque
+JSON; the SDK does not interpret application domains or manage runtime/storage
+grants. Modules sharing a host and direct libraries need no listener/bootstrap.
+
+The loader accepts local Unix bindings with `grants: {}` and preserves the
+existing private lease. Remote bindings load identity, CA and bearer files
+from explicit handles: pinned canonical paths, no symlinks, owned 0700 final
+parent, single-link regular 0600 files, nonblocking open and bounded overflow
+reads. Input is at most 16 KiB with strict exact JSON keys and no duplicates;
+application nesting is limited to 32 levels. TLS/key/CA/token material is
+validated once, without environment variables, file searching or per-call reads.
+Native remote TLS requires at least TLS 1.2 and verifies the endpoint DNS/IP;
+`mutual_tls` also requires verified native client certificates.
+
+The application supplies its already bound listener to
+`httpx.ServeBound(listener, lease, handler, input.Credentials(), instanceID,
+options)` or `grpcx.ServeBound(listener, lease, register, input.Credentials(),
+instanceID, limits, grpc.Chain*Interceptor(...))`. These reuse the existing
+native host lifecycle. Unix listeners must match the live lease's native
+address and retained inode. `xrpc.NewInstanceID()` creates a fresh unpredictable
+identity; `binding.ServiceRef(instanceID)` constructs the actual readiness
+reference after startup. These wrappers require the loaded server role and
+fence every internal request. Product method/scope checks remain inside the
+handler/interceptor. The declared caller grant must return `true` while the
+native request context remains live before product dispatch; a blocked grant
+still counts as owned work and retains the lease until it returns.
+
+For a client owner use `httpx.NewBound(credentials, actualRef, config)` or
+`grpcx.DialBound(credentials, actualRef, dialOptions)`. Full reference identity
+must match the resolved binding; limits and remote numeric dialing remain
+explicit owner options. Bootstrap authorization cannot be overridden by
+per-call headers/outgoing metadata. `NewTLSIdentityGrant`, `NewTLSTrustGrant`,
+`NewBearerGrant` and `NewAuthorizationGrant` let an existing credential owner
+supply native grants through `xrpc.GrantResolver` without another manager.
+
+Bootstrap validation includes the shared corpus and actual HTTP/gRPC mTLS and
+server-TLS calls with authenticated DNS plus injected numeric dialing, missing
+client certificate/wrong SAN/duplicate authorization rejection, immutable
+credential snapshots, FIFO/permission/link/size failures, and expired grant
+callbacks retaining actual work/lease ownership. These checks do not establish
+end-to-end product acceptance or sustained CPU/cache/allocation/RSS/latency
+performance; controlled heavy workloads remain separately measured.
