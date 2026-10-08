@@ -4,6 +4,12 @@ This contract extends runtime.md. These are requirements for the SDKs and
 their product integrations; a contract entry does not establish implementation
 or deployment support. Each SDK publishes and tests its supported capabilities.
 
+The [runtime service-boundary choice](runtime.md#choose-the-actual-service-boundary)
+precedes bootstrap. Only a necessary service host owns a service binding and
+listener. Modules share their existing host's policy, grants and lifecycle;
+libraries and pure data paths need no service endpoint or RPC bootstrap.
+Directory/process inventories cannot impose a separate listener on them.
+
 ## Four distinct inputs
 
 | Input | Owner and lifetime | Examples |
@@ -192,18 +198,18 @@ instance IDs or operation-success claims as present reality. Durable operation
 receipts require domain-specific crash recovery and retention; an in-memory
 deduplication cache does not provide exactly-once effects across a crash.
 
-Lichtblick owns its user/workspace layout and view state. Its current IndexedDB,
-localStorage and Electron stores are migration inputs, not architectural
-exceptions. Managed scene/topic/frame fields and personal view fields retain
-distinct semantic owners while their persistence moves to registered storage
-through the product's host. A saved camera view must restore from that managed
-state, independently of the browser's hidden database. XRPC does not interpret
-camera matrices, and Core does not acquire a second authoritative copy merely
-because a save RPC is added. Retire the old normal read/write paths together;
-an explicit bounded import preserves existing state without permanent dual-read
-or dual-write behavior. Do not clear the user's original store before verified
-import. Extensions, language preference, UI workspace and desktop settings are
-part of the same audit, not exemptions because they came from upstream.
+Lichtblick owns its user/workspace layout and view state. Retire normal readers
+and writers of IndexedDB, localStorage and Electron stores together. This
+reconstruction does not implement database compatibility, imports, dual reads,
+dual writes or legacy-schema recovery. New managed storage has an explicit new
+identity; restoration verifies data written through that current contract.
+Existing user stores are left untouched, not silently deleted or treated as
+the new authority. Managed scene/topic/frame fields and personal view fields
+retain distinct semantic owners. A saved camera view restores from managed
+state independently of the browser's hidden database. XRPC does not interpret
+camera matrices, and Core does not acquire a second authoritative copy because
+a save RPC is added. Extensions, language preference, UI workspace and desktop
+settings are part of the same audit, including upstream-originated settings.
 
 ## Diagnostics, status and flow control
 

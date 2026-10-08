@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc2.dev/contracts/xrpc/bootstrap-input-v1.json",
+  "title": "Explicit process-owner XRPC startup input v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "binding", "grants"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "binding": { "$ref": "bootstrap.schema.json" },
+    "grants": {
+      "type": "object", "maxProperties": 32,
+      "propertyNames": { "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+      "additionalProperties": { "oneOf": [
+        { "type": "object", "additionalProperties": false,
+          "required": ["kind", "cert_file", "key_file"],
+          "properties": { "kind": { "const": "tls_identity" }, "cert_file": { "$ref": "#/$defs/file" }, "key_file": { "$ref": "#/$defs/file" } } },
+        { "type": "object", "additionalProperties": false,
+          "required": ["kind", "ca_file"],
+          "properties": { "kind": { "const": "tls_trust" }, "ca_file": { "$ref": "#/$defs/file" } } },
+        { "type": "object", "additionalProperties": false,
+          "required": ["kind", "token_file"],
+          "properties": { "kind": { "const": "bearer" }, "token_file": { "$ref": "#/$defs/file" } } }
+      ] }
+    },
+    "application": {}
+  },
+  "$defs": { "file": { "type": "string", "minLength": 2, "maxLength": 4096, "pattern": "^/[^\u0000]*$" } }
+}

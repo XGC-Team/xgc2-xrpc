@@ -9,10 +9,11 @@ const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
 const { execFileSync } = require("node:child_process");
-const { HTTPClient, createRPCHost, resolvePolicy, createHTTPHost } = require("..");
+const { HTTPClient, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, resolvePolicy, createHTTPHost } = require("..");
 const corpus = require("../../contracts/fixtures/wire.json");
 const env = require("../../contracts/fixtures/environment.json");
 const registry = require("../runtime-policy.json");
+const bootstraps = require("../../contracts/fixtures/bootstrap.json");
 const boot = corpus.instance_id;
 const certDir = fs.mkdtempSync(path.join(os.tmpdir(), "xrpc-node-tls-"));
 execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", path.join(certDir, "key.pem"), "-out", path.join(certDir, "cert.pem"), "-days", "1", "-subj", "/CN=fixture", "-addext", "subjectAltName=IP:127.0.0.1"], { stdio: "ignore" });
@@ -187,4 +188,104 @@ for (const kind of ["reason", "trailer"]) test(`${kind} output cannot bypass the
       request.on("error", resolve);
     });
   } finally { await host.close(); }
+});
+test("shared bootstrap corpus and safe explicit file loading reject legacy/unsafe inputs", () => {
+  for (const entry of bootstraps.cases) {
+    if (entry.valid) {
+      const binding = new BootstrapBinding(entry.binding);
+      assert.equal(binding.serviceRef("actual:fresh-boot").instance_id, "actual:fresh-boot");
+    } else assert.throws(() => new BootstrapBinding(entry.binding), undefined, entry.name);
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "xrpc-bootstrap-"));
+  const file = path.join(directory, "binding.json");
+  try {
+    fs.writeFileSync(file, JSON.stringify(bootstraps.cases[0].binding), { mode: 0o600 });
+    assert.equal(readBootstrapBinding(file).serviceRef("fresh:1").service, "fixture");
+    fs.chmodSync(file, 0o644); assert.throws(() => readBootstrapBinding(file), /mode0600/);
+    fs.chmodSync(file, 0o600); fs.linkSync(file, path.join(directory,"hardlink")); assert.throws(() => readBootstrapBinding(file), /single-link/);
+    fs.unlinkSync(path.join(directory,"hardlink"));
+    fs.symlinkSync(file,path.join(directory,"symlink")); assert.throws(() => readBootstrapBinding(path.join(directory,"symlink")));
+    const fifo = path.join(directory, "fifo"); execFileSync("mkfifo", ["-m", "600", fifo]);
+    assert.throws(() => execFileSync(process.execPath, ["-e", "require(process.argv[1]).readBootstrapBinding(process.argv[2])", path.resolve(__dirname,".."), fifo], { timeout: 1000, stdio: "pipe" }), (error) => error.code !== "ETIMEDOUT" && error.status === 1);
+    fs.writeFileSync(file, " ".repeat(16385)); assert.throws(() => readBootstrapBinding(file), /16KiB/);
+  } finally { fs.rmSync(directory, { recursive: true }); }
+});
+test("public startup loader reads actual bounded grants and authenticates native mutual TLS", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "xrpc-bootstrap-input-"));
+  const write = (name, bytes) => { const file = path.join(directory,name); fs.writeFileSync(file,bytes,{mode:0o600}); return file; };
+  const keyFile = write("key.pem",key), certFile = write("cert.pem",cert), tokenFile = write("token","startup-fixture");
+  const binding = bootstraps.cases[0].binding;
+  const input = { schema_version:1, binding, grants: {
+    [binding.secret_handles.tls_identity]: { kind:"tls_identity",cert_file:certFile,key_file:keyFile },
+    [binding.secret_handles.tls_trust]: { kind:"tls_trust",ca_file:certFile },
+    [binding.secret_handles.authorization]: { kind:"bearer",token_file:tokenFile },
+    "storage-auth": {kind:"bearer",token_file:tokenFile},
+  }, application: { storage: { authorization:"storage-auth" } } };
+  const inputFile = write("input.json",JSON.stringify(input));
+  let host, client, dispatch = 0;
+  try {
+    const loaded = loadBootstrapInput(inputFile,{role:"server"});
+    assert.ok(Object.isFrozen(loaded.application.storage));
+    assert.equal(loaded.resolveGrant("storage-auth","authorization").headers.authorization,"Bearer startup-fixture");
+    assert.throws(() => loaded.resolveGrant("ungranted","authorization"));
+    assert.throws(() => loaded.resolveGrant("storage-auth","tls_trust"));
+    const credentials = loaded.binding.resolveCredentials(loaded.resolveGrant,"client");
+    host = createBoundHTTPHost((_req,res) => { dispatch++; res.end("ready"); },{...loaded,instanceId:boot});
+    host.server.listen(0,"127.0.0.1"); await once(host.server,"listening");
+    client = new HTTPClient({tls:credentials.tls});
+    const reference = ref(`https://127.0.0.1:${host.server.address().port}`);
+    assert.equal((await client.call(reference,"/echo",{timeoutMs:1000})).status,403); assert.equal(dispatch,0);
+    assert.equal((await client.call(reference,"/echo",{timeoutMs:1000,headers:credentials.authorization.headers})).body.toString(),"ready");
+    assert.equal(dispatch,1);
+    input.grants["unused-trust"] = {kind:"tls_trust",ca_file:write("invalid-ca","not a certificate")};
+    fs.writeFileSync(inputFile,JSON.stringify(input));
+    assert.throws(() => loadBootstrapInput(inputFile,{role:"server"}));
+    delete input.grants["unused-trust"]; fs.writeFileSync(inputFile,JSON.stringify(input));
+    fs.writeFileSync(certFile,"not a certificate");
+    assert.throws(() => loadBootstrapInput(inputFile,{role:"server"}));
+  } finally { client?.close(); await host?.close(); fs.rmSync(directory,{recursive:true}); }
+});
+test("authorization must return true before the live RPC deadline to dispatch", async () => {
+  for (const verdict of ["false", "late"]) {
+    let dispatch = 0;
+    const binding = new BootstrapBinding(bootstraps.cases[0].binding);
+    const host = createBoundHTTPHost((_req,res) => { dispatch++; res.end("bad"); }, { binding,instanceId:boot,
+      resolveGrant: (_handle,kind) => kind === "tls_identity" ? {key,cert} : kind === "tls_trust" ? {ca:cert} : {authorize:async () => {
+        if (verdict === "late") { await new Promise(resolve=>setTimeout(resolve,100)); return true; }
+        return "false";
+      }} });
+    host.server.listen(0,"127.0.0.1"); await once(host.server,"listening");
+    const client = new HTTPClient({tls:{ca:cert,key,cert}});
+    try {
+      const call = client.call(ref(`https://127.0.0.1:${host.server.address().port}`),"/echo",{timeoutMs:30});
+      if (verdict === "late") await assert.rejects(call); else assert.equal((await call).status,403);
+      await new Promise(resolve=>setTimeout(resolve,110)); assert.equal(dispatch,0);
+    } finally {client.close();await host.close();}
+  }
+});
+test("empty and malformed trust grants fail before a native host is created", () => {
+  const binding = new BootstrapBinding(bootstraps.cases[0].binding);
+  for (const ca of ["not a certificate",Buffer.alloc(0),[],cert.toString()+"garbage"]) {
+    assert.throws(()=>binding.resolveCredentials((_handle,kind)=>kind === "tls_identity" ? {key,cert} : kind === "tls_trust" ? {ca} : {authorize:()=>true},"server"));
+  }
+});
+test("common bootstrap resolves native TLS/auth grants once and gates domain dispatch", async () => {
+  const binding = new BootstrapBinding(bootstraps.cases[0].binding);
+  const resolved = [], authorization = { authorize: (req) => req.headers.authorization === "Bearer fixture", headers: { Authorization: "Bearer fixture" } };
+  function resolveGrant(handle, kind) {
+    resolved.push([handle,kind]);
+    return kind === "tls_identity" ? { key, cert } : kind === "tls_trust" ? { ca: cert } : authorization;
+  }
+  let dispatch = 0;
+  const host = createBoundHTTPHost((_req,res) => { dispatch++; res.end('{"ok":true}'); }, { binding, instanceId: boot, resolveGrant });
+  assert.equal(resolved.length,3);
+  host.server.listen(0, "127.0.0.1"); await once(host.server,"listening");
+  const address = `https://127.0.0.1:${host.server.address().port}`;
+  const client = new HTTPClient({ localTarget: "local", tls: { ca:cert,key,cert } });
+  try {
+    assert.equal((await client.call(ref(address),"/v1/echo",{timeoutMs:1000})).status,403);
+    assert.equal(dispatch,0);
+    assert.equal((await client.call(ref(address),"/v1/echo",{timeoutMs:1000,headers:authorization.headers})).status,200);
+    assert.equal(dispatch,1); assert.equal(resolved.length,3);
+  } finally { client.close(); await host.close(); }
 });

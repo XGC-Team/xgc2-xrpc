@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "source_revision": "b80f5c8af0621c240634dc294c7c5d1bb8724403",
+  "candidate_version": "@xgc2/xrpc@0.1.0",
+  "date": "2026-10-09",
+  "runtime": "Node.js 22.23.3, Linux amd64",
+  "source_test_command": "cd node && npm test",
+  "source_tests_passed": 24,
+  "shared_wire_cases": 33,
+  "policy_corpus": "Supported host/http/rpc/transport/client_pool/client_registry fields; explicit diagnostics/grpc rejected in this revision",
+  "independent_review": "Real retained-stream, cancellation, HEAD, policy-conflict, idle-buffer, request/output-head, IPv6 and tiny-head crash repros informed regression fixes; current source tests preserve the fixes",
+  "installation": {
+    "source": "git archive of source_revision, node directory only",
+    "package_sha256": "6351c6cd3e01d82db8a51215aca9f8ffcc3f8062f131c305a8c5696ef8f6f7af",
+    "method": "npm pack, fresh private consumer npm install --ignore-scripts, import @xgc2/xrpc, actual createRPCHost/native HTTPS and HTTPClient with trusted disposable CA",
+    "result": "200 response with verified instance and expected JSON; client and host close completed",
+    "temporary_provenance": "/tmp/xrpc-node-install-cadikls4"
+  },
+  "unverified": [
+    "production multi-architecture and Focal installation",
+    "native Bun host compatibility",
+    "cross-language full crash, weak-network, stopped-scheduler and OOM matrix",
+    "sustained overload resource and performance window",
+    "Node diagnostics support (next batch)",
+    "production mTLS identity grants"
+  ],
+  "node_unix_host": "Unsupported; Unix listen paths reject before bind. Node HTTP client may consume a leased local provider implemented by a formal SDK.",
+  "production_publication": "Not performed"
+}

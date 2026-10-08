@@ -53,10 +53,38 @@ Per-reference and global admission are fail-fast and avoid an Agent retry queue.
 `resolvePolicy` requires an explicit environment snapshot. Values, source,
 ceiling and revision are queryable via `effective()`. Host/client options map
 the supplied policy; conflicting explicit options fail. The Node package
-currently implements `host`, `http`, `rpc`, `transport`, `client_pool` and
-`client_registry`. Explicit diagnostics or gRPC settings fail rather than
-silently being ignored. `LOG_LEVEL`/`LOG_FORMAT` are not yet an implemented
-Node logging sink. No fields are currently administratively mutable.
+implements `host`, `http`, `rpc`, `transport`, `client_pool` and
+`client_registry`. With an explicit shared `Diagnostics` owner it additionally
+enforces `LOG_LEVEL`/`LOG_FORMAT`; unsupported gRPC settings fail.
+
+```js
+const { Diagnostics, resolvePolicy } = require("@xgc2/xrpc");
+const diagnostics = new Diagnostics({
+  sink: { kind: "supervisor_stderr", rotationOwner: "supervisor" },
+});
+const policy = resolvePolicy({ environment: { ...process.env }, diagnostics });
+// The product authenticates and authorizes administrative callers first.
+policy.update({ LOG_LEVEL: "warn" }, { expectedRevision: policy.revision });
+// Pass this same policy to hosts and clients. Drain those owners first.
+await diagnostics.close({ timeoutMs: 5000 });
+```
+
+The sink has one explicitly owned worker, fixed-cardinality counters, bounded
+ACKed record admission and no payload/header/error-text logging. The supervisor
+owns disk rotation. A stalled stderr retains real writer ownership and causes
+finite close to fail; a later close can wait for actual drain. It does not
+spawn a worker per host/reference. Only `LOG_LEVEL` is dynamically mutable, with
+revision CAS; prior snapshots remain immutable. `LOG_FORMAT` is startup-only.
+
+`loadBootstrapInput(explicitPath, { role: "server" | "client" })` loads the
+common versioned binding and explicitly named private credential files once.
+Use its `{ binding, resolveGrant, application }` with `createBoundHTTPHost`.
+See the shared [startup contract](https://github.com/XGC-Team/xgc2-xrpc/blob/main/contracts/bootstrap.md) and schemas for
+file ownership/byte limits. `application` is opaque product metadata; large
+configuration stays behind explicit managed references. The host verifies
+native TLS and authorization before dispatch. No credential environment
+variables or guessed paths are introduced. Native applications retain
+ownership of listen/readiness/drain/exit and create a fresh instance ID.
 
 `createRPCHost` supplies strict metadata gating for conformance and explicitly
 owned native HTTP listeners. It does **not** add a Unix lease. It cannot be
@@ -82,5 +110,5 @@ RSS guarantee is asserted.
 Validation: `npm test` uses real sockets and shared `contracts/fixtures` cases.
 Those fixtures are source tests; they are not shipped as a runtime dependency.
 The tests include real verified HTTPS with disposable certificates, and do not
-establish production Focal/ABI, mTLS, cross-language
+establish production Focal/ABI, cross-language
 crash, scheduler-stop, OOM or sustained overload acceptance.

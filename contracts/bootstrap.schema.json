@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/XGC-Team/xgc2-xrpc/contracts/bootstrap.schema.json",
+  "title": "XRPC BootstrapBinding v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "target_id", "service", "api_version", "profile", "endpoint", "runtime_grant", "authentication", "secret_handles", "storage_grants"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "target_id": {"$ref": "#/$defs/name"},
+    "service": {"$ref": "#/$defs/name"},
+    "api_version": {"$ref": "#/$defs/name"},
+    "profile": {"enum": ["http.v1", "grpc.v1"]},
+    "endpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "address"],
+      "properties": {"kind": {"enum": ["unix", "https", "tls"]}, "address": {"type": "string", "minLength": 1, "maxLength": 2048}}
+    },
+    "runtime_grant": {"$ref": "#/$defs/name"},
+    "authentication": {"enum": ["local_private", "server_tls", "mutual_tls"]},
+    "secret_handles": {
+      "type": "object", "maxProperties": 8,
+      "additionalProperties": false,
+      "properties": {
+        "tls_identity": {"$ref": "#/$defs/name"},
+        "tls_trust": {"$ref": "#/$defs/name"},
+        "authorization": {"$ref": "#/$defs/name"}
+      }
+    },
+    "storage_grants": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/name"}}
+  },
+  "allOf": [
+    {"if": {"properties": {"endpoint": {"properties": {"kind": {"const": "unix"}}}}}, "then": {"properties": {"authentication": {"const": "local_private"}}}},
+    {"if": {"properties": {"endpoint": {"properties": {"kind": {"enum": ["https", "tls"]}}}}}, "then": {"properties": {"authentication": {"enum": ["server_tls", "mutual_tls"]}, "secret_handles": {"required": ["tls_identity", "tls_trust", "authorization"]}}}},
+    {"if": {"properties": {"profile": {"const": "http.v1"}}}, "then": {"properties": {"endpoint": {"properties": {"kind": {"enum": ["unix", "https"]}}}}}},
+    {"if": {"properties": {"profile": {"const": "grpc.v1"}}}, "then": {"properties": {"endpoint": {"properties": {"kind": {"enum": ["unix", "tls"]}}}}}}
+  ],
+  "$defs": {"name": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}}
+}

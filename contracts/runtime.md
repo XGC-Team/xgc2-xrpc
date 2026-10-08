@@ -8,6 +8,24 @@ Runtime environment, configuration delivery, persistence, observability and
 administrative ownership follow [operations.md](operations.md). The shared
 environment namespace is `XGC2_XRPC_`; domain configuration is separate.
 
+## Choose the actual service boundary
+
+A product directory, process or small function does not by itself require an
+RPC listener. Establish its actual functions, callers and useful isolation or
+remote invocation before choosing one of these forms:
+
+| Form | Ownership and invocation |
+| --- | --- |
+| Independent service | A justified process boundary owns its endpoint, readiness and drain; callers use XRPC for its necessary service capabilities |
+| Module in an existing service host | The host shares one endpoint, execution/admission and lifecycle; modules expose domain functions through that host without their own listener, probe or ServiceRef |
+| Library or pure data path | Call domain functions directly or use the native data interface; no listener or service bootstrap is required |
+
+Simple modules may belong in an existing aggregate host. A data relay or
+device-facing process may retain its necessary data transport without gaining
+a separate RPC control plane. When service invocation is needed, use the shared
+SDK mechanisms; do not infer that need from a protocol or directory inventory.
+Record the chosen boundary and its callers/benefit in the owning product.
+
 ## Profiles
 
 `http.v1` uses HTTP/1.1 over a private Unix stream or authenticated HTTPS.
@@ -30,7 +48,7 @@ uses ROS services or command topics. ROS remains an algorithm/user-facing or
 device integration interface (for example MAVROS flight controller services),
 not the platform's internal service bus. ROS/Zenoh/DDS/RTP telemetry, real-time
 data loops, C ABI and shared memory remain data/implementation boundaries.
-The fact that a function is small is not an exemption from shared transport.
+Functions within the same host can call their domain implementation directly.
 
 ## Service references and lifecycle
 
@@ -104,12 +122,19 @@ The wire contract is shared across languages, including negative cases:
   metadata can shorten a host limit; a longer caller budget does not make an
   otherwise valid request malformed.
 
-Native gRPC streaming requires an actual caller deadline no later than the
+Internal gRPC streaming requires an actual caller deadline no later than the
 host's maximum call budget. Reject an absent/longer deadline before dispatch;
 substituting a shorter wrapper Context does not cancel the native stream's
 blocked receive. Cancellation must reach the underlying transport. Unary
 handlers may use a shorter effective budget, with admitted work still counted
 until it really terminates.
+
+Persistent native edge streams use an explicitly declared finite owner stream
+lifetime and connection grace, independent of the short internal RPC budget.
+Native authentication, peer epochs and domain stream semantics remain with
+that edge. The shared host enforces the actual transport lifetime, including
+blocked native I/O; a wrapper context or configurable aging grace alone cannot
+extend it. This does not release ownership of domain work that has not ended.
 
 Synchronous transport failures distinguish not-sent from outcome-unknown.
 Mutation calls are not automatically replayed. A cancelled RPC does not imply
@@ -140,6 +165,15 @@ them in batches where the domain supports it. Stable handles with generations
 identify records across removal/reuse; do not expose pointers into movable
 storage. Separate cold configuration/diagnostics from hot control state.
 
+Long-lived observation holds its bounded transport/observer allocation rather
+than occupying an execution worker while idle. Hosts distinguish accepted
+connections/streams and pending replies from runnable domain execution.
+Registering an asynchronous observer may release its execution slot only after
+that execution actually returns; cancellation cannot pretend blocked native
+work or its memory has ended. Command overload rejects explicitly. A latest
+telemetry value policy is chosen by that data path's semantics, never imposed
+as a silent generic command drop policy.
+
 Memory budgets include admitted connections, parser buffers, bodies, pending
 replies, queued work, operation results and slow consumers. Queue admission
 reserves its storage before reporting acceptance. Products publish limits and
@@ -152,7 +186,20 @@ ownership through cancellation and async completion; memory is not recycled
 while a reader or write still owns it. Prefer a bounded copy over unsafe
 aliasing. Measure allocation counts, peak resident/buffer memory, latency and
 throughput at realistic concurrency, including overload and slow peers; a
-class/struct choice or microbenchmark alone is not performance evidence.
+class/struct choice or microbenchmark alone is not performance evidence. Report
+allocation rate, RSS peak, actual native/SDK thread counts, tail latency and
+saturation/recovery against the combined connection, parser, body, queued work,
+execution, pending reply and slow-consumer budget. Fixed concurrency alone does
+not establish completion of performance acceptance.
+
+Choose compact AoS or SoA layouts from measured hot access patterns; neither
+SoA nor ECS is a mandatory repository-wide representation. Batch compatible
+work, separate hot data from cold metadata, and check shared counters for false
+sharing and global pools for contention. Locate CPU cost before changing a
+layout. Compare the same workload's cycles/instructions/cache misses where
+hardware counters are available, together with throughput, p99, allocation and
+RSS. Report unavailable counters explicitly; object/array names alone are not
+evidence of cache benefit.
 
 ## Language packages
 

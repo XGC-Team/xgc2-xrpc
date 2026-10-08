@@ -8,6 +8,8 @@ const { pipeline } = require("node:stream/promises");
 const { WebSocket, WebSocketServer } = require("ws");
 const { resolvePolicy, PolicyError, policyOptions } = require("./policy.cjs");
 const { HTTPClient, TransportError } = require("./client.cjs");
+const { BootstrapBinding, readBootstrapBinding, loadBootstrapInput } = require("./bootstrap.cjs");
+const { Diagnostics, DiagnosticCloseError, DiagnosticSinkError } = require("./diagnostics.cjs");
 
 function positive(value, fallback, name) {
   const result = value ?? fallback;
@@ -27,6 +29,8 @@ function createHTTPHost(handler, options = {}) {
     HEADER_TIMEOUT_MS: "headerTimeoutMs", IDLE_TIMEOUT_MS: "idleTimeoutMs",
     SHUTDOWN_TIMEOUT_MS: "shutdownMs",
   });
+  const diagnostics = options.policy?.diagnostics;
+  const emit = (event, fields) => diagnostics?.emit(event, fields);
   const maxConnections = positive(options.maxConnections, 32, "maxConnections");
   const maxInFlight = positive(options.maxInFlight, 32, "maxInFlight");
   const maxBodyBytes = positive(options.maxBodyBytes, 1048576, "maxBodyBytes");
@@ -62,24 +66,32 @@ function createHTTPHost(handler, options = {}) {
     keepAliveTimeout: positive(options.idleTimeoutMs, 30000, "idleTimeoutMs"),
     connectionsCheckingInterval: 250,
   }, (req, res) => {
-    req.on("error", () => res.destroy());
+    req.on("error", () => { emit("transport_failed", { category: req.receivedBytes > maxBodyBytes ? "resource_exhausted" : "unavailable" }); res.destroy(); });
     if (closing) {
+      emit("call_rejected", { category: "unavailable", in_flight: inFlight });
       res.writeHead(503, { Connection: "close" });
       res.end();
       return;
     }
     if (inFlight >= maxInFlight || Number(req.headers["content-length"] ?? 0) > maxBodyBytes) {
+      emit("call_rejected", { category: "resource_exhausted", in_flight: inFlight });
       res.writeHead(inFlight >= maxInFlight ? 429 : 413, { Connection: "close" });
       res.end();
       return;
     }
     inFlight++;
     activeHandlers++;
+    const started = performance.now();
+    emit("call_started", { in_flight: inFlight });
     let released = false, responseDone = false, handlerDone = false;
     const release = () => {
       if (!released && responseDone && handlerDone) {
         released = true;
         inFlight--;
+        emit("call_completed", { elapsed_ms: performance.now() - started, in_flight: inFlight });
+        // Native finish listeners mark this keepalive socket idle after the
+        // response event. Reap it on that completion boundary during drain.
+        if (closing) setImmediate(() => server.closeIdleConnections());
         changed();
       }
     };
@@ -134,15 +146,16 @@ function createHTTPHost(handler, options = {}) {
     // opt into a finite handler budget for routes without long-lived streams.
     let timer;
     if (callTimeoutMs) {
-      timer = setTimeout(() => res.destroy(), callTimeoutMs);
+      timer = setTimeout(() => { emit("deadline_exceeded", { budget_ms: callTimeoutMs }); res.destroy(); }, callTimeoutMs);
       timer.unref();
       res.once("close", () => clearTimeout(timer));
     }
     try {
       const suppliedId = req.headers["x-request-id"];
       res.setHeader("X-Request-ID", typeof suppliedId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(suppliedId) ? suppliedId : randomUUID());
-      Promise.resolve(handler(req, res)).catch(() => res.destroy()).finally(handlerFinished);
+      Promise.resolve(handler(req, res)).catch(() => { emit("handler_failed", { category: "internal" }); res.destroy(); }).finally(handlerFinished);
     } catch {
+      emit("handler_failed", { category: "internal" });
       res.destroy();
       handlerFinished();
     }
@@ -157,9 +170,10 @@ function createHTTPHost(handler, options = {}) {
     return nativeListen(...args);
   };
   server.on("connection", (socket) => {
-    if (closing || sockets.size >= maxConnections) { socket.destroy(); return; }
+    if (closing || sockets.size >= maxConnections) { emit("connection_rejected", { connections: sockets.size, category: "resource_exhausted" }); socket.destroy(); return; }
     sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
+    emit("connection_accepted", { connections: sockets.size });
+    socket.once("close", () => { sockets.delete(socket); emit("connection_closed", { connections: sockets.size }); });
   });
   server.on("upgrade", (req, socket, head) => {
     if (closing || !upgradeHandler) { socket.destroy(); return; }
@@ -170,18 +184,20 @@ function createHTTPHost(handler, options = {}) {
   function close() {
     if (shutdown) return shutdown;
     closing = true;
+    emit("shutdown_started", { in_flight: inFlight, budget_ms: shutdownMs });
     shutdown = new Promise((resolve, reject) => {
       let expired = false;
       const finish = () => {
         if (expired && activeHandlers) {
           changed = () => {};
           shutdown = undefined; // A later close can wait for actual quiescence.
+          emit("shutdown_failed", { category: "deadline_exceeded", in_flight: inFlight });
           reject(new Error(`shutdown deadline: ${activeHandlers} domain handlers remain active`));
         } else if (networkClosed && !inFlight) {
           clearTimeout(timer);
           changed = () => {};
-          if (networkError && networkError.code !== "ERR_SERVER_NOT_RUNNING") reject(networkError);
-          else resolve();
+          if (networkError && networkError.code !== "ERR_SERVER_NOT_RUNNING") { emit("shutdown_failed", { category: "unavailable" }); reject(networkError); }
+          else { emit("shutdown_completed", { in_flight: inFlight }); resolve(); }
         }
       };
       changed = finish;
@@ -397,6 +413,7 @@ function createRPCHost(handler, options = {}) {
     if (ids.length !== 1 || !/^[A-Za-z0-9._:-]{1,128}$/.test(ids[0]) || timeouts.length !== 1 || !/^[1-9][0-9]{0,7}$/.test(timeouts[0]) || Number(timeouts[0]) > 86400000 || instances.length > 1) code = "invalid_argument";
     else if (!(req.method === "GET" && discovery.has(req.url) && instances.length === 0) && (instances.length !== 1 || instances[0] !== instanceId)) code = "conflict";
     if (code) {
+      options.policy?.diagnostics?.emit("call_rejected", { category: code, instance_id: instanceId });
       res.writeHead(code === "conflict" ? 409 : 400, { "Content-Type": "application/json", Connection: "close" });
       res.end(JSON.stringify({ error: { code, message: "invalid RPC metadata" } }));
       return;
@@ -405,13 +422,30 @@ function createRPCHost(handler, options = {}) {
     const abort = new AbortController();
     const timeoutMs = Math.min(Number(timeouts[0]), maximum);
     const deadline = Date.now() + timeoutMs;
-    const timer = setTimeout(() => { abort.abort(); res.destroy(); }, timeoutMs);
+    const timer = setTimeout(() => { options.policy?.diagnostics?.emit("deadline_exceeded", { request_id: ids[0], instance_id: instanceId, budget_ms: timeoutMs }); abort.abort(); res.destroy(); }, timeoutMs);
     timer.unref();
-    const ended = () => { clearTimeout(timer); abort.abort(); };
+    const ended = () => { clearTimeout(timer); if (!res.writableFinished && !abort.signal.aborted) options.policy?.diagnostics?.emit("cancelled", { request_id: ids[0], instance_id: instanceId }); abort.abort(); };
     res.once("close", ended); res.once("finish", () => clearTimeout(timer));
     try { return await handler(req, res, { requestId: ids[0], instanceId, deadline, signal: abort.signal }); }
     finally { if (res.writableFinished || res.destroyed) clearTimeout(timer); }
   }, { ...options, maxResponseBytes: options.maxResponseBytes ?? 1048576, callTimeoutMs: maximum });
 }
 
-module.exports = { createHTTPHost, createFetchHost, createRPCHost, proxyWebSocket, resolvePolicy, PolicyError, HTTPClient, TransportError };
+function createBoundHTTPHost(handler, options) {
+  if (!(options?.binding instanceof BootstrapBinding)) throw new TypeError("validated BootstrapBinding required");
+  if (options.binding.profile !== "http.v1" || options.binding.endpoint.kind !== "https") throw new TypeError("Node native bound host requires HTTPS BootstrapBinding");
+  const credentials = options.binding.resolveCredentials(options.resolveGrant, "server");
+  if (options.tls != null) throw new TypeError("bound TLS comes from bootstrap grants");
+  return createRPCHost(async (req,res,context) => {
+    const authorized = await credentials.authorization.authorize(req, context);
+    if (context.signal.aborted || res.destroyed || Date.now() >= context.deadline) return;
+    if (authorized !== true) {
+      options.policy?.diagnostics?.emit("call_rejected", { operation: "authorization", request_id: context.requestId, instance_id: context.instanceId });
+      res.writeHead(403, { "Content-Type": "application/json", Connection: "close" });
+      res.end('{"error":{"code":"permission_denied","message":"caller is not authorized"}}');
+      return;
+    }
+    return handler(req,res,context);
+  }, { ...options, tls: credentials.tls });
+}
+module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, resolvePolicy, PolicyError, HTTPClient, TransportError };

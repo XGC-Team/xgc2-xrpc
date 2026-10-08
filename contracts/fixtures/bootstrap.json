@@ -1,0 +1,434 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "https_valid",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": true
+    },
+    {
+      "name": "schema_unsupported",
+      "binding": {
+        "schema_version": 2,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown_field",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ],
+        "instance_id": "persisted:old"
+      },
+      "valid": false
+    },
+    {
+      "name": "missing_target",
+      "binding": {
+        "schema_version": 1,
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "empty_handle",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "missing_auth",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "plain_http",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "http://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "resource_origin",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example/private"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "url_credentials",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://secret@fixture.example"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "profile_endpoint",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "grpc.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "remote_private",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "local_private",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "duplicate_grant",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state",
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "oversized_grants",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:0",
+          "fixture:1",
+          "fixture:2",
+          "fixture:3",
+          "fixture:4",
+          "fixture:5",
+          "fixture:6",
+          "fixture:7",
+          "fixture:8",
+          "fixture:9",
+          "fixture:10",
+          "fixture:11",
+          "fixture:12",
+          "fixture:13",
+          "fixture:14",
+          "fixture:15",
+          "fixture:16",
+          "fixture:17",
+          "fixture:18",
+          "fixture:19",
+          "fixture:20",
+          "fixture:21",
+          "fixture:22",
+          "fixture:23",
+          "fixture:24",
+          "fixture:25",
+          "fixture:26",
+          "fixture:27",
+          "fixture:28",
+          "fixture:29",
+          "fixture:30",
+          "fixture:31",
+          "fixture:32"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown_secret",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "https",
+          "address": "https://fixture.example:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller",
+          "secret_env": "PASSWORD"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "unix_binding_valid",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "http.v1",
+        "endpoint": {
+          "kind": "unix",
+          "address": "/private/runtime/rpc.sock"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "local_private",
+        "secret_handles": {},
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": true
+    },
+    {
+      "name": "grpc_tls_valid",
+      "binding": {
+        "schema_version": 1,
+        "target_id": "fixture:target",
+        "service": "fixture",
+        "api_version": "v1",
+        "profile": "grpc.v1",
+        "endpoint": {
+          "kind": "tls",
+          "address": "[::1]:8443"
+        },
+        "runtime_grant": "fixture:runtime",
+        "authentication": "mutual_tls",
+        "secret_handles": {
+          "tls_identity": "fixture:identity",
+          "tls_trust": "fixture:trust",
+          "authorization": "fixture:caller"
+        },
+        "storage_grants": [
+          "fixture:state"
+        ]
+      },
+      "valid": true
+    }
+  ]
+}

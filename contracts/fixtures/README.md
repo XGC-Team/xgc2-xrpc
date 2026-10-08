@@ -19,6 +19,12 @@ effective field values and `sources` uses `sdk_default`, `deployment`, or
 for unknown reserved keys). The implementation must reject unsupported known
 keys when explicitly requested; merely parsing a setting is not enforcement.
 
+`bootstrap.json` supplies common positive/negative `BootstrapBinding` cases.
+The startup input schema additionally covers actual owner-granted credential
+files. Test private permissions, symlink/hardlink/FIFO rejection, bounded reads,
+invalid TLS material, native mTLS, authorization and cancellation before domain
+dispatch. A test-only injected resolver does not establish deployed startup.
+
 The packaged runtime registries are generated from `runtime-policy.json` by
 `python3 tools/generate-policy.py`. CI runs it with `--check`; generated copies
 are distribution assets, not independent registries.

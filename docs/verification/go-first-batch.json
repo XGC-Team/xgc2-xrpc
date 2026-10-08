@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source_commit": "35c23b5583998ee825e161213ab6c01c01e06104",
+  "scope": "Go HTTP/gRPC shared runtime first source batch; not full release acceptance",
+  "module": "github.com/XGC-Team/xgc2-xrpc/go",
+  "version": "v0.0.0-20261008183413-35c23b558399",
+  "go_minimum": "1.24",
+  "module_sum": "h1:zww4QE18mlJIhNKVn3CWJyqwGBAa9o5CLA1F0LTT7vw=",
+  "module_go_mod_sum": "h1:SbR8WMLhRLqW77NAaSD1tKKpPxT1SQavGU2ciCTF74A=",
+  "verified": [
+    "Owner CGO_ENABLED=0 go test ./... -timeout30s",
+    "Owner CGO_ENABLED=1 go test -race ./... -timeout45s",
+    "Root CGO_ENABLED=0 go test ./...",
+    "Independent process:33 wire cases and22 environment cases, SIGTERM exit0",
+    "Remote private repository go list resolved immutable version",
+    "Fresh consumer go mod tidy fetched remote immutable module without replace",
+    "CGO_ENABLED=0 fresh consumer real Unix socket RPC200 and successful drain"
+  ],
+  "install_consumer": "/tmp/xrpc-go-module-install-9df4q77i",
+  "not_verified": [
+    "Full cross-language weak-network/crash/scheduler/OOM/resource matrix",
+    "Entire product chain and live deployment",
+    "Next bootstrap input batch",
+    "Every native edge workload and all supported deployment ABIs"
+  ]
+}
