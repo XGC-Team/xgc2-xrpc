@@ -1,0 +1,699 @@
+{
+  "schema_version": 1,
+  "instance_id": "fixture:boot-1",
+  "cases": [
+    {
+      "name": "valid_bound",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "timeout_valid_1",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "timeout_valid_86400000",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "86400000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "timeout_zero",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "0"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_leading_zero",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "01"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_plus",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "+1"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_minus",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "-1"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_fraction",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1.5"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_exponent",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1e3"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_empty",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          ""
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_over_max",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "86400001"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_overflow",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "999999999999999999999999999999999999999"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_symbol",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "*"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_missing",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "timeout_duplicate",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ],
+        [
+          "x-xrpc-timeout-ms",
+          "1000"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_empty",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          ""
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_comma",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "a,b"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_slash",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "a/b"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_space",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "a b"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_over_max",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_missing",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_duplicate",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ],
+        [
+          "x-request-id",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "request_id_max",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "instance_empty",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          ""
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "instance_mismatch",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-2"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "instance_missing",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "instance_duplicate",
+      "method": "GET",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_absent",
+      "method": "GET",
+      "path": "/v1/describe",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "discovery_bound",
+      "method": "GET",
+      "path": "/v1/describe",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "discovery_empty",
+      "method": "GET",
+      "path": "/v1/describe",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          ""
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_duplicate_empty",
+      "method": "GET",
+      "path": "/v1/describe",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          ""
+        ],
+        [
+          "x-xrpc-instance-id",
+          ""
+        ]
+      ],
+      "status": 400,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_mismatch",
+      "method": "GET",
+      "path": "/v1/describe",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-2"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "head_bound",
+      "method": "HEAD",
+      "path": "/v1/echo",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    }
+  ]
+}

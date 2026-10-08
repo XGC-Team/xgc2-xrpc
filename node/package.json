@@ -1,0 +1,13 @@
+{
+  "name": "@xgc2/xrpc",
+  "version": "0.1.0",
+  "description": "Bounded HTTP RPC clients and HTTP/WebSocket hosts for XGC2 service edges",
+  "license": "MIT",
+  "main": "index.cjs",
+  "types": "index.d.cts",
+  "exports": "./index.cjs",
+  "engines": { "node": ">=20" },
+  "files": ["index.cjs", "index.d.cts", "client.cjs", "policy.cjs", "runtime-policy.json", "README.md"],
+  "scripts": { "test": "node --test test/*.test.cjs" },
+  "dependencies": { "ws": "8.22.0" }
+}
