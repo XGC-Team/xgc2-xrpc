@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "profile": "grpc.v1",
+  "instance_id": "fixture:boot-1",
+  "host_call_timeout_ms": 500,
+  "cases": [
+    {
+      "name": "bound-unary",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "OK",
+      "dispatch": 1
+    },
+    {
+      "name": "bound-stream",
+      "method": "stream",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "OK",
+      "dispatch": 1
+    },
+    {
+      "name": "request-id-empty",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          ""
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "request-id-space",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "request id"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "request-id-non-ascii",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "request:\u00e9"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "request-id-overlong",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "request-id-missing",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "request-id-duplicate",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "request-id-max-length",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "OK",
+      "dispatch": 1
+    },
+    {
+      "name": "instance-missing",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ]
+      ],
+      "status": "FAILED_PRECONDITION",
+      "dispatch": 0
+    },
+    {
+      "name": "instance-empty",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          ""
+        ]
+      ],
+      "status": "FAILED_PRECONDITION",
+      "dispatch": 0
+    },
+    {
+      "name": "instance-mismatched",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:old"
+        ]
+      ],
+      "status": "FAILED_PRECONDITION",
+      "dispatch": 0
+    },
+    {
+      "name": "instance-duplicate",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "discovery-unbound",
+      "method": "unary",
+      "discovery": true,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ]
+      ],
+      "status": "OK",
+      "dispatch": 1
+    },
+    {
+      "name": "discovery-bound",
+      "method": "unary",
+      "discovery": true,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "OK",
+      "dispatch": 1
+    },
+    {
+      "name": "discovery-instance-empty",
+      "method": "unary",
+      "discovery": true,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          ""
+        ]
+      ],
+      "status": "FAILED_PRECONDITION",
+      "dispatch": 0
+    },
+    {
+      "name": "discovery-instance-mismatched",
+      "method": "unary",
+      "discovery": true,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:old"
+        ]
+      ],
+      "status": "FAILED_PRECONDITION",
+      "dispatch": 0
+    },
+    {
+      "name": "discovery-instance-duplicate",
+      "method": "unary",
+      "discovery": true,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "discovery-stream",
+      "method": "stream",
+      "discovery": true,
+      "deadline_ms": 120,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "unary-deadline-missing",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": null,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "stream-deadline-missing",
+      "method": "stream",
+      "discovery": false,
+      "deadline_ms": null,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "stream-deadline-over-host",
+      "method": "stream",
+      "discovery": false,
+      "deadline_ms": 1000,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "INVALID_ARGUMENT",
+      "dispatch": 0
+    },
+    {
+      "name": "unary-longer-caller-budget",
+      "method": "unary",
+      "discovery": false,
+      "deadline_ms": 1000,
+      "metadata": [
+        [
+          "x-request-id",
+          "fixture:req-1"
+        ],
+        [
+          "x-xrpc-instance-id",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": "OK",
+      "dispatch": 1
+    }
+  ]
+}

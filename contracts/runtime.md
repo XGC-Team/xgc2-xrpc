@@ -122,6 +122,28 @@ The wire contract is shared across languages, including negative cases:
   metadata can shorten a host limit; a longer caller budget does not make an
   otherwise valid request malformed.
 
+For `grpc.v1`, the SDK owns lowercase `x-request-id` and
+`x-xrpc-instance-id` metadata, alongside native gRPC deadline/framing. Request
+IDs use the same 1–128 ASCII token grammar above. Missing, duplicate, empty or
+invalid request IDs return `INVALID_ARGUMENT`. Duplicate instance metadata
+returns `INVALID_ARGUMENT`; a bound call with a missing, single empty or
+mismatched instance returns `FAILED_PRECONDITION`. Every rejection precedes
+domain dispatch. A declared unary discovery method alone may omit the instance
+key; a supplied value is still bound exactly, and discovery is never a fallback
+for a rejected invocation or a streaming mode.
+
+Admitted responses echo exactly one matching request ID and the actual hosting
+instance. Streaming hosts publish those initial metadata before blocking on
+payload I/O, and clients verify them before using stream payloads. A successful
+response with absent, duplicate or mismatched fence/correlation metadata fails
+with `FAILED_PRECONDITION`. A native transport rejection with no response
+metadata retains its native failure; it is not converted into a fictitious
+successful response. Unbound discovery returns the same hosting incarnation in
+its metadata and domain ServiceRef. There is no common business Protobuf schema;
+generated methods and payloads remain with their domain owners. The metadata
+corpus is [fixtures/grpc-wire.json](fixtures/grpc-wire.json); it does not claim
+that each language has already passed the required native checks.
+
 Internal gRPC streaming requires an actual caller deadline no later than the
 host's maximum call budget. Reject an absent/longer deadline before dispatch;
 substituting a shorter wrapper Context does not cancel the native stream's
