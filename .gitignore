@@ -6,3 +6,6 @@ __pycache__/
 node_modules/
 dist/
 *.egg-info/
+
+# Local validation receipts are retained outside the released SDK sources.
+/cpp/validation/
