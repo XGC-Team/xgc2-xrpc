@@ -144,6 +144,7 @@ def main():
             raise ValueError("pinned Node npm artifact SHA256 mismatch")
         verify_source_tar(args.node_tarball, args.node_source_sha)
     source_sha = None
+    committed = {}
     if args.release_source_sha:
         if not re.fullmatch(r"[0-9a-f]{40}", args.release_source_sha):
             raise ValueError("release source SHA must be a full lowercase commit ID")
@@ -154,6 +155,13 @@ def main():
             raise ValueError("release candidate requires all SDKs and native C++ gRPC")
         if args.cmake_prefix or args.shlibdeps_package_root or args.shlibdeps_library_path:
             raise ValueError("release toolchains must be installed in the controlled image; local dependency extraction is not release evidence")
+        tree = run(["git", "ls-tree", "-rz", source_sha], cwd=ROOT, capture=True)
+        for record in tree.split("\0"):
+            if record:
+                identity, name = record.split("\t", 1)
+                mode, kind, oid = identity.split()
+                if kind == "blob" and mode in ("100644", "100755"):
+                    committed[name] = oid
     text = (ROOT / ".xgc2/product.yml").read_text()
     product_version = re.search(r"^version: (\S+)$", text, re.M).group(1)
     sdk_version = product_version.split("-", 1)[0]
@@ -167,6 +175,8 @@ def main():
     for directory in languages + ["contracts", "packaging", "tools", ".xgc2"]:
         for path in source_files(ROOT / directory):
             relative = path.relative_to(ROOT)
+            if source_sha and str(relative) not in committed:
+                continue
             target = source / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
@@ -181,14 +191,6 @@ def main():
         "node_artifact_override": {"sha256": args.node_tarball_sha256, "source_sha": args.node_source_sha}},
         sort_keys=True).encode()).hexdigest()
     if source_sha:
-        tree = run(["git", "ls-tree", "-rz", source_sha], cwd=ROOT, capture=True)
-        committed = {}
-        for record in tree.split("\0"):
-            if record:
-                identity, name = record.split("\t", 1)
-                mode, kind, oid = identity.split()
-                if kind == "blob" and mode in ("100644", "100755"):
-                    committed[name] = oid
         for name in inputs:
             if name not in committed or run(["git", "hash-object", "--no-filters", source / name], cwd=ROOT, capture=True) != committed[name]:
                 raise ValueError("build input is not exact committed source: " + name)
