@@ -418,7 +418,8 @@ void client_only_policy_mapping() {
   options.environment = {{"XGC2_XRPC_MAX_REQUEST_BYTES", "4096"},
       {"XGC2_XRPC_MAX_RESPONSE_BYTES", "8192"}, {"XGC2_XRPC_CALL_TIMEOUT_MS", "1100"},
       {"XGC2_XRPC_IDLE_TIMEOUT_MS", "2000"}};
-  const auto limits = grpc_client_limits(resolve_runtime_policy(options));
+  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
+  const auto limits = grpc_client_limits(resolve_runtime_policy(options), {"IDLE_TIMEOUT_MS"});
   assert(limits.request_bytes == 4096 && limits.response_bytes == 8192);
   assert(limits.call_timeout == 1100ms && limits.idle_timeout == 2000ms);
   const auto channel_arguments = grpc_channel_arguments(limits);
@@ -431,8 +432,8 @@ void client_only_policy_mapping() {
       assert(argument.type == GRPC_ARG_INTEGER && argument.value.integer == 2000);
     }
   }
-  assert(idle_arguments == 1);
-  auto manual = limits; manual.idle_timeout = 999ms;
+  assert(idle_arguments == 0);
+  auto manual = limits; manual.idle_timeout = 0ms;
   throws([&] { (void)grpc_channel_arguments(manual); });
   manual.idle_timeout = 2147483647ms;
   throws([&] { (void)grpc_channel_arguments(manual); });
@@ -449,8 +450,8 @@ void client_only_policy_mapping() {
   options.environment.back().second = "2147483647";
   throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
   options.environment.back().second = "2147483646";
-  assert(grpc_client_limits(resolve_runtime_policy(options)).idle_timeout == 2147483646ms);
-  options.environment.back().second = "2000";
+  assert(grpc_client_limits(resolve_runtime_policy(options), {"IDLE_TIMEOUT_MS"}).idle_timeout == 2147483646ms);
+  options.environment.pop_back();
   options.environment.push_back({"XGC2_XRPC_HOST_MAX_IN_FLIGHT", "7"});
   // No declared host owner: a client-only resolver rejects this environment.
   throws([&] { (void)resolve_runtime_policy(options); });

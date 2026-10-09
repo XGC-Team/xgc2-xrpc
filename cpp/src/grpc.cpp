@@ -2,6 +2,7 @@
 #include "xgc2/xrpc/diagnostics.hpp"
 #include <grpc/impl/codegen/grpc_types.h>
 #include <grpcpp/server_posix.h>
+#include <grpcpp/resource_quota.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -91,9 +92,9 @@ GrpcLimits grpc_limits(const RuntimePolicy& policy) {
 GrpcLimits grpc_client_limits(const RuntimePolicy& policy,
                              std::span<const std::string_view> owner_applied) {
   std::vector<std::string_view> applied{"MAX_REQUEST_BYTES", "MAX_RESPONSE_BYTES",
-      "CALL_TIMEOUT_MS", "IDLE_TIMEOUT_MS", "MAX_HEADER_BYTES"};
+      "CALL_TIMEOUT_MS", "MAX_HEADER_BYTES"};
   for (const auto name : owner_applied) {
-    if (name != "GRPC_MAX_STREAMS_PER_CONNECTION")
+    if (name != "GRPC_MAX_STREAMS_PER_CONNECTION" && name != "IDLE_TIMEOUT_MS")
       throw RuntimePolicyError(std::string(name), "unsupported client owner field");
     applied.push_back(name);
   }
@@ -108,9 +109,8 @@ GrpcLimits grpc_client_limits(const RuntimePolicy& policy,
     limits.header_bytes = policy.integer("MAX_HEADER_BYTES");
   if (policy.supports("GRPC_MAX_STREAMS_PER_CONNECTION"))
     limits.streams_per_connection = policy.integer("GRPC_MAX_STREAMS_PER_CONNECTION");
-  // Stay within the documented native client idle range (minimum one second).
-  if (limits.idle_timeout < std::chrono::seconds(1))
-    throw RuntimePolicyError("IDLE_TIMEOUT_MS", "native client idle minimum is 1000 ms");
+  // Channel lifetime belongs to its owner. The supported native baseline
+  // bounds server idle connections, but has no client idle eviction option.
   if (limits.idle_timeout.count() >= 2147483647)
     throw RuntimePolicyError("IDLE_TIMEOUT_MS", "native INT_MAX idle value means unlimited");
   validate(limits);
@@ -123,7 +123,7 @@ GrpcClock::time_point grpc_stream_deadline(const GrpcLimits& limits,
   if (caller_deadline == GrpcClock::time_point::max() || caller_deadline <= now ||
       caller_deadline - now > std::chrono::hours(24))
     throw std::invalid_argument("finite stream caller deadline within 24 hours required");
-  // gRPC 1.51 rounds native deadlines to milliseconds and timeout encoding
+  // Native gRPC rounds deadlines to milliseconds and timeout encoding
   // upward by at most one percent. Do not relax the host's actual-native check.
   const auto margin = std::chrono::milliseconds((limits.call_timeout.count() + 99) / 100 + 3);
   if (limits.call_timeout <= margin)
@@ -491,13 +491,10 @@ GrpcStats GrpcUnixServer::stats() const noexcept {
 const std::string& GrpcUnixServer::socket_path() const noexcept { return impl_->path; }
 grpc::ChannelArguments grpc_channel_arguments(const GrpcLimits& limits) {
   validate(limits);
-  if (limits.idle_timeout < std::chrono::seconds(1))
-    throw std::invalid_argument("native client idle minimum is 1000 ms");
   grpc::ChannelArguments args;
   args.SetMaxReceiveMessageSize(static_cast<int>(limits.response_bytes));
   args.SetMaxSendMessageSize(static_cast<int>(limits.request_bytes));
   args.SetInt(GRPC_ARG_MAX_METADATA_SIZE, static_cast<int>(limits.header_bytes));
-  args.SetInt(GRPC_ARG_CLIENT_IDLE_TIMEOUT_MS, static_cast<int>(limits.idle_timeout.count()));
   args.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
   grpc::ResourceQuota quota;
   quota.Resize(limits.native_memory_bytes).SetMaxThreads(limits.native_threads);

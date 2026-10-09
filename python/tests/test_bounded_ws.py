@@ -226,9 +226,9 @@ class BoundedWebSocketTests(unittest.TestCase):
         async def check():
             for value in (True,math.inf,math.nan,0):
                 with self.assertRaises(ValueError):
-                    await anext(iter_body(Request(),max_bytes=value))
+                    await iter_body(Request(),max_bytes=value).__anext__()
             with self.assertRaises(ValueError):
-                await anext(iter_body(Request(),chunk_size=True))
+                await iter_body(Request(),chunk_size=True).__anext__()
         asyncio.run(check())
 
 

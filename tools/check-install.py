@@ -137,7 +137,7 @@ def check_cpp(args, directory, evidence, work, checks):
             shutil.copy2(path, target, follow_symlinks=False)
             if ".so." in path.name and path.is_file() and not path.is_symlink():
                 runtime.append(target)
-    if len(runtime) != (5 if profile == "grpc" else 4):
+    if len(runtime) != (6 if profile == "grpc" else 5):
         raise ValueError("wrong installed native library count")
     for library in runtime:
         info = elf_info(library, args.distribution, args.architecture)
@@ -185,7 +185,7 @@ def check_cpp(args, directory, evidence, work, checks):
 def check_python(args, file, work, checks, sdk_version):
     if not args.wheelhouse:
         raise ValueError("Python verification needs a preprovisioned offline --wheelhouse")
-    run([args.python, "-c", "import sys; assert sys.version_info >= (3,10)"])
+    run([args.python, "-c", "import sys; assert sys.version_info >= (3,8)"])
     env = work / "python-venv"
     run([args.python, "-m", "venv", env])
     interpreter = env / "bin/python"
@@ -196,9 +196,9 @@ def check_python(args, file, work, checks, sdk_version):
     probe = """import json, pathlib, sys, importlib.metadata as m
 import xgc2_xrpc, aiohttp
 from xgc2_xrpc.policy import resolve_policy
-assert pathlib.Path(xgc2_xrpc.__file__).is_relative_to(pathlib.Path(sys.prefix))
+pathlib.Path(xgc2_xrpc.__file__).relative_to(pathlib.Path(sys.prefix))
 assert resolve_policy({}) is not None
-assert aiohttp.__version__ == '3.14.4'
+assert aiohttp.__version__ == '3.10.11'
 assert m.version('httpx') == '0.28.1' and m.version('httpcore') == '1.0.9'
 assert callable(aiohttp.web.Application)
 versions = {'python':sys.version.split()[0], 'sdk':m.version('xgc2-xrpc'), 'aiohttp':aiohttp.__version__}

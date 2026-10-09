@@ -17,12 +17,12 @@ apt:
   - libxgc2-xrpc-grpc-dev
   - node-xgc2-xrpc
   depends:
-  - libgrpc++-dev (>= 1.51)
+  - libgrpc++-dev (>= 1.16)
   - libprotobuf-dev
 usage:
   install: sudo apt install libxgc2-xrpc-dev libxgc2-xrpc-grpc-dev node-xgc2-xrpc
   smoke_test: cmake --find-package -DNAME=XgcXrpc -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST
-  notes: C++ consumers use XgcXrpc::http or the explicit grpc component. Python wheel, Go source archive, Rust crate and Node npm tarball install through their native package managers. Python uses an explicitly selected interpreter >=3.10. The Architecture all node-xgc2-xrpc package installs the same Node library with private pinned ws; consumers provide an explicitly selected Node >=20 runtime. Its installation identity is recorded in /usr/share/xgc2/xrpc/node/install-identity.json.
+  notes: C++ consumers use XgcXrpc::http or the explicit grpc component. Python wheel, Go source archive, Rust crate and Node npm tarball install through their native package managers. Python uses an explicitly selected interpreter >=3.8. The Architecture all node-xgc2-xrpc package installs the same Node library with private pinned ws; consumers provide an explicitly selected Node >=20 runtime. Its installation identity is recorded in /usr/share/xgc2/xrpc/node/install-identity.json.
 ownership:
   paths:
   - /usr/include/xgc2/xrpc

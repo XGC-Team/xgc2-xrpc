@@ -19,7 +19,7 @@ cmake --install build --prefix /explicit/package/prefix
 Boost >= 1.70 supplies Beast/Asio and cold policy JSON parsing. GNU builds
 require GCC >= 11; CMake also checks actual C++20 standard-library facilities.
 The Unix primitive itself has no Boost dependency. Optional gRPC requires a
-native gRPC >= 1.51 package, Protobuf and its C++ generator for tests. The test
+native gRPC >= 1.16 package, Protobuf and its C++ generator for tests. The test
 service/generated proto is not an installed product contract.
 
 ## Policy and HTTP ownership

@@ -23,10 +23,18 @@ class RuntimeTests(unittest.TestCase):
             errors=[]
             previous=loop.get_exception_handler()
             loop.set_exception_handler(lambda owner,context:errors.append(context))
-            left,right=socket.socketpair()
-            left.setblocking(False)
+            directory=tempfile.TemporaryDirectory()
+            listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            listener.setblocking(False)
+            listener.bind(os.path.join(directory.name,"native.sock"))
+            listener.listen(1)
+            connecting=asyncio.create_task(anyio.connect_unix(os.path.join(directory.name,"native.sock")))
+            right,_=await loop.sock_accept(listener)
             right.setblocking(False)
-            stream=await anyio.abc.UNIXSocketStream.from_socket(left)
+            stream=await connecting
+            left=stream.extra(anyio.abc.SocketAttribute.raw_socket)
+            listener.close()
+            directory.cleanup()
             registration=loop.create_future()
             original=loop.add_reader
             def observe(fd,callback,*args):
@@ -165,9 +173,9 @@ class RuntimeTests(unittest.TestCase):
         runtime=Runtime(blocking_workers=1)
         entered,release=threading.Event(),threading.Event()
         files=[]
-        original=native_request.SpooledTemporaryFile
+        original=native_request.tempfile.TemporaryFile
         class SlowFile:
-            def __init__(self): self.file=original(1)
+            def __init__(self): self.file=original()
             def __getattr__(self,name): return getattr(self.file,name)
             def write(self,data):
                 entered.set()
@@ -186,7 +194,7 @@ class RuntimeTests(unittest.TestCase):
             router.add_post("/upload",upload)
             host=Host.from_app(router,path=path,runtime=runtime,limits=Limits(shutdown_timeout=.02))
             peer=socket.socket(socket.AF_UNIX)
-            with patch.object(native_request,"SpooledTemporaryFile",factory),patch.object(native_request,"_FILE_SPOOL_MAX_SIZE",1):
+            with patch.object(native_request.tempfile,"TemporaryFile",factory):
                 host.start()
                 try:
                     peer.connect(path)
@@ -255,7 +263,7 @@ class RuntimeTests(unittest.TestCase):
         runtime=PausedRuntime()
         runtime._start()
         try:
-            with self.assertRaises(TimeoutError): runtime.close(timeout=.02)
+            with self.assertRaises(concurrent.futures.TimeoutError): runtime.close(timeout=.02)
             self.assertTrue(entered.is_set())
             self.assertFalse(runtime.closed)
         finally:

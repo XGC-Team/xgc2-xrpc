@@ -352,7 +352,9 @@ class Runtime:
             if self._native_owners or self._jobs:
                 raise RuntimeError("runtime still owns native clients or domain work")
             self._closing = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        # Ownership checks above already require every queued/running job to
+        # finish. There is no pending work to cancel during executor shutdown.
+        self._executor.shutdown(wait=False)
         self.diagnostics.close(timeout)
         self.closed = True
 

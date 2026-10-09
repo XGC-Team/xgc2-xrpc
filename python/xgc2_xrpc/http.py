@@ -195,9 +195,10 @@ class _AdmissionServer(web.Server):
     def __init__(self, handler, runtime, limits, *, request_factory=None):
         self.runtime,self.limits=runtime,limits
         self.admitted=set()
+        self.initial_headers={}
         if request_factory is None:
             def request_factory(message,payload,protocol,writer,task):
-                return _PolicyBaseRequest(message,payload,protocol,writer,task,runtime.loop,client_max_size=limits.body_bytes)
+                return _PolicyBaseRequest(message,payload,protocol,writer,task,runtime.loop,client_max_size=limits.body_bytes+1)
         super().__init__(handler,request_factory=request_factory,logger=_NativeLogger(runtime),access_log=None,handler_cancellation=True,keepalive_timeout=min(limits.header_timeout,limits.idle_timeout),
                          max_line_size=limits.header_bytes,max_field_size=limits.header_bytes,max_headers=limits.header_count,
                          read_bufsize=min(limits.body_bytes,65536),lingering_time=0,auto_decompress=False,
@@ -215,8 +216,14 @@ class _AdmissionServer(web.Server):
             self.runtime.notify("connection_rejected")
             return
         self.runtime.notify("connection_accepted",connections=connections)
+        self.initial_headers[handler]=self.runtime.loop.call_later(self.limits.header_timeout,transport.close)
         super().connection_made(handler,transport)
+    def headers_received(self,handler):
+        timer=self.initial_headers.pop(handler,None)
+        if timer is not None:
+            timer.cancel()
     def connection_lost(self,handler,exc=None):
+        self.headers_received(handler)
         with self.runtime._ownership_lock:
             admitted=handler in self.admitted
             if admitted:
@@ -316,7 +323,7 @@ class Host:
         host._app=app
         host._edge_handler=app._handle
         # Native read()/post() must use the tighter application/host body limit.
-        app._client_max_size=min(app._client_max_size,host.limits.body_bytes) if app._client_max_size else host.limits.body_bytes
+        app._client_max_size=min(app._client_max_size,host.limits.body_bytes+1) if app._client_max_size else host.limits.body_bytes+1
         host._address,host._ssl=address,ssl_context
         return host
 
@@ -491,6 +498,7 @@ class Host:
         return response
 
     async def _handle(self,request):
+        self._server.headers_received(request.protocol)
         request[HOST_KEY]=self
         if self._state!="running" or len(self._active)>=self.limits.in_flight or self.runtime.calls>=self.runtime.max_calls:
             self.runtime.notify("call_rejected",category="resource_exhausted",in_flight=self.runtime.calls)

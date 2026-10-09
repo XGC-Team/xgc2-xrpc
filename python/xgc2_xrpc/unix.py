@@ -76,7 +76,16 @@ class UnixLease:
         if not stat.S_ISSOCK(current.st_mode):
             raise RuntimeError("bound endpoint is not a socket")
         self.identity = (current.st_dev, current.st_ino)
-        os.chmod(self.name, self.mode, dir_fd=self.parent, follow_symlinks=False)
+        descriptor = os.open(self.name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISSOCK(opened.st_mode) or (opened.st_dev, opened.st_ino) != self.identity:
+                raise FileExistsError("bound endpoint changed before permissions were established")
+            # O_PATH pins this socket inode; the proc descriptor path applies
+            # permissions to it without following a substituted endpoint name.
+            os.chmod("/proc/self/fd/%d" % descriptor, self.mode)
+        finally:
+            os.close(descriptor)
 
     def bind(self, backlog=16):
         try:

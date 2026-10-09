@@ -27,6 +27,8 @@ GrpcLimits grpc_limits(const RuntimePolicy&);
 // Client projection requires no host capability. Native channel settings do
 // not cap outgoing streams: a bounded owner may declare that field applied,
 // but must enforce its own complete concurrent-call/stream count.
+// IDLE_TIMEOUT_MS also requires an owner that actually retires idle channels;
+// the supported native baseline only provides server-side idle eviction.
 GrpcLimits grpc_client_limits(const RuntimePolicy&,
     std::span<const std::string_view> owner_applied = {});
 inline GrpcLimits grpc_client_limits(const RuntimePolicy& policy,

@@ -69,7 +69,8 @@ target_link_libraries(xgc2_xrpc_http PUBLIC xgc2_xrpc_unix xgc2_xrpc_policy
 option(XGC2_XRPC_ENABLE_GRPC "Build the optional native gRPC C++ SDK" OFF)
 if(XGC2_XRPC_ENABLE_GRPC)
   find_package(Protobuf REQUIRED)
-  find_package(gRPC 1.51 CONFIG REQUIRED)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(XgcXrpcNativeGrpc REQUIRED IMPORTED_TARGET grpc++>=1.16)
   add_library(xgc2_xrpc_grpc SHARED src/grpc.cpp)
   add_library(XgcXrpc::grpc ALIAS xgc2_xrpc_grpc)
   set_target_properties(xgc2_xrpc_grpc PROPERTIES EXPORT_NAME grpc
@@ -80,7 +81,7 @@ if(XGC2_XRPC_ENABLE_GRPC)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
   target_link_libraries(xgc2_xrpc_grpc PUBLIC xgc2_xrpc_unix xgc2_xrpc_policy
-    xgc2_xrpc_diagnostics gRPC::grpc++ Threads::Threads)
+    xgc2_xrpc_diagnostics PkgConfig::XgcXrpcNativeGrpc Threads::Threads)
   install(TARGETS xgc2_xrpc_grpc EXPORT XgcXrpcGrpcTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -137,13 +138,17 @@ if(BUILD_TESTING)
     set_tests_properties(xrpc_cpp_${case} PROPERTIES TIMEOUT 30)
   endforeach()
   if(XGC2_XRPC_ENABLE_GRPC)
+    find_program(XgcXrpcGrpcPlugin grpc_cpp_plugin)
+    if(NOT XgcXrpcGrpcPlugin)
+      message(FATAL_ERROR "gRPC fixture generation requires grpc_cpp_plugin")
+    endif()
     set(grpc_fixture_dir "${CMAKE_CURRENT_BINARY_DIR}/grpc-fixture")
     file(MAKE_DIRECTORY "${grpc_fixture_dir}")
     add_custom_command(OUTPUT
       "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.pb.h"
       "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.h"
       COMMAND protobuf::protoc --cpp_out=${grpc_fixture_dir} --grpc_out=${grpc_fixture_dir}
-        --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+        --plugin=protoc-gen-grpc=${XgcXrpcGrpcPlugin}
         --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/grpc_fixture.proto
       DEPENDS tests/grpc_fixture.proto VERBATIM)

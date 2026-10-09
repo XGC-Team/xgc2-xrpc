@@ -5,7 +5,9 @@ once through owned directory descriptors; native TLS uses those loaded bytes.
 Application configuration and storage use remain the application's authority.
 """
 
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+from dataclasses import dataclass
 import hashlib
 import hmac
 import ipaddress
@@ -69,8 +71,10 @@ def _endpoint(profile, value):
     return Endpoint(kind, address)
 
 
-@dataclass(frozen=True, slots=True, init=False, repr=False)
+@dataclass(frozen=True, init=False, repr=False)
 class BootstrapBinding:
+    __slots__ = ("schema_version", "target_id", "service", "api_version", "profile", "endpoint",
+                 "runtime_grant", "authentication", "secret_handles", "storage_grants")
     schema_version: int
     target_id: str
     service: str
@@ -184,19 +188,22 @@ def _private_file(path, maximum):
             os.close(directory)
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class _IdentityGrant:
+    __slots__ = ("cert", "key")
     cert: bytes
     key: bytes
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class _TrustGrant:
+    __slots__ = ("ca",)
     ca: bytes
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class _AuthorizationGrant:
+    __slots__ = ("headers", "_digest")
     headers: Mapping[str, str]
     _digest: bytes
 
@@ -222,8 +229,9 @@ class _AuthorizationGrant:
         return found is not None and hmac.compare_digest(self._digest, hashlib.sha256(found).digest())
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class _Credentials:
+    __slots__ = ("tls_context", "authorization")
     tls_context: ssl.SSLContext | None
     authorization: _AuthorizationGrant | None
 
@@ -276,12 +284,13 @@ def _freeze(value, depth=0):
     return value
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class BootstrapInput:
+    __slots__ = ("binding", "application", "credentials", "_grants")
     binding: BootstrapBinding
     application: object
     credentials: _Credentials
-    _grants: Mapping = field(repr=False)
+    _grants: Mapping
 
     def __post_init__(self):
         object.__setattr__(self, "application", _freeze(self.application))

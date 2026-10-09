@@ -92,7 +92,7 @@ def build_cpp(args, source, work, out, version, sdk_version):
             runtime_name = name.removesuffix("-dev") + "1" if hasattr(str, "removesuffix") else name[:-4] + "1"
             depends = runtime_name + " (= " + version + ")"
             if name == "libxgc2-xrpc-grpc-dev":
-                depends += ", libxgc2-xrpc-dev (= " + version + "), libgrpc++-dev (>= 1.51), libprotobuf-dev"
+                depends += ", libxgc2-xrpc-dev (= " + version + "), libgrpc++-dev (>= 1.16), libprotobuf-dev"
         section = "libs" if name in names else "libdevel"
         (root / "DEBIAN/control").write_text(
             "Package: " + name + "\nVersion: " + version + "\nArchitecture: " + args.architecture +
@@ -205,7 +205,7 @@ def main():
         artifacts, evidence["elf"] = build_cpp(args, source, work, out, version, sdk_version)
         evidence["artifacts"] += artifacts
     if "python" in languages:
-        run([args.python, "-c", "import sys; assert sys.version_info >= (3,10), 'XRPC requires Python >= 3.10'"])
+        run([args.python, "-c", "import sys; assert sys.version_info >= (3,8), 'XRPC requires Python >= 3.8'"])
         wheels = work / "wheels"
         wheels.mkdir()
         run([args.python, "-m", "pip", "wheel", "--no-deps", "--no-index", "--no-build-isolation",

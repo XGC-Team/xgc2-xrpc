@@ -6,8 +6,8 @@
     "noble": {"glibc_max": "2.39"}
   },
   "architectures": {"amd64": "Advanced Micro Devices X86-64", "arm64": "AArch64"},
-  "cpp": {"standard": 20, "gnu_min": 11, "soname": 1, "grpc_min": "1.51"},
-  "python": {"minimum": "3.10", "deployment_line": "3.12", "system_python_replacement": false},
+  "cpp": {"standard": 20, "gnu_min": 11, "soname": 1, "grpc_min": "1.16"},
+  "python": {"minimum": "3.8", "deployment_line": "3.8", "system_python_replacement": false},
   "go": {"minimum": "1.24"},
   "rust": {"minimum": "1.85"},
   "node": {"minimum": "20"}

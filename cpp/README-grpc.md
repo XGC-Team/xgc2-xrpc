@@ -1,6 +1,6 @@
 # Native C++ gRPC integration
 
-The optional `XgcXrpc::grpc` target uses Linux, C++20 and native gRPC >= 1.51.
+The optional `XgcXrpc::grpc` target uses Linux, C++20 and native gRPC >= 1.16.
 Build with `-DXGC2_XRPC_ENABLE_GRPC=ON`; installed consumers request
 `find_package(XgcXrpc REQUIRED COMPONENTS grpc)`. HTTP-only consumers retain
 their ordinary Unix/HTTP targets without a gRPC link dependency. Product
@@ -22,7 +22,7 @@ blocked native `Read`/`Write`, rather than only shortening a wrapper timer.
 For a client using the same host maximum, use
 `grpc_stream_deadline(limits, caller_deadline)`: native timeout encoding rounds
 up, so an exact `now + host_maximum` can otherwise be rejected. The helper
-reserves one percent plus 3 ms for gRPC 1.51's representation rounding and keeps
+reserves one percent plus 3 ms for native gRPC representation rounding and keeps
 the earlier caller deadline. A host budget too small for that positive margin
 (including 1 ms) fails locally. This margin handles native representation;
 it does not establish a bound on scheduling pauses or clock adjustments.
@@ -104,14 +104,11 @@ it must not send a remote Unix pathname to the local dialer.
 
 `grpc_client_limits(policy)` projects a client policy with `rpc` and `transport`
 capabilities without requiring `host`. It maps message sizes, finite caller
-budget and native client idle time; use its call budget when creating each
-`GrpcClientCall` or paired stream deadline. Optional header limits also map when
-present. Client idle time below the documented native minimum of 1,000 ms
-fails. The channel actually sets `grpc.client_idle_timeout_ms`.
-Both native client and server reject `IDLE_TIMEOUT_MS=2147483647`: native
-gRPC interprets that integer sentinel as unlimited, so accepted finite values
-stop at 2147483646. These boundaries follow the
-[native channel arguments](https://raw.githubusercontent.com/grpc/grpc/v1.51.1/include/grpc/impl/codegen/grpc_types.h).
+budget and header limits; use its call budget when creating each `GrpcClientCall`
+or paired stream deadline. The native baseline provides server idle eviction,
+not client idle channel eviction. A selected `IDLE_TIMEOUT_MS` therefore fails
+client projection unless its owner actually retires idle channels and declares
+that field in `owner_applied`. Channel arguments never claim to enforce it.
 Host policy fields in a composed process remain with their host owner.
 
 `GRPC_MAX_STREAMS_PER_CONNECTION` controls incoming server streams; it does not
@@ -287,12 +284,12 @@ package installation or running-container mutation was required.
 The [baseline handoff](validation/2026-10-09-sol10.md) records the exact
 configuration and sanitizer/deployment boundaries.
 
-Focal's cached Clang10/libstdc++10.5 route is proven for HTTP/policy/diagnostics,
-including installed consumption on the Focal runtime. Its cached gRPC1.16.1
-does not meet this SDK's >=1.51 requirement. Focal gRPC needs a maintained
-rootfs-matched gRPC/Protobuf distribution or an approved newer deployment
-rootfs; Noble native binaries are not asserted to load on Focal.
-
+Focal's controlled Clang10/libstdc++10.5 route supports HTTP and native gRPC
+with the distribution's gRPC1.16.1 and Protobuf3.6.1. The native resource quota,
+accepted-fd server, finite calls and installed consumer are exercised on this
+baseline. Dependencies are discovered through their distribution pkg-config
+interface; a newer gRPC CMake config is not required. Noble ELF is not relabeled
+as Focal.
 An explicit installed `COMPONENTS grpc` imports unix/policy/diagnostics and
 native gRPC dependencies, with no HTTP target/library requirement. An explicit
 `COMPONENTS policy` requires only the policy component. Use those component

@@ -11,8 +11,8 @@ import math
 from aiohttp import WSMsgType, WSCloseCode, web
 from .wire import bounded_json_dumps
 
-HOST_KEY=web.RequestKey("xrpc.host",object)
-DEADLINE_KEY=web.RequestKey("xrpc.deadline",float)
+HOST_KEY=web.AppKey("xrpc.host",object)
+DEADLINE_KEY=web.AppKey("xrpc.deadline",float)
 
 
 class AppRouter:
@@ -154,8 +154,7 @@ class BoundedWebSocketResponse(web.WebSocketResponse):
         # permits the declared inclusive cap and still rejects larger frames.
         super().__init__(max_msg_size=max_msg_size+1,receive_timeout=receive_timeout,
                          timeout=timeout,heartbeat=heartbeat,protocols=protocols,
-                         compress=False,autoping=autoping,autoclose=autoclose,
-                         writer_limit=min(max_msg_size,65536))
+                         compress=False,autoping=autoping,autoclose=autoclose)
 
     async def prepare(self,request):
         host=request.get(HOST_KEY)

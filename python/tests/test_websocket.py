@@ -21,6 +21,11 @@ class WebSocketTests(unittest.TestCase):
         self.runtime = Runtime(max_calls=4)
         self.runners, self.clients = [], []
 
+    def event(self):
+        async def create():
+            return asyncio.Event()
+        return self.runtime.run(create())
+
     def tearDown(self):
         for client in reversed(self.clients):
             client.close(timeout=.5)
@@ -167,7 +172,7 @@ class WebSocketTests(unittest.TestCase):
         with self.assertRaises(Fault): second.consume("/total", twice, timeout=1, max_msg_bytes=3, total_receive_bytes=5)
 
     def test_deadline_closes_network_but_noncooperative_consumer_retains_call_and_pool(self):
-        release, stopped, entered = asyncio.Event(), threading.Event(), threading.Event()
+        release, stopped, entered = self.event(), threading.Event(), threading.Event()
         async def handler(request):
             socket = web.WebSocketResponse(compress=False)
             await socket.prepare(request)
@@ -467,8 +472,8 @@ class WebSocketTests(unittest.TestCase):
             asyncio.run(check())
 
     def test_relay_deadline_retains_handler_domain_lease_until_actual_native_close(self):
-        gate = asyncio.Event()
-        other_release = asyncio.Event()
+        gate = self.event()
+        other_release = self.event()
         other_entered = threading.Event()
         cleanup_started, peer_stopped, handler_finished = threading.Event(), threading.Event(), threading.Event()
         leases = {"active": 0}

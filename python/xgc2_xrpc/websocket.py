@@ -95,6 +95,8 @@ class _Pool:
         async def sent(session, context, params):
             call = _CALL.get()
             if call is not None:
+                if call.sent:
+                    raise TransportError("WebSocket handshake replay is forbidden", "outcome_unknown")
                 call.sent = True  # conservative entry to native header serialization
                 call.check_headers(params.headers)
         async def redirect(session, context, params):
@@ -107,21 +109,17 @@ class _Pool:
                 if params.response.history:
                     params.response.close()
                     raise TransportError("WebSocket redirects are forbidden", "outcome_unknown")
-                call.check_headers(params.response.headers)
+                try:
+                    call.check_headers(params.response.headers)
+                except BaseException:
+                    params.response.close()
+                    raise
                 if call.cancelled or time.monotonic() >= call.deadline:
                     params.response.close()
                     raise TransportError("WebSocket deadline exceeded", "outcome_unknown")
         trace.on_request_headers_sent.append(sent)
         trace.on_request_redirect.append(redirect)
         trace.on_request_end.append(response)
-        async def no_retry(request, handler):
-            try:
-                return await handler(request)
-            except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError) as error:
-                call = _CALL.get()
-                # aiohttp's persistent GET replay catches those public native
-                # exception types. Converting them here exits that retry path.
-                raise _consume_error(error, call.sent if call is not None else True) from error
         connector_type = aiohttp.UnixConnector if self.uds is not None else aiohttp.TCPConnector
         options = {"limit": self.limits.connections, "limit_per_host": self.limits.connections,
                    "force_close": True}
@@ -133,9 +131,9 @@ class _Pool:
         self.session = aiohttp.ClientSession(connector=self.connector,
             timeout=aiohttp.ClientTimeout(total=self.limits.call_timeout, connect=self.limits.call_timeout),
             cookie_jar=aiohttp.DummyCookieJar(), trust_env=False, auto_decompress=False,
-            skip_auto_headers=("Accept-Encoding",), trace_configs=(trace,), middlewares=(no_retry,),
+            skip_auto_headers=("Accept-Encoding",), trace_configs=(trace,),
             read_bufsize=min(65536, self.limits.response_bytes), max_line_size=self.limits.header_bytes,
-            max_field_size=self.limits.header_bytes, max_headers=self.limits.header_count)
+            max_field_size=self.limits.header_bytes)
         self.state = "running"
         return self.session
 
@@ -492,7 +490,7 @@ class WebSocketClient:
             if remaining <= 0:
                 raise asyncio.TimeoutError()
             call.ws = await session.ws_connect(call.options["url"], headers=call.options["headers"], protocols=call.options["protocols"],
-                timeout=aiohttp.ClientWSTimeout(ws_receive=None, ws_close=min(self.limits.shutdown_timeout, remaining)),
+                timeout=min(self.limits.shutdown_timeout, remaining), receive_timeout=None,
                 ssl=self.tls_context if self.tls_context is not None else True,
                 compress=0, autoclose=False, autoping=False, heartbeat=None, max_msg_size=call.options["max_msg_bytes"] + 1)
             borrowed = call.borrowed = BoundedWebSocket(call)

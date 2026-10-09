@@ -18,7 +18,7 @@ Language versions, dependencies and public APIs remain in their language manifes
 | `libxgc2-xrpc-dev` | Headers, unversioned linker symlinks, relocatable CMake exports; exact-version runtime dependency |
 | `libxgc2-xrpc-grpc1` | Optional gRPC shared library, SONAME 1; generated Debian runtime dependencies |
 | `libxgc2-xrpc-grpc-dev` | gRPC header and CMake component; exact base development/runtime dependencies and native gRPC/protobuf development dependencies |
-| Python wheel | An explicitly selected Python >=3.10 virtual environment; offline native dependency wheels |
+| Python wheel | An explicitly selected Python >=3.8 virtual environment; offline native dependency wheels |
 | Go source archive | Standalone module with embedded policy assets; native Go module consumer |
 | Rust crate | Standalone Cargo package with policy assets and optional gRPC feature |
 | Node npm tarball | Native npm installation with the declared `ws` dependency |
@@ -68,31 +68,18 @@ target architecture's native Docker host and never starts a product service.
 
 ## Focal runtime
 
-Focal remains a target. Its system GCC9 and Python3.8 are not SDK toolchains.
-Select a controlled C++20 compiler explicitly and run the installed feature probe.
-The Clang10/libstdc++10 route is applicable to the currently exercised HTTP feature
-set; it does not establish the native gRPC route. GNU builds require GCC >=11 as
-declared by the SDK. ELF version requirements and actual runtime loader selection
-are checked separately from compiler version.
+Focal remains a target with its system Python3.8. The SDK uses Python3.8
+syntax and pinned compatible aiohttp3.10.11/httpx0.28.1/httpcore1.0.9/grpcio1.70.0.
+The owning build/runtime images provide the same module lock and capability checks;
+products do not replace the interpreter or download these dependencies at startup.
 
-Use an explicitly provisioned modern Python, with the 3.12 deployment line, instead
-of replacing `/usr/bin/python3`. The controlled Focal builder's managed Python is
-a build resource, not proof of runtime-image deployment. Pin its exact release,
-archive hash and architecture, plus all native wheel hashes, in the owning images
-build/runtime layer. The same interpreter and module capability checks apply in
-the deployment image. No leaf PPA, system-Python replacement or dependency download
-is an installation fallback.
-
-The native gRPC route requires >=1.51 and matching protobuf/Abseil dependencies
-built for the target glibc. Focal's archive gRPC1.16 cannot satisfy that route.
-Never relabel Noble-built ELF as Focal. Controlled images must supply the compiler,
-standard library and gRPC/protobuf together for both amd64 and arm64. A Gazebo or
-adapter process loading C++ plugins must use one compatible libstdc++ selection
-from process startup; an SDK `$ORIGIN` RPATH alone does not select the process's
-standard library. Static libstdc++ copies are not a substitute for this check.
-[GCC ABI policy](https://gcc.gnu.org/onlinedocs/libstdc++/manual/abi.html) describes
-the standard-library symbol version boundary. [Managed Python documentation](https://docs.astral.sh/uv/concepts/python-versions/)
-describes the interpreter distribution used by the controlled builder.
+C++ requires the existing C++20 feature probe. The controlled Clang10/libstdc++10
+route supports the distribution gRPC1.16.1 and Protobuf3.6.1 via pkg-config.
+Server idle connections remain natively bounded; client channel lifetime belongs
+to its explicit owner. ELF version requirements and actual loader selection are
+checked separately from compiler version. Never relabel Noble ELF as Focal.
+A process loading C++ plugins must select one compatible standard-library runtime
+from startup; an SDK `$ORIGIN` RPATH does not select the process's libstdc++.
 
 ## Local validation and release evidence
 
@@ -102,10 +89,10 @@ writable scratch mount:
 ```bash
 python3 tools/build-packages.py --output /scratch/packages \
   --distribution focal --architecture amd64 \
-  --cxx /path/to/controlled/c++ --python /path/to/managed/python
+  --cxx /path/to/controlled/c++ --python /usr/bin/python3
 python3 tools/check-install.py --artifacts /scratch/packages \
   --work-dir /scratch/install --distribution focal --architecture amd64 \
-  --cxx /path/to/controlled/c++ --python /path/to/managed/python \
+  --cxx /path/to/controlled/c++ --python /usr/bin/python3 \
   --wheelhouse /preprovisioned/wheels --negative-controls
 ```
 
