@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 node_modules/
 dist/
+.ci/
 *.egg-info/
 
 # Local validation receipts are retained outside the released SDK sources.

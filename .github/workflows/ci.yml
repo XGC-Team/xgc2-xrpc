@@ -1,0 +1,52 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+  packages: read
+concurrency:
+  group: xrpc-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-debs:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [focal, jammy, noble]
+        arch: [amd64, arm64]
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+          - {suite: focal, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic@sha256:120f629b2fef7f445550719789c62083d360257d23393e8feccf1fe0a45c034c'}
+          - {suite: jammy, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-jammy-full-humble@sha256:6ef53429e0f41e659a873118629585c489e365253ed90bef51423a0dc1c2c4e1'}
+          - {suite: noble, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-noble-full-jazzy@sha256:7fe6af8df3e1c643a5ecc55197122cb25f8634d4ce1716606687df85d92beb7b'}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and install SDK artifacts
+        env:
+          IMAGE: ${{ matrix.image }}
+          SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e GITHUB_SHA -e GITHUB_RUN_ID -e GITHUB_EVENT_NAME \
+            -e GITHUB_REPOSITORY -e GITHUB_WORKFLOW_REF \
+            -e RUNNER_TEMP=/out \
+            -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/out" -w /work \
+            "$IMAGE" bash .xgc2/scripts/build-ci.sh "$SUITE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xgc2-xrpc-debs-${{ matrix.suite }}-${{ matrix.arch }}
+          path: .ci/artifacts/
+          include-hidden-files: true
+          retention-days: 14
