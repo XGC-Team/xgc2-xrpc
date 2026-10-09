@@ -12,7 +12,8 @@ import tarfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packaging"))
 from support import ABI, ROOT, digest, elf_info, extract_tar, run, system_suite, utc_now, write_json
-from node_deb import IDENTITY_PATH, PACKAGE as NODE_PACKAGE, SDK_PATH, verify_installed
+from node_deb import (IDENTITY_PATH, PACKAGE as NODE_PACKAGE, SDK_PATH,
+                      locked_ws_archive, npm_payload, regular_hashes, verify_installed)
 
 
 def expected_failure(args, cwd=None, env=None):
@@ -262,8 +263,13 @@ def check_rust(file, work, checks, sdk_version):
 def check_node(file, work, checks, sdk_version):
     consumer = work / "node-consumer"
     consumer.mkdir()
-    (consumer / "package.json").write_text('{"private":true,"dependencies":{"@xgc2/xrpc":' + json.dumps(str(file)) + '}}\n')
+    ws_tar, _ = locked_ws_archive(ROOT / "node/package-lock.json", consumer)
+    write_json(consumer / "package.json", {"private": True, "dependencies": {
+        "@xgc2/xrpc": "file:" + str(file.resolve()), "ws": "file:" + str(ws_tar.resolve())}})
     run(["npm", "install", "--offline", "--ignore-scripts", "--omit=dev", "--omit=optional", "--no-audit", "--no-fund"], cwd=consumer)
+    if (regular_hashes(consumer / "node_modules/@xgc2/xrpc") != npm_payload(file) or
+            regular_hashes(consumer / "node_modules/ws") != npm_payload(ws_tar)):
+        raise ValueError("installed Node consumer differs from pinned archives")
     manifest = json.loads((consumer / "node_modules/@xgc2/xrpc/package.json").read_text())
     if (manifest["name"], manifest["version"]) != ("@xgc2/xrpc", sdk_version):
         raise ValueError("installed Node package identity mismatch")

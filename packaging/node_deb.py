@@ -98,8 +98,9 @@ def verify_installed(root, expected_tar_sha=None):
     return identity
 
 
-def build_node_deb(tarball, lock_file, work, out, version, sdk_version, epoch, source_sha=None):
-    # Preprovisioned npm cache only; no registry access, lifecycle scripts or native peers.
+def locked_ws_archive(lock_file, work):
+    # Resolve the committed archive URL directly: an offline cache need not contain
+    # the registry's mutable package manifest.
     ws_lock = json.loads(lock_file.read_text())["packages"]["node_modules/ws"]
     if ws_lock["version"] != "8.22.0" or ws_lock["resolved"] != "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz":
         raise ValueError("unexpected ws lock identity")
@@ -108,6 +109,12 @@ def build_node_deb(tarball, lock_file, work, out, version, sdk_version, epoch, s
     ws_tar = work / packed["filename"]
     if integrity(ws_tar) != ws_lock["integrity"]:
         raise ValueError("preprovisioned ws archive differs from lock integrity")
+    return ws_tar, ws_lock
+
+
+def build_node_deb(tarball, lock_file, work, out, version, sdk_version, epoch, source_sha=None):
+    # Preprovisioned npm cache only; no registry access, lifecycle scripts or native peers.
+    ws_tar, ws_lock = locked_ws_archive(lock_file, work)
     payload = npm_payload(tarball)
     ws_payload = npm_payload(ws_tar)
     consumer = work / "node-deb-npm-install"
