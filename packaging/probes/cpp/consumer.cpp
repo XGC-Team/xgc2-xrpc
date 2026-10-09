@@ -1,4 +1,5 @@
 #include <xgc2/xrpc/http.hpp>
+#include <xgc2/xrpc/bootstrap.hpp>
 #include <xgc2/xrpc/runtime_policy.hpp>
 #include <xgc2/xrpc/diagnostics.hpp>
 #include <condition_variable>
@@ -9,6 +10,12 @@
 #include <xgc2/xrpc/grpc.hpp>
 #endif
 int main() {
+  try {
+    (void)xgc2::xrpc::parseBootstrapBinding("{}");
+    return 7;
+  } catch (const xgc2::xrpc::BootstrapError &error) {
+    if (error.code != xgc2::xrpc::BootstrapErrorCode::InvalidInput) return 8;
+  }
   xgc2::xrpc::RuntimePolicyOptions options;
 #ifdef XRPC_CHECK_GRPC
   options.capabilities.push_back("grpc");

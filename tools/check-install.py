@@ -190,7 +190,9 @@ def check_python(args, file, work, checks, sdk_version):
     run([args.python, "-m", "venv", env])
     interpreter = env / "bin/python"
     # No inherited source/dependency path is allowed to make an incomplete wheel appear valid.
-    run([interpreter, "-m", "pip", "install", "--no-index", "--only-binary=:all:", "--find-links", args.wheelhouse,
+    # Use the image-owned pip to target the native isolated interpreter. Focal's
+    # venv bootstrap pip cannot recognize its modern manylinux arm64 wheels.
+    run([args.python, "-m", "pip", "--python", interpreter, "install", "--no-index", "--only-binary=:all:", "--find-links", args.wheelhouse,
          str(file) + ("[grpc]" if args.python_install_profile == "grpc" else "")], env={"PYTHONPATH": "", "PYTHONNOUSERSITE": "1"})
     run([interpreter, "-m", "pip", "check"], env={"PYTHONPATH": ""})
     probe = """import json, pathlib, sys, importlib.metadata as m

@@ -15,7 +15,8 @@ cp -a /opt/xgc2/npm-cache "$npm_config_cache"
 # Resolve only the SDK's committed native language locks before the offline
 # package and installed-consumer steps. Toolchains remain image-owned.
 cargo fetch --locked --manifest-path rust/Cargo.toml
-(cd go && go mod download)
+mapfile -t go_modules < <(awk '$2 !~ /\/go.mod$/ {print $1 "@" $2}' go/go.sum)
+(cd go && go mod download "${go_modules[@]}")
 export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 cxx=g++
 if [[ "$suite" = focal ]]; then cxx=clang++-10; fi
