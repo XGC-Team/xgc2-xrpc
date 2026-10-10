@@ -60,6 +60,10 @@ Cross-origin use needs the server to allow the request headers above in
 `Access-Control-Allow-Headers` and to list `X-Request-ID` and
 `X-Xrpc-Instance-ID` in `Access-Control-Expose-Headers`.
 
+TLS trust is the platform's: browsers and Node use their system trust store. For
+a private CA or client certificates in Node, pass a `fetch` built on an undici
+`Agent` as `options.fetch`; this package adds no dependency for that.
+
 ## Event streams
 
 ```ts
