@@ -43,6 +43,24 @@ struct Directory {
   }
   ~Directory() { std::filesystem::remove_all(path); }
 };
+HttpRequest request_for(const std::string &method, const std::string &target,
+                        std::string body = {}) {
+  HttpRequest request;
+  request.method = method;
+  request.target = target;
+  request.body = std::move(body);
+  if (!request.body.empty())
+    request.headers.emplace_back("Content-Type", "application/json");
+  return request;
+}
+Json json_body(const HttpResponse &response) {
+  Json value;
+  bool content_type = false;
+  for (const auto &[name, field] : response.headers)
+    content_type = content_type || (name == "Content-Type" && field == "application/json");
+  assert(content_type && parse_json(response.body, value));
+  return value;
+}
 void protocol() {
   Directory directory;
   const auto path = directory.path + "/service.sock";
@@ -56,42 +74,33 @@ void protocol() {
     assert(!request.request_id.empty() && request.deadline > Clock::now());
     if (request.target == "/large") reply.complete(std::string(10000, 'x'));
     else if (request.target == "/absent") reply.complete(!request.body);
+    else if (request.target == "/failure") reply.error(409, "conflict", "domain refusal");
     else reply.complete(*request.body, 201);
   }, {128, 4}, limits.response_bytes);
   // Routing is ordinary domain function composition. No SDK host mode,
   // listener, worker or additional queue is needed by the adapter.
   HttpServer host(UnixOptions{path}, [&](HttpRequest request, HttpReply reply) {
-    if (request.target == "/invalid-response") {
-      HttpResponse response;
-      response.body = "not json";
-      response.headers.emplace_back("Content-Type", "application/json");
-      reply.complete(std::move(response));
-    } else echo(std::move(request), std::move(reply));
+    echo(std::move(request), std::move(reply));
   }, limits, HttpIdentity{instance, {}});
   std::thread io([&] { host.run(); });
-  JsonHttpClient client(path, limits, instance);
-  JsonHttpRequest request;
-  request.method = "POST";
-  request.target = "/echo";
-  request.body = Json{{"n", UINT64_MAX}, {"s", "hello"}};
+  HttpClient client(path, limits, instance);
+  const Json sent = Json{{"n", UINT64_MAX}, {"s", "hello"}};
   for (int i = 0; i < 200; ++i) {
-    const auto response = client.call(request, Clock::now()+seconds(2));
-    assert(response.status == 201 && response.body == request.body);
+    const auto response = client.call(request_for("POST", "/echo", sent.dump()), Clock::now()+seconds(2));
+    assert(response.status == 201 && json_body(response) == sent);
   }
   assert(host.stats().accepted_connections == 1);
-  request.body = nullptr;
-  assert(client.call(request, Clock::now()+seconds(2)).body->is_null());
-  request.target = "/absent";
-  request.body.reset();
-  assert(*client.call(request, Clock::now()+seconds(2)).body == true);
-  request.target = "/large";
-  assert(client.call(request, Clock::now()+seconds(2)).status == 503);
+  assert(json_body(client.call(request_for("POST", "/echo", "null"), Clock::now()+seconds(2))).is_null());
+  assert(json_body(client.call(request_for("GET", "/absent"), Clock::now()+seconds(2))) == true);
+  assert(client.call(request_for("POST", "/large", "{}"), Clock::now()+seconds(2)).status == 503);
+  const auto refusal = client.call(request_for("POST", "/failure", "{}"), Clock::now()+seconds(2));
+  assert(refusal.status == 409);
+  const auto error = json_body(refusal);
+  assert(error["error"]["code"] == "conflict" && error["error"]["message"] == "domain refusal");
   const auto count = calls.load();
   HttpClient raw(path, limits, instance);
-  HttpRequest invalid;
-  invalid.method = "POST";
-  invalid.target = "/echo";
-  invalid.body = "{}";
+  HttpRequest invalid = request_for("POST", "/echo", "{}");
+  invalid.headers.clear();
   assert(raw.call(invalid, Clock::now()+seconds(2)).status == 415);
   invalid.headers.emplace_back("Content-Type", "application/json");
   invalid.body = "{\"a\":1,\"a\":2}";
@@ -101,15 +110,6 @@ void protocol() {
   invalid.body = std::string(129, ' ');
   assert(raw.call(invalid, Clock::now()+seconds(2)).status == 413);
   assert(calls.load() == count);
-  request.body = std::string(1000, 'x');
-  try { client.call(request, Clock::now()+seconds(2)); assert(false); }
-  catch (const HttpCallError &e) { assert(e.delivery == Delivery::NotSent); }
-  request.body.reset();
-  request.target = "/invalid-response";
-  try { client.call(request, Clock::now()+seconds(2)); assert(false); }
-  catch (const HttpCallError &e) {
-    assert(e.code == "invalid_response" && e.delivery == Delivery::OutcomeUnknown);
-  }
   client.close();
   raw.close();
   host.request_stop();
@@ -118,5 +118,5 @@ void protocol() {
 int main() {
   syntax();
   protocol();
-  std::cout << "PASS strict bounded JSON, typed HTTP calls, connection reuse, protocol rejection and delivery outcomes\n";
+  std::cout << "PASS strict bounded JSON, JSON-HTTP handler adapter, connection reuse and protocol rejection\n";
 }

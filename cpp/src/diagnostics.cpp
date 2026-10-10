@@ -23,29 +23,19 @@ constexpr std::uint64_t level_mask = 255;
 constexpr std::uint64_t maximum_revision =
     std::numeric_limits<std::uint64_t>::max() >> level_bits;
 
-LogSeverity parse_level(std::string_view value) {
-  const auto found = std::find(severity_names.begin(), severity_names.end(), value);
-  if (found == severity_names.end())
-    throw RuntimePolicyError("LOG_LEVEL", "diagnostic severity is not supported");
-  return static_cast<LogSeverity>(found - severity_names.begin());
-}
-LogFormat parse_format(std::string_view value) {
-  if (value == "json")
-    return LogFormat::Json;
-  if (value == "text")
-    return LogFormat::Text;
-  throw RuntimePolicyError("LOG_FORMAT", "diagnostic format is not supported");
-}
 DiagnosticsOptions validate_options(DiagnosticsOptions options) {
   if (!options.capacity || options.capacity > 65536)
     throw std::invalid_argument("diagnostics capacity requires 1..65536 records");
   if (!options.per_event_per_second)
     throw std::invalid_argument("diagnostics event rate must be positive");
+  if (log_severity_name(options.level).empty())
+    throw std::invalid_argument("diagnostics level is not supported");
+  if (options.format != LogFormat::Json && options.format != LogFormat::Text)
+    throw std::invalid_argument("diagnostics format is not supported");
   return options;
 }
+constexpr std::uint64_t initial_revision = 1;
 std::uint64_t pack(std::uint64_t revision, LogSeverity level) {
-  if (revision == 0 || revision > maximum_revision)
-    throw RuntimePolicyError("revision", "diagnostic policy revision out of range");
   return (revision << level_bits) | static_cast<std::uint64_t>(level);
 }
 bool valid_identity(std::string_view value) noexcept {
@@ -142,7 +132,7 @@ std::string_view diagnostic_code_name(DiagnosticCode code) noexcept {
 }
 
 std::size_t format_diagnostic(const DiagnosticRecord &record, LogFormat format,
-                              std::span<char> output) noexcept {
+                              char *output, std::size_t capacity) noexcept {
   if (log_severity_name(record.severity).empty() ||
       diagnostic_code_name(record.code).empty() ||
       (format != LogFormat::Json && format != LogFormat::Text) ||
@@ -151,24 +141,17 @@ std::size_t format_diagnostic(const DiagnosticRecord &record, LogFormat format,
     return 0;
   Encoder counted;
   encode(counted, record, format);
-  if (counted.size > output.size())
+  if (counted.size > capacity)
     return 0;
-  Encoder encoded{output.data()};
+  Encoder encoded{output};
   encode(encoded, record, format);
   return encoded.size;
 }
 
-Diagnostics::Diagnostics(const RuntimePolicy &policy, DiagnosticsOptions options)
+Diagnostics::Diagnostics(DiagnosticsOptions options)
     : options_(validate_options(options)),
-      format_(parse_format(policy.text("LOG_FORMAT"))),
-      initial_revision_(policy.revision()), level_origin_(policy.field("LOG_LEVEL")),
-      format_origin_(policy.field("LOG_FORMAT")),
-      revision_level_(pack(initial_revision_, parse_level(policy.text("LOG_LEVEL")))),
-      ring_(std::make_unique<DiagnosticRecord[]>(options_.capacity)) {
-  policy.check_applied({"LOG_LEVEL", "LOG_FORMAT"}, {"diagnostics"});
-  if (!level_origin_.dynamic || format_origin_.dynamic)
-    throw RuntimePolicyError("diagnostics", "unsupported registry mutability");
-}
+      revision_level_(pack(initial_revision, options_.level)),
+      ring_(std::make_unique<DiagnosticRecord[]>(options_.capacity)) {}
 
 bool Diagnostics::try_emit(DiagnosticCode code, LogSeverity severity,
                            DiagnosticContext context,
@@ -241,7 +224,7 @@ std::size_t Diagnostics::drain(std::size_t maximum_records, Sink sink,
       queued_.store(count_, std::memory_order_relaxed);
     }
     std::array<char, diagnostic_output_capacity> buffer{};
-    const auto size = format_diagnostic(record, format_, buffer);
+    const auto size = format_diagnostic(record, options_.format, buffer.data(), buffer.size());
     try {
       if (!size || !sink(state, {buffer.data(), size}))
         sink_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -289,19 +272,9 @@ Diagnostics::update(std::uint64_t expected_revision,
   return DiagnosticUpdateResult::Applied;
 }
 
-RuntimePolicySnapshot Diagnostics::effective_policy() const {
+DiagnosticsSettings Diagnostics::settings() const noexcept {
   const auto current = revision_level_.load(std::memory_order_acquire);
-  RuntimePolicySnapshot snapshot;
-  snapshot.revision = current >> level_bits;
-  snapshot.count = 2;
-  snapshot.fields[0] = level_origin_;
-  snapshot.fields[0].value = std::string(log_severity_name(
-      static_cast<LogSeverity>(current & level_mask)));
-  if (snapshot.revision != initial_revision_) {
-    snapshot.fields[0].source = "administrative";
-    snapshot.fields[0].source_detail.clear();
-  }
-  snapshot.fields[1] = format_origin_;
-  return snapshot;
+  return {current >> level_bits,
+          static_cast<LogSeverity>(current & level_mask), options_.format};
 }
 } // namespace xgc2::xrpc

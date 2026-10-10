@@ -398,8 +398,8 @@ void credentials_and_roles() {
   });
   assert(native_calls == 1);
   const auto live = std::chrono::steady_clock::now() + 1s;
-  const std::array<std::string_view, 1> correct{"Bearer ephemeral.token=="}, wrong{"Bearer other"};
-  const std::array<std::string_view, 2> duplicate{correct.front(), correct.front()};
+  const std::vector<std::string_view> correct{"Bearer ephemeral.token=="}, wrong{"Bearer other"};
+  const std::vector<std::string_view> duplicate{correct.front(), correct.front()};
   assert(server.authorize(correct, live));
   assert(!server.authorize({}, live) && !server.authorize(wrong, live) && !server.authorize(duplicate, live));
   assert(!server.authorize(correct, std::chrono::steady_clock::time_point::max()));
