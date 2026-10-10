@@ -4,8 +4,10 @@ from .http import Client, Context, Fault, Host, Limits, Response, TransportError
 from .app import AppRouter, BoundedWebSocketResponse, RawStreamResponse, iter_body, HOST_KEY, DEADLINE_KEY
 from .websocket import WebSocketClient
 from .unix import UnixLease
+from .wire import DISPOSITIONS, NOT_SENT, OUTCOME_UNKNOWN, RESPONSE_RECEIVED, new_instance_id
 
-__all__ = ["WebSocketClient", "HOST_KEY", "DEADLINE_KEY", "AppRouter", "BoundedWebSocketResponse", "RawStreamResponse", "iter_body", "Runtime", "Endpoint", "ServiceRef", "Client", "Context", "Fault", "Host", "Limits", "Response", "TransportError", "UnixLease", "multipart"]
+__all__ = ["WebSocketClient", "HOST_KEY", "DEADLINE_KEY", "AppRouter", "BoundedWebSocketResponse", "RawStreamResponse", "iter_body", "Runtime", "Endpoint", "ServiceRef", "Client", "Context", "Fault", "Host", "Limits", "Response", "TransportError", "UnixLease", "multipart",
+           "DISPOSITIONS", "NOT_SENT", "OUTCOME_UNKNOWN", "RESPONSE_RECEIVED", "new_instance_id"]
 
 from .reference import Endpoint, ServiceRef
 

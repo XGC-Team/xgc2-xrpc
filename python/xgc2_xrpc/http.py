@@ -23,7 +23,9 @@ import aiohttp
 import httpx
 from aiohttp import web
 from .unix import UnixLease
-from .wire import WireError, bounded_json_dumps, validate_request_metadata, validate_response_metadata, validate_request_id, timeout_ms_from_seconds, strict_json_loads
+from .wire import (DISPOSITIONS, ERROR_STATUS, RESPONSE_RECEIVED, WireError, bounded_json_dumps, code_for_status,
+                   strict_json_loads, timeout_ms_from_seconds, validate_request_id, validate_request_metadata,
+                   validate_response_metadata)
 from .app import HOST_KEY, DEADLINE_KEY, _text_size
 from .runtime import _CALL_OWNER
 
@@ -84,14 +86,24 @@ def _client_limits(limits):
     return limits
 
 class Fault(Exception):
-    def __init__(self, code, message, status=None):
+    """A domain error with a code of the shared vocabulary (or a domain code).
+
+    Raised by handlers, and by a Client when the peer answered with an error:
+    then disposition is "response_received" and status is the HTTP status.
+    """
+    def __init__(self, code, message, status=None, *, disposition=None):
         super().__init__(message)
         self.code = code
-        self.status = status or {"invalid_argument":400,"not_found":404,"conflict":409,"resource_exhausted":429,"deadline_exceeded":504,"cancelled":499,"unavailable":503,"internal":500}.get(code,500)
+        self.status = status or ERROR_STATUS.get(code,500)
+        self.disposition = disposition
 
 class TransportError(Exception):
+    """A call that produced no usable answer; disposition is not_sent,
+    outcome_unknown or response_received (an answer the client refuses)."""
     def __init__(self, message, disposition):
         super().__init__(message)
+        if disposition not in DISPOSITIONS:
+            raise ValueError("disposition must be not_sent, outcome_unknown or response_received")
         self.disposition = self.outcome = disposition
 
 def _maintained_headers(headers, limits):
@@ -136,10 +148,13 @@ class Context:
 
 @dataclass
 class Response:
+    """A reply. A Client returns it only for a 2xx answer, with disposition
+    "response_received"; a Host handler may ignore that field."""
     body: object
     status: int = 200
     content_type: str = "application/json"
     headers: dict = field(default_factory=dict)
+    disposition: str = RESPONSE_RECEIVED
     @classmethod
     def json(cls,value,status=200,*,max_bytes=1048576):
         return cls(bounded_json_dumps(value,max_bytes),status)
@@ -880,7 +895,7 @@ class Client:
                 owned=_OwnedHttpStream(self,stream_request(),state["deadline"])
                 async with owned as response:
                     if sum(len(k)+len(v)+4 for k,v in response.headers.raw)>self.limits.header_bytes or len(response.headers.raw)>self.limits.header_count:
-                        raise TransportError("response headers exceed limit","response_received")
+                        raise TransportError("response headers exceed limit",RESPONSE_RECEIVED)
                     try:
                         validate_response_metadata(response.headers.raw,request_id=request_id,
                                                    instance_id=self.instance_id,discovery=self._discovery)
@@ -888,11 +903,10 @@ class Client:
                         raise TransportError(str(error),"outcome_unknown") from error
                     length=response.headers.get("Content-Length")
                     if length is not None and int(length)>self.limits.response_bytes:
-                        raise TransportError("response exceeds limit","response_received")
+                        raise TransportError("response exceeds limit",RESPONSE_RECEIVED)
                     data=await _read_body(response,self.limits.response_bytes,owned)
                     if response.status_code>=400:
-                        fault=_json(data).get("error",{})
-                        raise Fault(fault.get("code","internal"),fault.get("message","RPC failed"),response.status_code)
+                        raise _answer_fault(response.status_code,data)
                     return Response(data,response.status_code,response.headers.get("Content-Type",""),dict(response.headers))
             invocation=self.runtime.loop.create_task(invoke())
             invocation_cancelled=False
@@ -993,6 +1007,19 @@ class Client:
         self.close()
 
 
+def _answer_fault(status,data):
+    """The Fault for an error answer: the standard envelope wins, else the status decides."""
+    try:
+        envelope=_json(data).get("error")
+    except (ValueError,AttributeError):
+        envelope=None
+    if not isinstance(envelope,dict):
+        envelope={}
+    code,message=envelope.get("code"),envelope.get("message")
+    return Fault(code if isinstance(code,str) and code else code_for_status(status),
+                 message if isinstance(message,str) and message else "HTTP %d"%status,
+                 status,disposition=RESPONSE_RECEIVED)
+
 async def _read_body(response,maximum,owner):
     """Read a native HTTPX response under a total byte cap, keeping native cleanup observable."""
     output=bytearray()
@@ -1000,7 +1027,7 @@ async def _read_body(response,maximum,owner):
         # Native arrivals are consumed as they come; the cap is checked on every chunk.
         async for chunk in response.aiter_raw():
             if len(output)+len(chunk)>maximum:
-                raise TransportError("response exceeds limit","response_received")
+                raise TransportError("response exceeds limit",RESPONSE_RECEIVED)
             output.extend(chunk)
     except (OSError,httpx.HTTPError) as error:
         if owner.task is None and not owner.observed_native_close and response.is_closed:
