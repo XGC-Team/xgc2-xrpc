@@ -301,8 +301,14 @@ documented in the test and implemented by the Go reference
 `udpx/udptest/cmd/udpx-interop-server`:
 
 ```
+# the Go reference server
 go build -o /tmp/udpx-interop ./udpx/udptest/cmd/udpx-interop-server
 XGC2_XRPC_UDP_INTEROP_SERVER=/tmp/udpx-interop go test ./udpx -run Interop -v
+
+# the C++ server (from the repository root)
+cmake -S . -B /tmp/xrpc-cpp -DXGC2_XRPC_COMPONENTS=udp
+cmake --build /tmp/xrpc-cpp --target xgc2-xrpc-udp-interop-server
+XGC2_XRPC_UDP_INTEROP_SERVER=/tmp/xrpc-cpp/cpp/xgc2-xrpc-udp-interop-server go test ./udpx -run Interop -v
 ```
 
 ## Ownership and status
