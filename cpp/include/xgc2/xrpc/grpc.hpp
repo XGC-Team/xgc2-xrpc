@@ -1,6 +1,5 @@
 #pragma once
 #include "unix.hpp"
-#include "runtime_policy.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -13,36 +12,28 @@
 namespace xgc2::xrpc {
 class Diagnostics;
 using GrpcClock = std::chrono::steady_clock;
+// Hard bounds for a gRPC host and its channels. The defaults suit a small
+// private control service; the owner sets other bounds explicitly. The library
+// reads no environment variables and keeps no hidden policy.
 struct GrpcLimits {
-  GrpcLimits();
-  std::size_t connections, inflight, streams_per_connection;
-  std::size_t request_bytes, response_bytes, header_bytes;
-  std::chrono::milliseconds call_timeout, idle_timeout, shutdown_timeout;
+  std::size_t connections = 32;             // accepted connections at one time
+  std::size_t inflight = 32;                // admitted calls without a result
+  std::size_t streams_per_connection = 32;  // native concurrent streams
+  std::size_t request_bytes = 1048576;      // largest request message
+  std::size_t response_bytes = 1048576;     // largest response message
+  std::size_t header_bytes = 16384;         // largest metadata block
+  std::chrono::milliseconds call_timeout{30000};    // host cap on one call
+  std::chrono::milliseconds idle_timeout{30000};    // idle connection eviction
+  std::chrono::milliseconds shutdown_timeout{5000}; // default shutdown budget
   // MAX_POLLERS alone does not bound handlers. ResourceQuota caps the native
   // synchronous pool; one additional SDK thread accepts all connections.
   int native_threads = 8;
   std::size_t native_memory_bytes = 16 * 1048576;
 };
-GrpcLimits grpc_limits(const RuntimePolicy&);
-// Client projection requires no host capability. Native channel settings do
-// not cap outgoing streams: a bounded owner may declare that field applied,
-// but must enforce its own complete concurrent-call/stream count.
-// IDLE_TIMEOUT_MS also requires an owner that actually retires idle channels;
-// the supported native baseline only provides server-side idle eviction.
-GrpcLimits grpc_client_limits(const RuntimePolicy&,
-    std::span<const std::string_view> owner_applied = {});
-inline GrpcLimits grpc_client_limits(const RuntimePolicy& policy,
-    std::initializer_list<std::string_view> owner_applied) {
-  return grpc_client_limits(policy, std::span<const std::string_view>{
-      owner_applied.begin(), owner_applied.size()});
-}
 // Leave room for native grpc-timeout rounding while preserving the caller's
 // finite budget. Throws if the host budget cannot accommodate that margin.
 GrpcClock::time_point grpc_stream_deadline(const GrpcLimits&,
                                           GrpcClock::time_point caller_deadline);
-// Also usable by the authenticated remote transport owner, who supplies its
-// credentials and address. Unix paths must use GrpcUnixServer instead.
-void configure_grpc_server(grpc::ServerBuilder&, const GrpcLimits&);
 struct GrpcStats {
   std::size_t inflight_calls = 0, active_connections = 0;
   std::uint64_t admitted_calls = 0, rejected_calls = 0,
@@ -151,8 +142,10 @@ private:
 };
 
 // Reuse one channel per ServiceRef. This local helper never dials a remote
-// Unix pathname. Remote credentials/routes are injected by their owner.
-grpc::ChannelArguments grpc_channel_arguments(const GrpcLimits& = {});
+// Unix pathname. Remote credentials/routes are injected by their owner. Only
+// the message and metadata bounds of the limits apply to a channel; idle
+// eviction and stream counts are server-side and the channel's owner decides
+// its lifetime.
 std::shared_ptr<grpc::Channel> make_grpc_unix_channel(
     const std::string& path, const GrpcLimits& = {});
 

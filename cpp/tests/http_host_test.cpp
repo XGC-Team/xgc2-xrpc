@@ -19,7 +19,7 @@ std::atomic<bool> reject_allocations{false};
 struct Directory {
   std::string path;
   Directory() {
-    char pattern[] = "/tmp/xrpc-policy-XXXXXX";
+    char pattern[] = "/tmp/xrpc-http-host-XXXXXX";
     const auto value = ::mkdtemp(pattern);
     assert(value);
     path = value;
@@ -444,6 +444,6 @@ int main() {
   noncooperative_worker_outlives_host(false);
   noncooperative_worker_outlives_host(true);
   std::cout
-      << "policy regressions: admission/idle budgets, framing input, HEAD, "
+      << "HTTP host regressions: admission/idle budgets, framing input, HEAD, "
          "metadata, IDs, cancellation and graceful shutdown passed\n";
 }

@@ -1,5 +1,4 @@
 #include "xgc2/xrpc/http.hpp"
-#include "xgc2/xrpc/runtime_policy.hpp"
 #include "xgc2/xrpc/diagnostics.hpp"
 #include <algorithm>
 #include <boost/asio.hpp>
@@ -100,35 +99,6 @@ bool reserved_header(const std::string &name) {
          beast::iequals(name, "X-Xrpc-Timeout-Ms");
 }
 } // namespace
-namespace {
-void apply_http_limits(HttpLimits &limits, const RuntimePolicy &policy) {
-  limits.connections = policy.integer("HOST_MAX_CONNECTIONS");
-  limits.inflight = policy.integer("HOST_MAX_IN_FLIGHT");
-  limits.header_bytes = policy.integer("MAX_HEADER_BYTES");
-  limits.request_bytes = policy.integer("MAX_REQUEST_BYTES");
-  limits.response_bytes = policy.integer("MAX_RESPONSE_BYTES");
-  limits.request_timeout = std::chrono::milliseconds(policy.integer("CALL_TIMEOUT_MS"));
-  limits.header_timeout = std::chrono::milliseconds(policy.integer("HEADER_TIMEOUT_MS"));
-  limits.idle_timeout = std::chrono::milliseconds(policy.integer("IDLE_TIMEOUT_MS"));
-  limits.shutdown_timeout = std::chrono::milliseconds(policy.integer("SHUTDOWN_TIMEOUT_MS"));
-}
-} // namespace
-HttpLimits::HttpLimits() {
-  static const auto defaults = resolve_runtime_policy(RuntimePolicyOptions{});
-  apply_http_limits(*this, defaults);
-}
-HttpLimits http_limits(const RuntimePolicy &policy) {
-  policy.check_applied({"HOST_MAX_CONNECTIONS", "HOST_MAX_IN_FLIGHT",
-                       "MAX_HEADER_BYTES", "MAX_REQUEST_BYTES",
-                       "MAX_RESPONSE_BYTES", "CALL_TIMEOUT_MS",
-                       "HEADER_TIMEOUT_MS", "IDLE_TIMEOUT_MS",
-                       "SHUTDOWN_TIMEOUT_MS"},
-                       {"host", "http", "rpc", "transport"});
-  HttpLimits limits;
-  apply_http_limits(limits, policy);
-  validate(limits);
-  return limits;
-}
 HttpResponse http_error(int status, const std::string &code,
                         const std::string &message) {
   HttpResponse r;

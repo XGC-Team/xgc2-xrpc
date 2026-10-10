@@ -412,64 +412,27 @@ void client_explicit_unary_discovery() {
   }
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
 }
-void client_only_policy_mapping() {
-  RuntimePolicyOptions options;
-  options.capabilities = {"rpc", "transport"};
-  options.environment = {{"XGC2_XRPC_MAX_REQUEST_BYTES", "4096"},
-      {"XGC2_XRPC_MAX_RESPONSE_BYTES", "8192"}, {"XGC2_XRPC_CALL_TIMEOUT_MS", "1100"},
-      {"XGC2_XRPC_IDLE_TIMEOUT_MS", "2000"}};
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  const auto limits = grpc_client_limits(resolve_runtime_policy(options), {"IDLE_TIMEOUT_MS"});
-  assert(limits.request_bytes == 4096 && limits.response_bytes == 8192);
-  assert(limits.call_timeout == 1100ms && limits.idle_timeout == 2000ms);
-  const auto channel_arguments = grpc_channel_arguments(limits);
-  const auto native_arguments = channel_arguments.c_channel_args();
-  unsigned idle_arguments = 0;
-  for (std::size_t i = 0; i < native_arguments.num_args; ++i) {
-    const auto& argument = native_arguments.args[i];
-    if (std::strcmp(argument.key, "grpc.client_idle_timeout_ms") == 0) {
-      ++idle_arguments;
-      assert(argument.type == GRPC_ARG_INTEGER && argument.value.integer == 2000);
-    }
-  }
-  assert(idle_arguments == 0);
-  auto manual = limits; manual.idle_timeout = 0ms;
-  throws([&] { (void)grpc_channel_arguments(manual); });
+void limits_validation() {
+  // Defaults are valid and documented in grpc.hpp.
+  const GrpcLimits defaults;
+  assert(defaults.connections == 32 && defaults.inflight == 32 &&
+         defaults.streams_per_connection == 32 && defaults.request_bytes == 1048576 &&
+         defaults.response_bytes == 1048576 && defaults.header_bytes == 16384 &&
+         defaults.call_timeout == 30000ms && defaults.idle_timeout == 30000ms &&
+         defaults.shutdown_timeout == 5000ms && defaults.native_threads == 8);
+  Directory directory;
+  (void)make_grpc_unix_channel(directory.socket(), defaults);
+  auto manual = defaults;
+  // The native idle option treats zero and INT_MAX as unlimited or invalid.
+  manual.idle_timeout = 0ms;
+  throws([&] { (void)make_grpc_unix_channel(directory.socket(), manual); });
   manual.idle_timeout = 2147483647ms;
-  throws([&] { (void)grpc_channel_arguments(manual); });
-  RuntimePolicyOptions server_policy;
-  server_policy.capabilities = {"host", "rpc", "transport", "grpc"};
-  server_policy.environment = {{"XGC2_XRPC_IDLE_TIMEOUT_MS", "2147483647"}};
-  throws([&] { (void)grpc_limits(resolve_runtime_policy(server_policy)); });
-  grpc::ServerBuilder server_builder;
-  throws([&] { configure_grpc_server(server_builder, manual); });
-  RuntimePolicyOptions defaults; defaults.capabilities = {"rpc", "transport"};
-  assert(grpc_client_limits(resolve_runtime_policy(defaults)).idle_timeout == 30000ms);
-  options.environment.back().second = "999";
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  options.environment.back().second = "2147483647";
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  options.environment.back().second = "2147483646";
-  assert(grpc_client_limits(resolve_runtime_policy(options), {"IDLE_TIMEOUT_MS"}).idle_timeout == 2147483646ms);
-  options.environment.pop_back();
-  options.environment.push_back({"XGC2_XRPC_HOST_MAX_IN_FLIGHT", "7"});
-  // No declared host owner: a client-only resolver rejects this environment.
-  throws([&] { (void)resolve_runtime_policy(options); });
-  options.capabilities.push_back("host");
-  // In a composed process the declared host owner enforces this field. It
-  // must not overwrite unrelated client limits with the host's admission cap.
-  assert(grpc_client_limits(resolve_runtime_policy(options)).inflight == GrpcLimits{}.inflight);
-  options.environment.pop_back(); options.capabilities = {"rpc", "transport", "grpc"};
-  options.environment.push_back({"XGC2_XRPC_GRPC_MAX_STREAMS_PER_CONNECTION", "5"});
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  constexpr std::array<std::string_view, 1> applied_streams{"GRPC_MAX_STREAMS_PER_CONNECTION"};
-  assert(grpc_client_limits(resolve_runtime_policy(options), applied_streams).streams_per_connection == 5);
-  options.environment.pop_back();
-  options.ceilings["GRPC_MAX_STREAMS_PER_CONNECTION"] = 32;
-  const auto ceiling_only = resolve_runtime_policy(options);
-  throws([&] { (void)grpc_client_limits(ceiling_only); });
-  constexpr std::array<std::string_view, 1> invalid_owner{"LOG_LEVEL"};
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(defaults), invalid_owner); });
+  throws([&] { (void)make_grpc_unix_channel(directory.socket(), manual); });
+  manual = defaults; manual.request_bytes = 0;
+  throws([&] { GrpcAdmission invalid("limits-instance", manual); });
+  manual = defaults; manual.native_threads = 1;
+  throws([&] { GrpcAdmission invalid("limits-instance", manual); });
+  throws([&] { (void)make_grpc_unix_channel("relative.sock", defaults); });
 }
 void unary_metadata_and_limits() {
   GrpcLimits l; l.request_bytes = 256; l.response_bytes = 256;
@@ -776,20 +739,6 @@ void native_thread_quota() {
             << " including " << callers << " caller threads, native cap=" << limits.native_threads << '\n';
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
 }
-void policy_mapping() {
-  RuntimePolicyOptions options;
-  options.capabilities = {"host", "rpc", "transport", "grpc"};
-  options.environment = {{"XGC2_XRPC_HOST_MAX_IN_FLIGHT", "7"},
-                         {"XGC2_XRPC_GRPC_MAX_STREAMS_PER_CONNECTION", "5"},
-                         {"XGC2_XRPC_SHUTDOWN_TIMEOUT_MS", "70"}};
-  const auto limits = grpc_limits(resolve_runtime_policy(options));
-  assert(limits.inflight == 7 && limits.streams_per_connection == 5 && limits.shutdown_timeout == 70ms);
-  options.capabilities.push_back("http");
-  options.environment.push_back({"XGC2_XRPC_HEADER_TIMEOUT_MS", "100"});
-  assert(grpc_limits(resolve_runtime_policy(options)).inflight == 7);
-  options.capabilities = {"host", "rpc", "transport", "grpc"};
-  throws([&] { (void)resolve_runtime_policy(options); });
-}
 void concurrent_stop_and_owner_close() {
   for (unsigned round = 0; round < 8; ++round) {
     Host host;
@@ -814,8 +763,7 @@ void concurrent_stop_and_owner_close() {
 }
 void injected_diagnostics() {
   Directory directory;
-  RuntimePolicyOptions policy_options; policy_options.capabilities = {"diagnostics"};
-  Diagnostics diagnostics(resolve_runtime_policy(policy_options));
+  Diagnostics diagnostics;
   GrpcAdmission admission("diagnostic-instance");
   admission.set_diagnostics(&diagnostics, "fixture");
   Service service(admission);
@@ -850,12 +798,12 @@ void reusable_resources() {
 }
 int main() {
   multi_service_server_first_reverse_streams(); explicit_unary_discovery(); client_explicit_unary_discovery();
-  client_only_policy_mapping();
+  limits_validation();
   unary_metadata_and_limits(); typed_streams(); native_stream_deadline_and_cancel();
   admission_and_failed_quiescence(); retained_work_lease();
   graceful_drain_preserves_admitted_result(); stream_budget_rounding_margin();
   replacement_and_connection_cap(); native_idle_connection_cleanup();
   renamed_directory_anchor(); native_thread_quota();
-  policy_mapping(); concurrent_stop_and_owner_close(); injected_diagnostics(); reusable_resources();
+  concurrent_stop_and_owner_close(); injected_diagnostics(); reusable_resources();
   std::cout << "native gRPC unary/streams/fence/cancel/lease passed\n";
 }

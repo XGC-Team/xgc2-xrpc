@@ -1,5 +1,4 @@
 #pragma once
-#include "runtime_policy.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -7,7 +6,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string_view>
 
 namespace xgc2::xrpc {
@@ -52,11 +50,14 @@ struct DiagnosticRecord {
 // Zero means invalid record/format or insufficient space. On failure output is
 // untouched; success returns a complete newline-terminated record, no NUL.
 std::size_t format_diagnostic(const DiagnosticRecord &record, LogFormat format,
-                              std::span<char> output) noexcept;
+                              char *output, std::size_t capacity) noexcept;
 
+// Plain construction settings; the library reads no environment variables.
 struct DiagnosticsOptions {
   std::size_t capacity = 256; // Positive, maximum 65536 fixed records.
   std::uint32_t per_event_per_second = 64; // Positive, fixed code buckets.
+  LogSeverity level = LogSeverity::Info; // Records above this are filtered.
+  LogFormat format = LogFormat::Json; // Fixed for the owner's lifetime.
 };
 struct DiagnosticsStats {
   std::uint64_t emitted = 0, filtered = 0, dropped_full = 0,
@@ -79,14 +80,19 @@ enum class DiagnosticUpdateResult {
   InvalidArgument,
   RevisionExhausted
 };
+// Live settings with the revision that guards administrative updates.
+struct DiagnosticsSettings {
+  std::uint64_t revision = 1;
+  LogSeverity level = LogSeverity::Info;
+  LogFormat format = LogFormat::Json;
+};
 
 class Diagnostics {
 public:
-  // The caller selects/enforces the registry's diagnostics capability and
-  // shares this owner. Construction is the only ring allocation; no thread,
-  // file, automatic endpoint or environment access is created.
-  explicit Diagnostics(const RuntimePolicy &policy,
-                       DiagnosticsOptions options = {});
+  // Callers share this owner. Construction is the only ring allocation; no
+  // thread, file, automatic endpoint or environment access is created.
+  // Throws std::invalid_argument for an unusable option.
+  explicit Diagnostics(DiagnosticsOptions options = {});
   ~Diagnostics() = default;
   Diagnostics(const Diagnostics &) = delete;
   Diagnostics &operator=(const Diagnostics &) = delete;
@@ -110,10 +116,10 @@ public:
 
   // The process owner must authorize callers before invoking this API. There
   // is no built-in administrative listener. One successful CAS updates level
-  // and its revision together; LOG_FORMAT always requires process restart.
+  // and its revision together; the format always requires process restart.
   DiagnosticUpdateResult update(std::uint64_t expected_revision,
                                 DiagnosticPolicyUpdate updates) noexcept;
-  RuntimePolicySnapshot effective_policy() const;
+  DiagnosticsSettings settings() const noexcept;
 
 private:
   struct RateBucket {
@@ -121,9 +127,6 @@ private:
     std::uint32_t count = 0;
   };
   const DiagnosticsOptions options_;
-  const LogFormat format_;
-  const std::uint64_t initial_revision_;
-  const EffectiveRuntimeField level_origin_, format_origin_;
   std::atomic<std::uint64_t> revision_level_;
   std::unique_ptr<DiagnosticRecord[]> ring_;
   std::atomic_flag queue_lock_ = ATOMIC_FLAG_INIT;

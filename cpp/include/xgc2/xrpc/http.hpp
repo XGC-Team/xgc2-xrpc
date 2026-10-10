@@ -13,19 +13,23 @@
 
 namespace xgc2 {
 namespace xrpc {
-class RuntimePolicy;
 class Diagnostics;
 using Clock = std::chrono::steady_clock;
 using Headers = std::vector<std::pair<std::string, std::string>>;
+// Hard bounds for a host or a client. The defaults suit a small private
+// control service; an owner that needs other bounds sets them explicitly.
+// The library reads no environment variables and keeps no hidden policy.
 struct HttpLimits {
-  HttpLimits(); // common generated registry defaults, without ambient getenv
-  std::size_t connections, header_bytes;
-  std::size_t request_bytes, response_bytes, inflight;
-  std::chrono::milliseconds request_timeout, idle_timeout;
-  std::chrono::milliseconds header_timeout, shutdown_timeout;
+  std::size_t connections = 32;          // accepted connections at one time
+  std::size_t header_bytes = 16384;      // header section of a request/response
+  std::size_t request_bytes = 1048576;   // request body
+  std::size_t response_bytes = 1048576;  // response body
+  std::size_t inflight = 32;             // admitted calls without a reply yet
+  std::chrono::milliseconds request_timeout{30000}; // server cap on one call
+  std::chrono::milliseconds idle_timeout{30000};    // wait for the next request
+  std::chrono::milliseconds header_timeout{5000};   // receive a full header
+  std::chrono::milliseconds shutdown_timeout{5000}; // default drain() budget
 };
-// Resolve the environment once in the composition root, then pass its policy.
-HttpLimits http_limits(const RuntimePolicy &policy);
 struct HttpIdentity {
   std::string instance_id;
   std::vector<std::string> discovery_targets;

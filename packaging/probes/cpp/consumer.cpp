@@ -1,6 +1,5 @@
 #include <xgc2/xrpc/json_http.hpp>
 #include <xgc2/xrpc/bootstrap.hpp>
-#include <xgc2/xrpc/runtime_policy.hpp>
 #include <xgc2/xrpc/diagnostics.hpp>
 #include <condition_variable>
 #include <mutex>
@@ -20,12 +19,7 @@ int main() {
   } catch (const xgc2::xrpc::BootstrapError &error) {
     if (error.code != xgc2::xrpc::BootstrapErrorCode::InvalidInput) return 8;
   }
-  xgc2::xrpc::RuntimePolicyOptions options;
-#ifdef XRPC_CHECK_GRPC
-  options.capabilities.push_back("grpc");
-#endif
-  const auto policy = xgc2::xrpc::resolve_runtime_policy(options);
-  const auto limits = xgc2::xrpc::http_limits(policy);
+  const xgc2::xrpc::HttpLimits limits;
   const auto instance = xgc2::xrpc::new_instance_id();
   xgc2::xrpc::HttpClient client("/unused-installed-sdk-probe.sock", limits, instance);
   client.close();
@@ -39,8 +33,9 @@ int main() {
   const int values[] = {1, 2};
   if (std::span(values).size() != 2 || limits.connections == 0) return 3;
 #ifdef XRPC_CHECK_GRPC
-  if (xgc2::xrpc::grpc_limits(policy).inflight == 0) return 4;
-  xgc2::xrpc::GrpcAdmission admission(instance, xgc2::xrpc::grpc_limits(policy));
+  const xgc2::xrpc::GrpcLimits grpc_limits;
+  if (grpc_limits.inflight == 0) return 4;
+  xgc2::xrpc::GrpcAdmission admission(instance, grpc_limits);
   admission.request_stop();
   if (!admission.wait_until(xgc2::xrpc::GrpcClock::now())) return 5;
 #endif

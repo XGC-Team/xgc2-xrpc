@@ -12,11 +12,9 @@ bool capture(void *state, std::string_view record) {
   return true;
 }
 int main() {
-  RuntimePolicyOptions settings;
-  settings.capabilities.push_back("diagnostics");
-  settings.environment.emplace_back("XGC2_XRPC_LOG_LEVEL", "debug");
-  const auto policy = resolve_runtime_policy(settings);
-  Diagnostics diagnostics(policy);
+  DiagnosticsOptions settings;
+  settings.level = LogSeverity::Debug;
+  Diagnostics diagnostics(settings);
   char pattern[] = "/tmp/xrpc-diagnostic-transport-XXXXXX";
   const auto value = ::mkdtemp(pattern);
   assert(value);
@@ -27,7 +25,7 @@ int main() {
     HttpResponse response;
     response.body = "response-secret-should-never-be-logged";
     reply.complete(std::move(response));
-  }, http_limits(policy), {"diagnostic-boot", {}});
+  }, {}, {"diagnostic-boot", {}});
   server.set_diagnostics(&diagnostics, "xgc2.transport-test");
   std::thread owner([&] { server.run(); });
   HttpClient client(options.path, {}, "diagnostic-boot");
@@ -50,5 +48,5 @@ int main() {
   assert(records.find("secret") == std::string::npos);
   assert(records.find("Authorization") == std::string::npos);
   std::filesystem::remove_all(dir);
-  std::cout << "shared policy, real HTTP lifecycle events and payload/header/path exclusion passed\n";
+  std::cout << "real HTTP lifecycle events and payload/header/path exclusion passed\n";
 }

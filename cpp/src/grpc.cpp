@@ -57,64 +57,6 @@ grpc::Status error(grpc::StatusCode code, const char* reason) {
   return {code, reason};
 }
 void close_fd(int& fd) noexcept { if (fd >= 0) { ::close(fd); fd = -1; } }
-void apply_limits(GrpcLimits& limits, const RuntimePolicy& policy) {
-  limits.connections = policy.integer("HOST_MAX_CONNECTIONS");
-  limits.inflight = policy.integer("HOST_MAX_IN_FLIGHT");
-  limits.streams_per_connection = policy.integer("GRPC_MAX_STREAMS_PER_CONNECTION");
-  limits.request_bytes = policy.integer("MAX_REQUEST_BYTES");
-  limits.response_bytes = policy.integer("MAX_RESPONSE_BYTES");
-  if (policy.supports("MAX_HEADER_BYTES")) limits.header_bytes = policy.integer("MAX_HEADER_BYTES");
-  limits.call_timeout = std::chrono::milliseconds(policy.integer("CALL_TIMEOUT_MS"));
-  limits.idle_timeout = std::chrono::milliseconds(policy.integer("IDLE_TIMEOUT_MS"));
-  limits.shutdown_timeout = std::chrono::milliseconds(policy.integer("SHUTDOWN_TIMEOUT_MS"));
-}
-}
-GrpcLimits::GrpcLimits() {
-  static const auto defaults = [] {
-    RuntimePolicyOptions options;
-    options.capabilities = {"host", "http", "rpc", "transport", "grpc"};
-    return resolve_runtime_policy(options);
-  }();
-  apply_limits(*this, defaults);
-}
-GrpcLimits grpc_limits(const RuntimePolicy& policy) {
-  policy.check_applied({"HOST_MAX_CONNECTIONS", "HOST_MAX_IN_FLIGHT",
-      "GRPC_MAX_STREAMS_PER_CONNECTION", "MAX_HEADER_BYTES", "MAX_REQUEST_BYTES",
-      "MAX_RESPONSE_BYTES", "CALL_TIMEOUT_MS", "IDLE_TIMEOUT_MS", "SHUTDOWN_TIMEOUT_MS"},
-      {"host", "rpc", "transport", "grpc"});
-  GrpcLimits limits;
-  apply_limits(limits, policy);
-  if (limits.idle_timeout.count() >= 2147483647)
-    throw RuntimePolicyError("IDLE_TIMEOUT_MS", "native INT_MAX idle value means unlimited");
-  validate(limits);
-  return limits;
-}
-GrpcLimits grpc_client_limits(const RuntimePolicy& policy,
-                             std::span<const std::string_view> owner_applied) {
-  std::vector<std::string_view> applied{"MAX_REQUEST_BYTES", "MAX_RESPONSE_BYTES",
-      "CALL_TIMEOUT_MS", "MAX_HEADER_BYTES"};
-  for (const auto name : owner_applied) {
-    if (name != "GRPC_MAX_STREAMS_PER_CONNECTION" && name != "IDLE_TIMEOUT_MS")
-      throw RuntimePolicyError(std::string(name), "unsupported client owner field");
-    applied.push_back(name);
-  }
-  constexpr std::array<std::string_view, 3> capabilities{"rpc", "transport", "grpc"};
-  policy.check_applied(applied, capabilities);
-  GrpcLimits limits;
-  limits.request_bytes = policy.integer("MAX_REQUEST_BYTES");
-  limits.response_bytes = policy.integer("MAX_RESPONSE_BYTES");
-  limits.call_timeout = std::chrono::milliseconds(policy.integer("CALL_TIMEOUT_MS"));
-  limits.idle_timeout = std::chrono::milliseconds(policy.integer("IDLE_TIMEOUT_MS"));
-  if (policy.supports("MAX_HEADER_BYTES"))
-    limits.header_bytes = policy.integer("MAX_HEADER_BYTES");
-  if (policy.supports("GRPC_MAX_STREAMS_PER_CONNECTION"))
-    limits.streams_per_connection = policy.integer("GRPC_MAX_STREAMS_PER_CONNECTION");
-  // Channel lifetime belongs to its owner. The supported native baseline
-  // bounds server idle connections, but has no client idle eviction option.
-  if (limits.idle_timeout.count() >= 2147483647)
-    throw RuntimePolicyError("IDLE_TIMEOUT_MS", "native INT_MAX idle value means unlimited");
-  validate(limits);
-  return limits;
 }
 GrpcClock::time_point grpc_stream_deadline(const GrpcLimits& limits,
                                           GrpcClock::time_point caller_deadline) {
@@ -130,6 +72,7 @@ GrpcClock::time_point grpc_stream_deadline(const GrpcLimits& limits,
     throw std::invalid_argument("stream host budget is too small for native timeout rounding");
   return std::min(caller_deadline, now + limits.call_timeout - margin);
 }
+namespace {
 void configure_grpc_server(grpc::ServerBuilder& builder, const GrpcLimits& limits) {
   validate(limits);
   builder.SetMaxReceiveMessageSize(static_cast<int>(limits.request_bytes));
@@ -147,6 +90,7 @@ void configure_grpc_server(grpc::ServerBuilder& builder, const GrpcLimits& limit
   builder.AddChannelArgument(GRPC_ARG_SERVER_HANDSHAKE_TIMEOUT_MS,
                              static_cast<int>(limits.idle_timeout.count()));
   builder.AddChannelArgument(GRPC_ARG_MAX_METADATA_SIZE, static_cast<int>(limits.header_bytes));
+}
 }
 namespace detail {
 struct GrpcAdmissionState {
@@ -489,6 +433,7 @@ GrpcStats GrpcUnixServer::stats() const noexcept {
   return stats;
 }
 const std::string& GrpcUnixServer::socket_path() const noexcept { return impl_->path; }
+namespace {
 grpc::ChannelArguments grpc_channel_arguments(const GrpcLimits& limits) {
   validate(limits);
   grpc::ChannelArguments args;
@@ -500,6 +445,7 @@ grpc::ChannelArguments grpc_channel_arguments(const GrpcLimits& limits) {
   quota.Resize(limits.native_memory_bytes).SetMaxThreads(limits.native_threads);
   args.SetResourceQuota(quota);
   return args;
+}
 }
 std::shared_ptr<grpc::Channel> make_grpc_unix_channel(const std::string& path,
                                                     const GrpcLimits& limits) {
