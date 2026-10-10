@@ -6,7 +6,6 @@ const { randomBytes, randomUUID } = require("node:crypto");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { WebSocket, WebSocketServer } = require("ws");
-const { resolvePolicy, derivePolicy, PolicyError, policyOptions } = require("./policy.cjs");
 const { HTTPClient, TransportError } = require("./client.cjs");
 const { BootstrapBinding, readBootstrapBinding, loadBootstrapInput } = require("./bootstrap.cjs");
 const { Diagnostics, DiagnosticCloseError, DiagnosticSinkError } = require("./diagnostics.cjs");
@@ -25,19 +24,17 @@ function newInstanceId() {
   return randomBytes(16).toString("hex");
 }
 
-// HTTP host with bounded admission and drain. A TCP/TLS edge is started with
+// HTTP host with bounded admission and drain. Options are plain limits (defaults
+// in parentheses): maxConnections (32), maxInFlight (32), maxBodyBytes (1 MiB),
+// maxHeaderBytes (16 KiB), maxResponseBytes (none), callTimeoutMs (none),
+// headerTimeoutMs (5000), requestTimeoutMs, idleTimeoutMs (30000), shutdownMs
+// (5000), plus diagnostics (a Diagnostics owner). TCP/TLS hosts are started with
 // host.server.listen(); authentication, routes and allowed origins belong to the
 // product. With unixPath the host owns a private Unix socket instead and is
 // started with host.listen().
 function createHTTPHost(handler, options = {}) {
-  options = policyOptions(options, {
-    HOST_MAX_CONNECTIONS: "maxConnections", HOST_MAX_IN_FLIGHT: "maxInFlight",
-    MAX_HEADER_BYTES: "maxHeaderBytes", MAX_REQUEST_BYTES: "maxBodyBytes",
-    MAX_RESPONSE_BYTES: "maxResponseBytes", CALL_TIMEOUT_MS: "callTimeoutMs",
-    HEADER_TIMEOUT_MS: "headerTimeoutMs", IDLE_TIMEOUT_MS: "idleTimeoutMs",
-    SHUTDOWN_TIMEOUT_MS: "shutdownMs",
-  });
-  const diagnostics = options.policy?.diagnostics;
+  if (options.diagnostics != null && !(options.diagnostics instanceof Diagnostics)) throw new TypeError("explicit Diagnostics owner required");
+  const diagnostics = options.diagnostics;
   const emit = (event, fields) => diagnostics?.emit(event, fields);
   const unixPath = options.unixPath ?? null;
   if (unixPath !== null) {
@@ -279,7 +276,7 @@ function proxyWebSocket(request, socket, head, address, options = {}) {
   const protocols = String(request.headers["sec-websocket-protocol"] || "")
     .split(",").map((p) => p.trim()).filter(Boolean);
   const headers = {};
-  // Policy decides whether these credentials may reach the selected upstream.
+  // The product decides whether these credentials may reach the selected upstream.
   for (const name of options.forwardHeaders ?? ["authorization", "cookie", "origin"]) {
     if (request.headers[name] != null) headers[name] = request.headers[name];
   }
@@ -435,11 +432,10 @@ function createFetchHost(handler, options = {}) {
 // A bound internal host uses the same native listener and resource owner as a
 // public edge, with strict metadata before any domain dispatch.
 function createRPCHost(handler, options = {}) {
-  options = policyOptions(options, { CALL_TIMEOUT_MS: "callTimeoutMs", MAX_RESPONSE_BYTES: "maxResponseBytes" });
   const instanceId = options.instanceId;
   if (typeof instanceId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(instanceId)) throw new TypeError("canonical instanceId required");
   const discovery = new Set(options.discoveryPaths ?? []);
-  const maximum = options.policy?.fields.CALL_TIMEOUT_MS?.value ?? options.callTimeoutMs ?? 30000;
+  const maximum = options.callTimeoutMs ?? 30000;
   if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 86400000) throw new RangeError("finite RPC callTimeoutMs 1..86400000 required");
   return createHTTPHost(async (req, res) => {
     const entries = (name) => {
@@ -453,7 +449,7 @@ function createRPCHost(handler, options = {}) {
     if (ids.length !== 1 || !/^[A-Za-z0-9._:-]{1,128}$/.test(ids[0]) || timeouts.length !== 1 || !/^[1-9][0-9]{0,7}$/.test(timeouts[0]) || Number(timeouts[0]) > 86400000 || instances.length > 1) code = "invalid_argument";
     else if (!(req.method === "GET" && discovery.has(req.url) && instances.length === 0) && (instances.length !== 1 || instances[0] !== instanceId)) code = "conflict";
     if (code) {
-      options.policy?.diagnostics?.emit("call_rejected", { category: code, instance_id: instanceId });
+      options.diagnostics?.emit("call_rejected", { category: code, instance_id: instanceId });
       res.writeHead(code === "conflict" ? 409 : 400, { "Content-Type": "application/json", Connection: "close" });
       res.end(JSON.stringify({ error: { code, message: "invalid RPC metadata" } }));
       return;
@@ -462,9 +458,9 @@ function createRPCHost(handler, options = {}) {
     const abort = new AbortController();
     const timeoutMs = Math.min(Number(timeouts[0]), maximum);
     const deadline = Date.now() + timeoutMs;
-    const timer = setTimeout(() => { options.policy?.diagnostics?.emit("deadline_exceeded", { request_id: ids[0], instance_id: instanceId, budget_ms: timeoutMs }); abort.abort(); res.destroy(); }, timeoutMs);
+    const timer = setTimeout(() => { options.diagnostics?.emit("deadline_exceeded", { request_id: ids[0], instance_id: instanceId, budget_ms: timeoutMs }); abort.abort(); res.destroy(); }, timeoutMs);
     timer.unref();
-    const ended = () => { clearTimeout(timer); if (!res.writableFinished && !abort.signal.aborted) options.policy?.diagnostics?.emit("cancelled", { request_id: ids[0], instance_id: instanceId }); abort.abort(); };
+    const ended = () => { clearTimeout(timer); if (!res.writableFinished && !abort.signal.aborted) options.diagnostics?.emit("cancelled", { request_id: ids[0], instance_id: instanceId }); abort.abort(); };
     res.once("close", ended); res.once("finish", () => clearTimeout(timer));
     try { return await handler(req, res, { requestId: ids[0], instanceId, deadline, signal: abort.signal }); }
     finally { if (res.writableFinished || res.destroyed) clearTimeout(timer); }
@@ -480,7 +476,7 @@ function createBoundHTTPHost(handler, options) {
     const authorized = await credentials.authorization.authorize(req, context);
     if (context.signal.aborted || res.destroyed || Date.now() >= context.deadline) return;
     if (authorized !== true) {
-      options.policy?.diagnostics?.emit("call_rejected", { operation: "authorization", request_id: context.requestId, instance_id: context.instanceId });
+      options.diagnostics?.emit("call_rejected", { operation: "authorization", request_id: context.requestId, instance_id: context.instanceId });
       res.writeHead(403, { "Content-Type": "application/json", Connection: "close" });
       res.end('{"error":{"code":"permission_denied","message":"caller is not authorized"}}');
       return;
@@ -488,4 +484,4 @@ function createBoundHTTPHost(handler, options) {
     return handler(req,res,context);
   }, { ...options, tls: credentials.tls });
 }
-module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, newInstanceId, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, resolvePolicy, derivePolicy, PolicyError, HTTPClient, TransportError };
+module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, newInstanceId, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, HTTPClient, TransportError };

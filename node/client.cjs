@@ -5,7 +5,7 @@ const tls = require("node:tls");
 const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 const { Transform } = require("node:stream");
-const { policyOptions } = require("./policy.cjs");
+const { Diagnostics } = require("./diagnostics.cjs");
 const id = /^[A-Za-z0-9._:-]{1,128}$/;
 class TransportError extends Error {
   constructor(code, disposition, message, cause) {
@@ -74,12 +74,7 @@ function secureClientTLS(input) {
 class HTTPClient {
   #tls;
   constructor(options = {}) {
-    options = policyOptions(options, {
-      CLIENT_MAX_CONNECTIONS: "maxConnections", CLIENT_MAX_REFERENCES: "maxReferences",
-      CLIENT_REFERENCE_IDLE_TIMEOUT_MS: "referenceIdleTimeoutMs", HOST_MAX_IN_FLIGHT: "maxInFlight",
-      MAX_HEADER_BYTES: "maxHeaderBytes", MAX_REQUEST_BYTES: "maxRequestBytes", MAX_RESPONSE_BYTES: "maxResponseBytes",
-      CALL_TIMEOUT_MS: "callTimeoutMs",
-    });
+    if (options.diagnostics != null && !(options.diagnostics instanceof Diagnostics)) throw new TypeError("explicit Diagnostics owner required");
     this.#tls = secureClientTLS(options.tls);
     this.options = Object.freeze({ ...options, tls: undefined });
     this.maxConnections = positive(options.maxConnections, 16, "maxConnections");
@@ -98,7 +93,7 @@ class HTTPClient {
   }
   stats() { return { references: this.pools.size, inFlight: this.active.size, closed: this.closed }; }
   diagnostic(event, fields = {}) {
-    this.options.policy?.diagnostics?.emit(event, { operation: "http_client", ...fields });
+    this.options.diagnostics?.emit(event, { operation: "http_client", ...fields });
   }
   diagnosticFailure(error, fields = {}, admission = false) {
     const event = error.code === "cancelled" ? "cancelled" : error.code === "deadline_exceeded" ? "deadline_exceeded"
