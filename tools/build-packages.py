@@ -31,7 +31,7 @@ def build_cpp(args, source, work, out, version, sdk_version):
     # Bootstrap is part of the base HTTP ABI: http's retained-parent and
     # credential setup calls into it at runtime, so ship its SONAME beside
     # the other non-gRPC libraries and let dpkg-shlibdeps derive OpenSSL.
-    names = {"libxgc2-xrpc1": ["unix", "policy", "diagnostics", "bootstrap", "http"]}
+    names = {"libxgc2-xrpc1": ["unix", "policy", "diagnostics", "bootstrap", "http", "json_http"]}
     if args.cpp_profile == "grpc":
         names["libxgc2-xrpc-grpc1"] = ["grpc"]
     packages = {}
@@ -91,6 +91,8 @@ def build_cpp(args, source, work, out, version, sdk_version):
         else:
             runtime_name = name.removesuffix("-dev") + "1" if hasattr(str, "removesuffix") else name[:-4] + "1"
             depends = runtime_name + " (= " + version + ")"
+            if name == "libxgc2-xrpc-dev":
+                depends += ", nlohmann-json3-dev (>= 3.7)"
             if name == "libxgc2-xrpc-grpc-dev":
                 depends += ", libxgc2-xrpc-dev (= " + version + "), libgrpc++-dev (>= 1.16), libprotobuf-dev"
         section = "libs" if name in names else "libdevel"

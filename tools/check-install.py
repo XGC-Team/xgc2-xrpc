@@ -78,9 +78,9 @@ def validate_deb_paths(file):
                 seen.add(name)
                 if member.issym():
                     # Only flat, relative linker/SONAME links are permitted. Directory links are never copied.
-                    if not re.fullmatch(r"usr/lib/[^/]+/libxgc2_xrpc_[a-z]+\.so(?:\.1)?", name):
+                    if not re.fullmatch(r"usr/lib/[^/]+/libxgc2_xrpc_[a-z_]+\.so(?:\.1)?", name):
                         raise ValueError("unsupported Debian symlink: " + name)
-                    if not re.fullmatch(r"libxgc2_xrpc_[a-z]+\.so\.(?:1|[0-9]+\.[0-9]+\.[0-9]+)", member.linkname):
+                    if not re.fullmatch(r"libxgc2_xrpc_[a-z_]+\.so\.(?:1|[0-9]+\.[0-9]+\.[0-9]+)", member.linkname):
                         raise ValueError("unsafe Debian link target: " + member.linkname)
                 elif not (member.isfile() or member.isdir()):
                     raise ValueError("unsupported Debian member type: " + name)
@@ -138,7 +138,7 @@ def check_cpp(args, directory, evidence, work, checks):
             shutil.copy2(path, target, follow_symlinks=False)
             if ".so." in path.name and path.is_file() and not path.is_symlink():
                 runtime.append(target)
-    if len(runtime) != (6 if profile == "grpc" else 5):
+    if len(runtime) != (7 if profile == "grpc" else 6):
         raise ValueError("wrong installed native library count")
     for library in runtime:
         info = elf_info(library, args.distribution, args.architecture)

@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-xrpc
 name: XGC2 XRPC SDKs
-version: 0.1.0-1
+version: 0.1.0-2
 kind: toolchain-apt
 summary: Bounded HTTP and optional native gRPC transport SDKs, including a Node library package.
 apt:
@@ -17,12 +17,13 @@ apt:
   - libxgc2-xrpc-grpc-dev
   - node-xgc2-xrpc
   depends:
+  - nlohmann-json3-dev (>= 3.7)
   - libgrpc++-dev (>= 1.16)
   - libprotobuf-dev
 usage:
   install: sudo apt install libxgc2-xrpc-dev libxgc2-xrpc-grpc-dev node-xgc2-xrpc
   smoke_test: cmake --find-package -DNAME=XgcXrpc -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST
-  notes: C++ consumers use XgcXrpc::http or the explicit grpc component. Python wheel, Go source archive, Rust crate and Node npm tarball install through their native package managers. Python uses an explicitly selected interpreter >=3.8. The Architecture all node-xgc2-xrpc package installs the same Node library with private pinned ws; consumers provide an explicitly selected Node >=20 runtime. Its installation identity is recorded in /usr/share/xgc2/xrpc/node/install-identity.json.
+  notes: C++ consumers use the explicit XgcXrpc::json_http or XgcXrpc::grpc business profile; raw XgcXrpc::http supports mixed/binary hosts. Python wheel, Go source archive, Rust crate and Node npm tarball install through their native package managers. Python uses an explicitly selected interpreter >=3.8. The Architecture all node-xgc2-xrpc package installs the same Node library with private pinned ws; consumers provide an explicitly selected Node >=20 runtime. Its installation identity is recorded in /usr/share/xgc2/xrpc/node/install-identity.json.
 ownership:
   paths:
   - /usr/include/xgc2/xrpc
@@ -39,6 +40,6 @@ release:
   requires: []
   dependency_policy: {}
   apt_versions:
-    focal: 0.1.0-1~focal
-    jammy: 0.1.0-1~jammy
-    noble: 0.1.0-1~noble
+    focal: 0.1.0-2~focal
+    jammy: 0.1.0-2~jammy
+    noble: 0.1.0-2~noble

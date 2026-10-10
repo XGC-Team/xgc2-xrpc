@@ -5,9 +5,10 @@ payloads, completion, configuration schemas and persistence remain with the
 product. This package has no ROS, workflow, process-launch or database dependency.
 
 Targets are `XgcXrpc::unix`, `XgcXrpc::policy`, `XgcXrpc::diagnostics`, `XgcXrpc::bootstrap`,
-`XgcXrpc::http`, and optional `XgcXrpc::grpc`. HTTP-only builds do not find or
+`XgcXrpc::http`, `XgcXrpc::json_http`, and optional `XgcXrpc::grpc`. HTTP-only builds do not find or
 link gRPC. Installed consumers use `find_package(XgcXrpc REQUIRED)` and link the
-target they consume; gRPC consumers also request `COMPONENTS grpc`.
+target they consume; JSON-HTTP consumers request `COMPONENTS json_http`; gRPC consumers request
+`COMPONENTS grpc`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -21,6 +22,37 @@ require GCC >= 11; CMake also checks actual C++20 standard-library facilities.
 The Unix primitive itself has no Boost dependency. Optional gRPC requires a
 native gRPC >= 1.16 package, Protobuf and its C++ generator for tests. The test
 service/generated proto is not an installed product contract.
+
+## JSON-HTTP function integration
+
+The supported business profiles are JSON-HTTP and generated Protobuf/gRPC.
+`JsonHttpClient` accepts/returns typed `JsonHttpRequest`/`JsonHttpResponse` values;
+`JsonHttpHandler` adapts a function receiving `JsonHttpRequest` and
+`JsonHttpReply` into the ordinary `HttpServer::Handler` signature. It owns no
+listener, thread, router or work queue. Products decide where to mount their
+functions and who owns the host; there is no independent/shared server mode.
+Raw `http` remains available for binary payloads and mixed-content hosts.
+
+```cpp
+#include <xgc2/xrpc/json_http.hpp>
+using namespace xgc2::xrpc;
+JsonHttpHandler method([](JsonHttpRequest request, JsonHttpReply reply) {
+  reply.complete(Json{{"accepted", request.body.has_value()}});
+}, {limits.request_bytes, 32}, limits.response_bytes);
+// Pass method to HttpServer, or call method(request, reply) in the product's
+// existing dispatcher. That dispatcher owns its paths and domain methods.
+```
+
+The JSON profile uses nlohmann-json >=3.7, parses once on the IO owner, rejects
+invalid syntax/UTF-8, duplicate keys and excess nesting, and preserves uint64
+integers. Nonempty bodies require application/json. Missing bodies and JSON
+null are distinct. Serialization streams into bounded storage and stops on
+overflow, without a temporary unbounded dump. The resulting buffer is moved
+into HTTP. Domain objects and business schema validation remain domain-owned.
+Typed replies retain the original HTTP admission and lease; no lifecycle is
+shortened by the adapter. The client reuses the original HTTP connection and
+never retries. Invalid responses report OutcomeUnknown; requests rejected
+before transport report NotSent. These are local Unix transports.
 
 ## Policy and HTTP ownership
 

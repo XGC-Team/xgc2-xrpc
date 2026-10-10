@@ -3,6 +3,7 @@
 #include <ostream>
 #include <streambuf>
 #include <string>
+#include <utility>
 namespace xgc2 {
 namespace xrpc {
 // JSON libraries can serialize into this ostream without first allocating an
@@ -13,6 +14,7 @@ public:
   std::ostream &stream() noexcept { return stream_; }
   bool good() const noexcept { return stream_.good(); }
   const std::string &value() const noexcept { return bytes_; }
+  std::string take() && noexcept { return std::move(bytes_); }
 
 protected:
   std::streamsize xsputn(const char *data, std::streamsize count) override {

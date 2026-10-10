@@ -1,4 +1,4 @@
-#include <xgc2/xrpc/http.hpp>
+#include <xgc2/xrpc/json_http.hpp>
 #include <xgc2/xrpc/bootstrap.hpp>
 #include <xgc2/xrpc/runtime_policy.hpp>
 #include <xgc2/xrpc/diagnostics.hpp>
@@ -10,6 +10,10 @@
 #include <xgc2/xrpc/grpc.hpp>
 #endif
 int main() {
+  xgc2::xrpc::Json value;
+  if (!xgc2::xrpc::parse_json("{\"n\":18446744073709551615}", value) ||
+      value["n"].get<std::uint64_t>() != UINT64_MAX) return 9;
+  if (xgc2::xrpc::json_response(value, 128).status != 200) return 10;
   try {
     (void)xgc2::xrpc::parseBootstrapBinding("{}");
     return 7;
