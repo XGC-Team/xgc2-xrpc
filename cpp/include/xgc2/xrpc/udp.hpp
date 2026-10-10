@@ -4,14 +4,19 @@
 // standard library; the implementation adds POSIX sockets and OpenSSL libcrypto.
 //
 // Wire format (network byte order), at most 1200 bytes per datagram:
-//    0  4  magic "XRU1"          28 16  instance (request: expected or zero;
-//    4  1  version = 1                          reply: the server's)
-//    5  1  type 1 request, 2 reply 44  4  request: timeout_ms (1..60000)
-//    6  2  flags (bit 0 request:             reply: status
-//          expected_instance set)  48  2  method length (reply: 0)
-//    8  4  key_id                  50  2  body length
-//   12 16  request_id              52  .. method, then body, then the tag:
-//                                  HMAC-SHA256(key[key_id], all preceding bytes)
+//   off len  field
+//     0   4  magic "XRU1"
+//     4   1  version = 1
+//     5   1  type: 1 request, 2 reply
+//     6   2  flags: bit 0 (requests) says expected_instance is set; others 0
+//     8   4  key_id, which selects the HMAC key
+//    12  16  request_id, chosen by the client, constant across retransmissions
+//    28  16  instance: request: the expected server instance or zero; reply: the server's
+//    44   4  request: timeout_ms (1..60000); reply: status
+//    48   2  method length (request: 1..128; reply: 0)
+//    50   2  body length
+//    52  ..  method, then body (UTF-8, JSON), then
+//    ..  32  tag = HMAC-SHA256(key[key_id], all preceding bytes)
 // Datagrams with an unknown key, a bad tag or a malformed layout are dropped
 // without a reply. Execution is at most once per (key_id, request_id) inside
 // the server's reply-cache window (see ServerOptions); beyond it the transport
