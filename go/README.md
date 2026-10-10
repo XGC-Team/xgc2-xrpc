@@ -78,8 +78,12 @@ native SetDeadline methods must actually interrupt its IO.
 `httpx.ServeEdge/RunEdge` serve a public gateway on any listener and preserve
 product auth, routes, SSE and WebSockets. Internal RPC budgets are optional on
 public edges. Hijacked protocols retain domain framing and byte budgets; the
-shared host tracks and closes their underlying connections. Remote TLS is the
-product's listener to wrap; the SDK has no TLS server of its own for http.v1.
+shared host tracks and closes their underlying connections. `HostOptions.
+TLSConfig` serves the edge over TLS 1.2+ (server-auth, or mutual TLS with the
+config's `ClientAuth`): the connection limiter sits below TLS, so `Request.TLS`
+carries the verified peer certificates. Do not wrap the listener in
+`tls.NewListener` yourself: net/http would see the limiter's connection instead
+of the `*tls.Conn` and leave `Request.TLS` nil.
 
 `grpcx.ServeWithOptions` owns native connection/message/header/stream
 admission and finite internal calls on a Unix listener. `HostOptions.InstanceID`

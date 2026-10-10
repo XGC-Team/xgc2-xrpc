@@ -45,6 +45,13 @@ type HostOptions struct {
 	// WriteTimeout is net/http's absolute response deadline; zero disables it.
 	// ServeEvents extends it on every frame, so streams outlive it.
 	WriteTimeout time.Duration
+	// TLSConfig makes ServeEdge and RunEdge serve TLS 1.2+ with this identity and
+	// client-certificate policy (nil serves the listener as it is). The
+	// connection limiter sits below TLS, so net/http owns the handshake and
+	// Request.TLS carries the peer certificates; a TLS listener wrapped by the
+	// caller would hide the *tls.Conn from net/http. Serve, which is for Unix
+	// sockets, rejects it.
+	TLSConfig *tls.Config
 	// ShutdownTimeout is the drain budget of RunEdge (default xrpc.DefaultShutdownTimeout).
 	ShutdownTimeout time.Duration
 	Diagnostics     *xrpc.Diagnostics
@@ -210,6 +217,9 @@ func Serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 	if listener.Addr().Network() != "unix" {
 		return nil, errors.New("xrpc: internal HTTP hosts serve Unix listeners; use ServeEdge for public listeners")
 	}
+	if options.TLSConfig != nil {
+		return nil, errors.New("xrpc: internal HTTP hosts serve Unix listeners without TLS; TLSConfig belongs to ServeEdge")
+	}
 	if options.Metrics == nil {
 		options.Metrics = &xrpc.Metrics{}
 	}
@@ -219,9 +229,19 @@ func Serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 // ServeEdge hosts an explicit public gateway. Its product retains HTTP auth,
 // CORS, routes, SSE and WebSocket semantics. No RPC caller headers are required.
 // MaxCallTime and WriteTimeout are opt-in for edges; zero preserves streaming.
+// HostOptions.TLSConfig serves the listener over TLS; hand ServeEdge the raw
+// listener in that case, not one wrapped by tls.NewListener.
 func ServeEdge(listener net.Listener, handler http.Handler, options HostOptions) (*Host, error) {
 	if listener == nil || handler == nil {
 		return nil, errors.New("xrpc: listener and handler required")
+	}
+	if options.TLSConfig != nil {
+		if len(options.TLSConfig.Certificates) == 0 && options.TLSConfig.GetCertificate == nil && options.TLSConfig.GetConfigForClient == nil {
+			return nil, errors.New("xrpc: server TLS identity required")
+		}
+		options.TLSConfig = options.TLSConfig.Clone()
+		options.TLSConfig.MinVersion = max(options.TLSConfig.MinVersion, tls.VersionTLS12)
+		options.TLSConfig.NextProtos = []string{"http/1.1"}
 	}
 	timeout := options.MaxCallTime
 	normalized := options.defaults()
@@ -273,6 +293,10 @@ func ServeEdge(listener net.Listener, handler http.Handler, options HostOptions)
 func serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, options HostOptions) (*Host, error) {
 	options = options.defaults()
 	limited := netlimit.New(listener, options.MaxConnections)
+	var serving net.Listener = limited
+	if options.TLSConfig != nil {
+		serving = tls.NewListener(limited, options.TLSConfig)
+	}
 	host := &Host{listener: limited, lease: lease, draining: make(chan struct{}), done: make(chan struct{}), stopped: make(chan struct{}), drained: make(chan struct{}), options: options}
 	tracked := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host.mu.Lock()
@@ -288,7 +312,7 @@ func serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 	})
 	host.server = &http.Server{Handler: tracked, ReadHeaderTimeout: options.HeaderTimeout, IdleTimeout: options.IdleTimeout, WriteTimeout: options.WriteTimeout, MaxHeaderBytes: options.MaxHeaderBytes, TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}}
 	go func() {
-		err := host.server.Serve(limited)
+		err := host.server.Serve(serving)
 		if !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			host.err = err
 		}
