@@ -8,6 +8,21 @@ from dataclasses import dataclass
 
 
 MAX_TIMEOUT_MS = 86400000
+# What a caller may conclude about a call: nothing reached the peer, the request
+# may have run without a usable answer, or the peer answered (an error answer
+# or an answer the client refuses also counts).
+NOT_SENT = "not_sent"
+OUTCOME_UNKNOWN = "outcome_unknown"
+RESPONSE_RECEIVED = "response_received"
+DISPOSITIONS = (NOT_SENT, OUTCOME_UNKNOWN, RESPONSE_RECEIVED)
+# The shared error vocabulary and the HTTP status each code travels with.
+ERROR_STATUS = {"invalid_argument": 400, "unauthenticated": 401, "permission_denied": 403,
+                "not_found": 404, "conflict": 409, "resource_exhausted": 429,
+                "deadline_exceeded": 504, "cancelled": 499, "unavailable": 503, "internal": 500}
+_CODE_FOR_STATUS = {400: "invalid_argument", 401: "unauthenticated", 403: "permission_denied",
+                    404: "not_found", 408: "deadline_exceeded", 409: "conflict",
+                    413: "resource_exhausted", 429: "resource_exhausted", 431: "resource_exhausted",
+                    499: "cancelled", 502: "unavailable", 503: "unavailable", 504: "deadline_exceeded"}
 _REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
 _TIMEOUT = re.compile(r"[1-9][0-9]{0,7}\Z", re.ASCII)
 
@@ -28,6 +43,16 @@ def validate_request_id(value):
 
 def generate_request_id():
     return secrets.token_hex(16)
+
+
+def new_instance_id():
+    """A fresh 128-bit instance identity as 32 hex characters; once per process start."""
+    return secrets.token_hex(16)
+
+
+def code_for_status(status):
+    """The error code an HTTP error status without a standard envelope stands for."""
+    return _CODE_FOR_STATUS.get(status, "internal")
 
 
 def parse_timeout_ms(value):

@@ -46,7 +46,7 @@ impl Drop for UserData {
 
 #[no_mangle]
 pub extern "C" fn consumer_sdk_symbol() -> *const c_void {
-    xgc2_xrpc::policy::default_policy as *const () as *const c_void
+    xgc2_xrpc::new_instance_id as *const () as *const c_void
 }
 #[no_mangle]
 pub extern "C" fn consumer_entered() -> usize { ENTERED.load(Ordering::SeqCst) }

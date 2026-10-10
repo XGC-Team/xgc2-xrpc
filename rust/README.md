@@ -1,23 +1,35 @@
 # xgc2-xrpc Rust
 
-Rust 1.85 or newer. HTTP uses Hyper/Tokio. The `grpc` feature adds native
-tonic/Protobuf transports; HTTP consumers do not enable it.
+Rust 1.85 or newer. HTTP/JSON (`http.v1`) over private Unix sockets, built on
+Hyper and Tokio: a bounded host, a pooled client, Unix endpoint ownership and a
+C host ABI for plugins. There is no gRPC, no TLS and no configuration from the
+process environment: limits are plain structs.
 
-Resolve the process environment once before creating listeners. Pass the same
-resolved limits to hosts and clients:
+| `Limits` field | Default | | `RuntimeOptions` field | Default |
+|---|---|---|---|---|
+| `connections` (host) | 32 | | `max_connections` | 32 |
+| `in_flight` (host) | 32 | | `max_calls` | 32 |
+| `body_bytes`, `response_bytes` | 1 MiB | | `max_sessions` (client references) | 64 |
+| `header_bytes` (at least 8192), `header_count` | 16 KiB, 64 | | `blocking_workers` | 4 |
+| `header_timeout`, `idle_timeout` | 5 s, 30 s | | | |
+| `client_connections` (per reference) | 16 | | | |
+| `client_reference_idle_timeout` | 30 s | | | |
+| `call_timeout` (at most 24 h), `shutdown_timeout` | 30 s, 5 s | | | |
+
+Override fields with struct update syntax and pass the same `Limits` to hosts
+and clients:
 
 ```rust,no_run
 use xgc2_xrpc::{
-    policy::PolicyOptions, RuntimePolicy, RuntimeOptions, Runtime, Limits,
-    Client, Host, HTTP_POLICY_FIELDS, handler, new_instance_id,
+    handler, new_instance_id, Client, Host, Limits, Runtime, RuntimeOptions,
 };
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-let policy = RuntimePolicy::resolve_os(std::env::vars_os(), PolicyOptions::default())?;
-policy.check_applied(HTTP_POLICY_FIELDS.iter().copied())?;
-let mut runtime = Runtime::new(RuntimeOptions::from_policy(&policy)?)?;
-let mut limits = Limits::from_policy(&policy)?;
-limits.discovery_routes = vec!["/v1/describe".into()];
+let mut runtime = Runtime::new(RuntimeOptions::default())?;
+let limits = Limits {
+    discovery_routes: vec!["/v1/describe".into()],
+    ..Limits::default()
+};
 
 // The bootstrap owner grants an euid-owned 0700 directory and an endpoint.
 let socket = std::path::Path::new("/run/user/1000/my-service/control.sock");
@@ -35,24 +47,35 @@ runtime.close(std::time::Duration::from_secs(5))?;
 # }
 ```
 
-`RuntimePolicy::effective()` reports values, sources, ceilings and revision.
-Explicit settings unsupported by the selected capabilities fail resolution.
-`check_applied` checks the union of fields consumed by the process. Diagnostic
-log settings are unsupported in this package. `Client::connection_bounds()`
-reports the configured per-reference ceiling and the effective native HTTP
-ceiling, bounded by the shared Runtime's global connection ceiling. HTTP
-connections grow only as concurrent calls need them, up to
-`CLIENT_MAX_CONNECTIONS`; idle connections are reused and expire independently.
-Clients with the same endpoint and compatible transport policy, including the
-connection ceiling, share one reference across clones and boot generations.
-A small per-call response cap does not create another pool.
+`Client::connection_bounds()` reports the configured per-reference ceiling and
+the effective native HTTP ceiling, bounded by the shared Runtime's global
+connection ceiling. HTTP connections grow only as concurrent calls need them,
+up to `Limits::client_connections`; idle connections are reused and expire
+independently. Clients with the same endpoint and compatible transport
+settings, including the connection ceiling, share one reference across clones
+and boot generations. A small per-call response cap does not create another
+pool.
+
+Every call that does not return a value fails with a `CallError` whose
+`disposition` says what the caller may conclude; `Ok` always means the peer
+answered:
+
+| `Disposition` | Meaning |
+|---|---|
+| `NotSent` | Nothing reached the peer (rejected locally, no listener). Retrying cannot duplicate an effect. |
+| `OutcomeUnknown` | The request may have been processed but no usable answer arrived: deadline, lost connection, truncated body, answer from another instance. Mutations are never replayed. |
+| `ResponseReceived` | The peer answered with an error status, or with an answer the client refuses (larger than `response_bytes`, not JSON). `CallError::status` and `CallError::code` carry the HTTP status and the error code, taken from the standard `{"error":{"code","message"}}` envelope or implied by the status. |
+
+The error codes are `invalid_argument`, `not_found`, `conflict`,
+`resource_exhausted`, `deadline_exceeded`, `cancelled`, `unavailable`,
+`internal`, `unauthenticated` and `permission_denied`; `Fault` carries them on
+the host side and a handler may use other codes of its own.
 
 A held GET response occupies one connection, so it can coexist with a mutation
 when both the per-reference and process/host admission ceilings allow at least
 two concurrent calls. Use `Client::unix_with_limits` or
-`Client::from_service_with_limits` with the same `Limits::from_policy` startup
-snapshot and RuntimeHandle for observation and control. No additional Runtime
-is needed. Saturated callers wait within their original absolute budget;
+`Client::from_service_with_limits` with the same `Limits` value and
+RuntimeHandle for observation and control. No additional Runtime is needed. Saturated callers wait within their original absolute budget;
 outbound call admission bounds the number of waiters. Cancellation invalidates
 only that call's incomplete connection framing and never replays a mutation.
 
@@ -66,7 +89,7 @@ reference has canonical nonempty target/service/API names, a valid nonempty
 instance ID, the selected profile, and a canonical Unix socket path for the
 local target. `Client::from_service` and `BlockingClient::from_service` enforce
 these constraints before admission; `from_service_with_limits` additionally
-preserves the owner's resolved limits. The product checks its expected service
+preserves the owner's limits. The product checks its expected service
 and API version. Discovery remains an explicit unbound Unix request.
 
 ```rust,no_run
@@ -87,14 +110,14 @@ finite timeout and retain ownership; it succeeds only after owned work ends.
 Drop the closed runtime and its handles to release native reactor objects.
 Cancellation and transport failure do not promise domain rollback or replay.
 The original absolute deadline is checked before waiting and after completion,
-including HTTP response encoding and each gRPC body poll. A non-yielding poll
+including HTTP response encoding. A non-yielding poll
 cannot turn an expired call into a successful receipt. Such code still blocks
 its executor until it returns, so the SDK cannot guarantee an on-time network
 reply or undo a domain effect that already happened.
 
 Plugins loaded from a shared library consume the SDK C host factory in
 `include/xgc2/xrpc.h`. The process creates `ffi::RuntimeExport` from its existing
-handle, the same resolved limits, and an `Arc` that pins the module's code.
+handle, the same limits, and an `Arc` that pins the module's code.
 The product's C ABI exposes the returned table through a versioned getter.
 The module uses `ffi::ForeignRuntime::from_api`; it copies the C table and calls
 the originating SDK's functions. Rust objects and allocators stay within each
@@ -151,19 +174,6 @@ all modules drain. Retain/release callbacks must complete promptly; foreign
 callbacks catch their own language's exceptions or panics before returning
 through C. Caller-provided table and buffer addresses must remain valid for
 their declared extents.
-
-With `grpc`, `grpc::GrpcHost::bind` accepts a generated tonic service and
-`grpc::GrpcClient` is the guarded transport passed to a generated client's
-`new` constructor. `grpc::GrpcLimits::from_policy` also consumes
-`GRPC_MAX_STREAMS_PER_CONNECTION`. Requests use native `grpc-timeout` and
-`x-request-id`/`x-xrpc-instance-id`. Streaming deadlines cannot exceed the host
-budget. Compression is rejected. `GrpcClient::with_dialer` accepts an injected
-authenticated transport; the dialer owns remote routing and TLS verification.
-Typed services configure native decode limits and use `grpc::BoundedProstCodec`
-or `grpc::check_message_size` to check encoded size before native allocation.
-Aggregate wire limits, HTTP/2 windows, decoded domain values and native codec
-allocation are separate bounds. A zero native deadline may be rejected by the
-native transport as cancelled before the metadata guard runs.
 
 HTTP serialization and collected bodies use bounded buffers. Parser buffers,
 admitted replies, decoded JSON values and caller-owned values also consume

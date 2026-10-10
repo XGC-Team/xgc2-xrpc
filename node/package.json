@@ -1,13 +1,13 @@
 {
   "name": "@xgc2/xrpc",
   "version": "0.1.0",
-  "description": "Bounded HTTP RPC clients and HTTP/WebSocket hosts for XGC2 service edges",
-  "license": "MIT",
+  "description": "Bounded HTTP RPC clients and HTTP, Unix-socket and WebSocket hosts for XGC2 service edges",
+  "license": "Apache-2.0",
   "main": "index.cjs",
   "types": "index.d.cts",
   "exports": "./index.cjs",
   "engines": { "node": ">=20" },
-  "files": ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "policy.cjs", "diagnostics.cjs", "diagnostic-worker.cjs", "runtime-policy.json", "README.md"],
+  "files": ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "diagnostics.cjs", "diagnostic-worker.cjs", "unix.cjs", "README.md"],
   "scripts": { "test": "node --test test/*.test.cjs" },
   "dependencies": { "ws": "8.22.0" }
 }

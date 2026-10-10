@@ -1,4 +1,4 @@
-"""Exclusive Unix endpoint lifetime, shared by HTTP and external gRPC binders."""
+"""Exclusive Unix endpoint lifetime for HTTP hosts and external binders."""
 
 import errno
 import fcntl

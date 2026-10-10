@@ -71,7 +71,7 @@ class BootstrapBinding {
   }
   resolveCredentials(resolve, role) {
     if (typeof resolve !== "function" || !["server", "client"].includes(role)) throw new TypeError("explicit grant resolver and role required");
-    if (this.endpoint.kind === "unix") throw new TypeError("local private bindings require a formal SDK Unix lease, not TLS grants");
+    if (this.endpoint.kind === "unix") throw new TypeError("local private bindings carry no TLS grants; host them with the unixPath option");
     const identity = resolve(this.secret_handles.tls_identity, "tls_identity");
     const trust = resolve(this.secret_handles.tls_trust, "tls_trust");
     const authorization = resolve(this.secret_handles.authorization, "authorization");

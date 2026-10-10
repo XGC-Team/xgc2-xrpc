@@ -1,5 +1,6 @@
 import asyncio
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -52,13 +53,27 @@ class AppTests(unittest.TestCase):
         router.add_post("/upload",upload)
         async def check():
             async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=self.path)) as client:
-                async with client.post("http://local/upload",data=b"x"*9) as response:
-                    self.assertEqual(response.status,413)
-                    await response.read()
+                # A declared length over the limit is refused from the head alone. The
+                # body is never written, so the 413 cannot race the connection close.
+                with socket.socket(socket.AF_UNIX) as peer:
+                    peer.settimeout(2)
+                    peer.connect(self.path)
+                    peer.sendall(b"POST /upload HTTP/1.1\r\nHost: local\r\nContent-Length: 9\r\n\r\n")
+                    self.assertTrue(peer.recv(4096).startswith(b"HTTP/1.1 413"))
                 self.assertEqual(calls,[])
-                async with client.post("http://local/upload",data=b"x"*8) as response:
-                    self.assertEqual(response.status,200)
-                    self.assertEqual(await response.read(),b"ok")
+                # A client that does send the 9 bytes sees the 413 or, if the host closes
+                # first, a broken connection; the handler never runs either way.
+                try:
+                    async with client.post("http://local/upload",data=b"x"*9) as response:
+                        self.assertEqual(response.status,413)
+                        await response.read()
+                except aiohttp.ClientConnectionError:
+                    pass
+                self.assertEqual(calls,[])
+                async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=self.path)) as fresh:
+                    async with fresh.post("http://local/upload",data=b"x"*8) as response:
+                        self.assertEqual(response.status,200)
+                        self.assertEqual(await response.read(),b"ok")
         with Host.from_app(router,path=self.path,runtime=self.runtime,limits=Limits(body_bytes=8)):
             asyncio.run(check())
         self.assertEqual(calls,[b"x"*8])
@@ -113,8 +128,13 @@ class AppTests(unittest.TestCase):
                 async with client.post("http://local/raw",data=pieces(b"a\x00b\r\nc")) as response:
                     self.assertEqual(response.status,200)
                     self.assertEqual(await response.read(),b"a\x00b\r\nc")
-                async with client.post("http://local/raw",data=pieces(b"x"*9)) as response:
-                    self.assertEqual(response.status,413)
+                # The limit trips while the chunked body is still being sent: the client
+                # sees the 413 or, if the host closes first, a broken connection.
+                try:
+                    async with client.post("http://local/raw",data=pieces(b"x"*9)) as response:
+                        self.assertEqual(response.status,413)
+                except aiohttp.ClientConnectionError:
+                    pass
         with Host.from_app(router,path=self.path,runtime=self.runtime,limits=Limits(body_bytes=8)):
             asyncio.run(check())
 
@@ -186,16 +206,28 @@ class AppTests(unittest.TestCase):
         with Host.from_app(router,path=self.path,runtime=self.runtime):
             asyncio.run(check())
 
-    def test_environment_uniform_precedence_and_actual_default_table(self):
-        runtime=Runtime.from_environment({"XGC2_XRPC_HOST_MAX_CONNECTIONS":"3","XGC2_XRPC_MAX_RESPONSE_BYTES":"96"})
+    def test_plain_limits_and_runtime_defaults_are_the_documented_table(self):
+        defaults=Limits()
+        self.assertEqual((defaults.connections,defaults.in_flight,defaults.header_bytes,defaults.header_count,
+                          defaults.body_bytes,defaults.response_bytes),(32,32,16384,64,1048576,1048576))
+        self.assertEqual((defaults.header_timeout,defaults.call_timeout,defaults.idle_timeout,
+                          defaults.shutdown_timeout,defaults.reference_idle_timeout),(5.0,30.0,30.0,5.0,30.0))
+        runtime=Runtime(max_connections=3)
         try:
+            capacities=runtime.status()["capacities"]
+            self.assertEqual(capacities,{"blocking_workers":4,"calls":32,"connections":3,"sessions":64})
             host=Host(self.path,{},runtime=runtime,limits=Limits(connections=1,response_bytes=64))
-            self.assertEqual(host.limits.connections,3)
-            self.assertEqual(host.limits.response_bytes,96)
-            self.assertEqual(runtime.effective_policy()["fields"]["MAX_RESPONSE_BYTES"]["source"],"environment")
+            self.assertEqual((host.limits.connections,host.limits.response_bytes),(1,64))
+            self.assertEqual(Host(self.path,{},runtime=runtime).limits,defaults)
         finally:
             runtime.close()
-
+        for bad in ({"connections":0},{"connections":True},{"body_bytes":2**31},{"call_timeout":0},
+                    {"call_timeout":86401},{"idle_timeout":float("inf")},{"header_timeout":"5"}):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):
+                Limits(**bad)
+        for bad in ({"blocking_workers":0},{"max_calls":1.5},{"shutdown_timeout":0},{"log_level":"loud"}):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):
+                Runtime(**bad)
 
 if __name__=="__main__":
     unittest.main()
