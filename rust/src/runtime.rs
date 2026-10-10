@@ -43,48 +43,27 @@ where
         .map_err(|_| ())?
 }
 
+/// Process-owner capacities. `RuntimeOptions::default()` documents the SDK
+/// defaults; override fields with struct update syntax.
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
+    /// Connections shared by all hosts and clients, per direction. Default 32.
     pub max_connections: usize,
+    /// Concurrent calls shared by all hosts and clients, per direction. Default 32.
     pub max_calls: usize,
+    /// Distinct client references (pools) alive at once. Default 64.
     pub max_sessions: usize,
+    /// Fixed blocking pool shared by all domain callbacks. Default 4.
     pub blocking_workers: usize,
 }
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            max_connections: crate::policy::default_policy()
-                .integer("HOST_MAX_CONNECTIONS")
-                .expect("generated policy") as usize,
-            max_calls: crate::policy::default_policy()
-                .integer("HOST_MAX_IN_FLIGHT")
-                .expect("generated policy") as usize,
-            max_sessions: crate::policy::default_policy()
-                .integer("CLIENT_MAX_REFERENCES")
-                .expect("generated policy") as usize,
+            max_connections: 32,
+            max_calls: 32,
+            max_sessions: 64,
             blocking_workers: 4,
         }
-    }
-}
-impl RuntimeOptions {
-    /// Process-owned fixed blocking pool remains an explicit option. Other
-    /// limits consume the shared policy resolved once by the composition root.
-    pub fn from_policy(policy: &crate::RuntimePolicy) -> io::Result<Self> {
-        let number = |name| {
-            if policy.fields().contains_key(name) {
-                policy.integer(name)
-            } else {
-                crate::policy::default_policy().integer(name)
-            }
-            .map(|n| n as usize)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-        };
-        Ok(Self {
-            max_connections: number("HOST_MAX_CONNECTIONS")?,
-            max_calls: number("HOST_MAX_IN_FLIGHT")?,
-            max_sessions: number("CLIENT_MAX_REFERENCES")?,
-            ..Self::default()
-        })
     }
 }
 #[derive(Clone, Debug, serde::Serialize)]

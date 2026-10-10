@@ -1,39 +1,21 @@
-//! Bounded XRPC policy over native Hyper/Tokio. Products own explicit Runtime
-//! instances; endpoints and calls share fixed IO/dispatch resources.
+//! Bounded http.v1 hosts and clients over native Hyper/Tokio. Products own
+//! explicit Runtime instances; endpoints and calls share fixed IO/dispatch
+//! resources. Limits are plain structs with documented defaults.
 #![doc = include_str!("../README.md")]
 mod client;
 pub mod ffi;
 mod host;
-pub mod policy;
 mod runtime;
 pub mod unix;
 pub use client::{AsyncIo, BlockingClient, Client, Dialer};
 pub use host::{Host, HostStats};
 pub use hyper::Method;
-pub use policy::{PolicyOptions, RuntimePolicy};
 pub use runtime::{Runtime, RuntimeHandle, RuntimeOptions, RuntimeStats};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::Instant;
 pub use unix::UnixLease;
-
-/// Registry fields consumed by a composed HTTP Runtime, Limits, and Client.
-/// Check the union of actual process roles before opening any listener.
-pub const HTTP_POLICY_FIELDS: &[&str] = &[
-    "HOST_MAX_CONNECTIONS",
-    "HOST_MAX_IN_FLIGHT",
-    "MAX_HEADER_BYTES",
-    "MAX_REQUEST_BYTES",
-    "MAX_RESPONSE_BYTES",
-    "CALL_TIMEOUT_MS",
-    "HEADER_TIMEOUT_MS",
-    "IDLE_TIMEOUT_MS",
-    "SHUTDOWN_TIMEOUT_MS",
-    "CLIENT_MAX_CONNECTIONS",
-    "CLIENT_MAX_REFERENCES",
-    "CLIENT_REFERENCE_IDLE_TIMEOUT_MS",
-];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,76 +33,59 @@ pub struct ServiceRef {
     pub profile: String,
     pub endpoint: Endpoint,
 }
+/// Resource limits shared by hosts and clients. `Limits::default()` documents
+/// the SDK defaults; override fields with struct update syntax.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    /// Host: concurrent connections. Default 32.
     pub connections: usize,
+    /// Host: concurrent calls. Default 32.
     pub in_flight: usize,
+    /// Request body ceiling in bytes. Default 1 MiB.
     pub body_bytes: usize,
+    /// Response body ceiling in bytes. Default 1 MiB.
     pub response_bytes: usize,
+    /// Header bytes ceiling, at least 8192. Default 16 KiB.
     pub header_bytes: usize,
+    /// Header count ceiling. Default 64.
     pub header_count: usize,
+    /// Time allowed to receive a request head. Default 5 s.
     pub header_timeout: Duration,
+    /// Idle keep-alive time of a connection. Default 30 s.
     pub idle_timeout: Duration,
+    /// Time an unused client reference keeps its pool. Default 30 s.
     pub client_reference_idle_timeout: Duration,
-    /// HTTP connection ceiling per endpoint and compatible transport policy.
+    /// HTTP connection ceiling per endpoint and compatible transport settings.
     /// The lazy pool also respects the selected Runtime's global ceiling.
+    /// Default 16.
     pub client_connections: usize,
+    /// Longest call budget, at most 24 h. Default 30 s.
     pub call_timeout: Duration,
+    /// Time a closing host waits for admitted work. Default 5 s.
     pub shutdown_timeout: Duration,
+    /// GET-only routes that may be called without an instance ID.
     pub discovery_routes: Vec<String>,
 }
 impl Default for Limits {
     fn default() -> Self {
-        let policy = policy::default_policy();
-        let number = |name| policy.integer(name).expect("generated policy") as usize;
-        let millis = |name| Duration::from_millis(number(name) as u64);
         Self {
-            connections: number("HOST_MAX_CONNECTIONS"),
-            in_flight: number("HOST_MAX_IN_FLIGHT"),
-            body_bytes: number("MAX_REQUEST_BYTES"),
-            response_bytes: number("MAX_RESPONSE_BYTES"),
-            header_bytes: number("MAX_HEADER_BYTES"),
+            connections: 32,
+            in_flight: 32,
+            body_bytes: 1 << 20,
+            response_bytes: 1 << 20,
+            header_bytes: 16 * 1024,
             header_count: 64,
-            header_timeout: millis("HEADER_TIMEOUT_MS"),
-            idle_timeout: millis("IDLE_TIMEOUT_MS"),
-            client_reference_idle_timeout: millis("CLIENT_REFERENCE_IDLE_TIMEOUT_MS"),
-            client_connections: number("CLIENT_MAX_CONNECTIONS"),
-            call_timeout: millis("CALL_TIMEOUT_MS"),
-            shutdown_timeout: millis("SHUTDOWN_TIMEOUT_MS"),
+            header_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(30),
+            client_reference_idle_timeout: Duration::from_secs(30),
+            client_connections: 16,
+            call_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(5),
             discovery_routes: Vec::new(),
         }
     }
 }
 impl Limits {
-    /// Consume one policy resolved by the process composition root. No getenv.
-    pub fn from_policy(policy: &RuntimePolicy) -> io::Result<Self> {
-        let number = |name| {
-            if policy.fields().contains_key(name) {
-                policy.integer(name)
-            } else {
-                policy::default_policy().integer(name)
-            }
-            .map(|n| n as usize)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-        };
-        let millis = |name| number(name).map(|n| Duration::from_millis(n as u64));
-        let limits = Self {
-            connections: number("HOST_MAX_CONNECTIONS")?,
-            in_flight: number("HOST_MAX_IN_FLIGHT")?,
-            body_bytes: number("MAX_REQUEST_BYTES")?,
-            response_bytes: number("MAX_RESPONSE_BYTES")?,
-            header_bytes: number("MAX_HEADER_BYTES")?,
-            header_timeout: millis("HEADER_TIMEOUT_MS")?,
-            idle_timeout: millis("IDLE_TIMEOUT_MS")?,
-            client_reference_idle_timeout: millis("CLIENT_REFERENCE_IDLE_TIMEOUT_MS")?,
-            client_connections: number("CLIENT_MAX_CONNECTIONS")?,
-            call_timeout: millis("CALL_TIMEOUT_MS")?,
-            shutdown_timeout: millis("SHUTDOWN_TIMEOUT_MS")?,
-            ..Self::default()
-        };
-        limits.validate()?;
-        Ok(limits)
-    }
     pub(crate) fn validate(&self) -> io::Result<()> {
         if [
             self.connections,
@@ -158,7 +123,7 @@ impl Limits {
         {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "finite positive resource limits required; MAX_HEADER_BYTES requires 8192..2147483647",
+                "finite positive resource limits required; header_bytes requires 8192..2147483647",
             ))
         } else {
             Ok(())

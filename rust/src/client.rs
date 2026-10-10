@@ -471,7 +471,7 @@ impl Client {
         if path.len() > self.limits.header_bytes || request_id.is_some_and(|id| !valid_id(id)) {
             return Err(error(
                 Disposition::NotSent,
-                "route or request ID exceeds policy",
+                "route or request ID exceeds limits",
             ));
         }
         // Reserve before enqueueing on the selected owner. The caller's loop
@@ -815,7 +815,7 @@ impl BlockingClient {
         {
             return Err(error(
                 Disposition::NotSent,
-                "route or request ID exceeds policy",
+                "route or request ID exceeds limits",
             ));
         }
         let permit = self
