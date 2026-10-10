@@ -21,8 +21,8 @@ jobs:
           - {arch: amd64, runner: ubuntu-latest}
           - {arch: arm64, runner: ubuntu-24.04-arm}
           - {suite: focal, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic@sha256:fce2d76fddf4f6439bf0a188249b731650febdc163befc360bed186b269d252a'}
-          - {suite: jammy, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-jammy-full-humble@sha256:784dc2690d63b62ad2ec3cfdac12bf63c5931247c7ae816de8f73d336e0dc9a5'}
-          - {suite: noble, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-noble-full-jazzy@sha256:aeb658acc5e40f5aad5caeb61c6aa5511a23b2111a28e88e7453defa02a32104'}
+          - {suite: jammy, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-jammy-full-humble@sha256:94b723df918e4eb04c6d4ef4e4ae6ce7364deb8087909eb710b6847ee6ba7421'}
+          - {suite: noble, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-noble-full-jazzy@sha256:1f9ba87ad4f6fd088493693b70d61e9987a65ce94fb36ee19e3a8e6dbc8829c9'}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
