@@ -1,0 +1,31 @@
+{
+  "name": "@xgc2/xrpc-client",
+  "version": "0.1.0",
+  "description": "XRPC http.v1 client for browsers and Node: JSON unary calls and resumable event streams over fetch",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
