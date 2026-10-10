@@ -19,6 +19,7 @@ const (
 	DefaultCallBudget    = 2 * time.Second
 	DefaultCacheTTL      = 120 * time.Second
 	DefaultCacheCapacity = 1024
+	DefaultMaxInFlight   = 64
 	DefaultRateLimit     = 50  // requests per second per source address
 	DefaultRateBurst     = 100 // bucket size per source address
 )
@@ -46,9 +47,12 @@ type ServerConfig struct {
 	// CacheTTL is how long an executed request stays in the reply cache
 	// (default DefaultCacheTTL).
 	CacheTTL time.Duration
-	// CacheCapacity bounds the reply cache, and with it the number of requests
-	// running at once (default DefaultCacheCapacity).
+	// CacheCapacity bounds the reply cache (default DefaultCacheCapacity); it
+	// must exceed MaxInFlight.
 	CacheCapacity int
+	// MaxInFlight bounds the requests whose handler has not answered yet;
+	// further ones are answered resource_exhausted (default DefaultMaxInFlight).
+	MaxInFlight int
 	// RateLimit and RateBurst configure the token bucket of each source address.
 	// A negative RateLimit disables the limiter (defaults DefaultRateLimit and
 	// DefaultRateBurst).
@@ -106,6 +110,9 @@ type Server struct {
 	mu      sync.RWMutex
 	methods map[string]Handler
 
+	admitMu  sync.Mutex // guards draining and the work.Add that admission performs
+	draining bool
+
 	base    context.Context
 	cancel  context.CancelFunc
 	closing atomic.Bool
@@ -156,10 +163,13 @@ func NewServer(conn *net.UDPConn, config ServerConfig) (*Server, error) {
 	if config.CacheCapacity == 0 {
 		config.CacheCapacity = DefaultCacheCapacity
 	}
-	if config.CacheTTL < 0 || config.CacheCapacity < 1 {
-		return nil, errors.New("udpx: cache ttl and capacity must be positive")
+	if config.MaxInFlight == 0 {
+		config.MaxInFlight = DefaultMaxInFlight
 	}
-	s := &Server{conn: conn, keys: config.Keys, budget: config.CallBudget, cache: newReplyCache(config.CacheTTL, config.CacheCapacity), methods: make(map[string]Handler), loop: make(chan struct{}), drained: make(chan struct{})}
+	if config.CacheTTL < 0 || config.MaxInFlight < 1 || config.CacheCapacity <= config.MaxInFlight {
+		return nil, errors.New("udpx: cache ttl must be positive and the cache capacity must exceed the positive in-flight limit")
+	}
+	s := &Server{conn: conn, keys: config.Keys, budget: config.CallBudget, cache: newReplyCache(config.CacheTTL, config.CacheCapacity, config.MaxInFlight), methods: make(map[string]Handler), loop: make(chan struct{}), drained: make(chan struct{})}
 	if config.RateLimit >= 0 {
 		if config.RateLimit == 0 {
 			config.RateLimit = DefaultRateLimit
@@ -175,6 +185,8 @@ func NewServer(conn *net.UDPConn, config ServerConfig) (*Server, error) {
 	if _, err := rand.Read(s.instance[:]); err != nil {
 		return nil, errors.New("udpx: instance identity unavailable")
 	}
+	// A burst of requests must not overrun the kernel's default receive buffer.
+	_ = conn.SetReadBuffer(1 << 20)
 	s.base, s.cancel = context.WithCancel(context.Background())
 	go s.serve()
 	return s, nil
@@ -221,23 +233,27 @@ func (s *Server) Stats() Stats {
 // and pending request has finished.
 func (s *Server) Drained() <-chan struct{} { return s.drained }
 
-// Shutdown stops reading datagrams, lets pending requests finish within ctx
-// (their handlers may still answer, retransmissions are no longer served), then
-// closes the socket. When ctx ends first the remaining requests are abandoned
-// and ctx's error is returned.
+// Shutdown stops admitting requests, which are answered unavailable from now on
+// (a retransmission of a request already answered still gets its cached reply),
+// waits for pending requests to finish within ctx, then closes the socket. When
+// ctx ends first the remaining requests are abandoned and ctx's error is
+// returned.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.stopReading()
-	<-s.loop
+	s.admitMu.Lock()
+	s.draining = true
+	s.admitMu.Unlock()
 	finished := make(chan struct{})
 	go func() { s.work.Wait(); close(finished) }()
+	var err error
 	select {
 	case <-finished:
-		s.release()
-		return nil
 	case <-ctx.Done():
-		s.release()
-		return ctx.Err()
+		err = ctx.Err()
 	}
+	s.stopReading()
+	<-s.loop
+	s.release()
+	return err
 }
 
 // Close stops the server at once: pending requests are abandoned. Handlers that
@@ -306,37 +322,61 @@ func (s *Server) dispatch(datagram []byte, from netip.AddrPort) {
 		reply, _ := s.encodeReply(&m, key, status, errorBody(status, message, nil))
 		s.send(from, reply)
 	}
-	if m.word < 1 || m.word > MaxTimeoutMS {
-		refuse(StatusInvalidArgument, "timeout_ms must be 1..60000")
+	if m.flags&^flagExpectedInstance != 0 || m.word < 1 || m.word > MaxTimeoutMS {
+		refuse(StatusInvalidArgument, "reserved flags set or timeout_ms outside 1..60000")
 		return
 	}
 	if m.expectedInstance() && m.instance != s.instance {
 		refuse(StatusConflict, "server instance does not match the expected instance")
 		return
 	}
+	id := cacheKey{keyID: m.keyID, id: m.id}
+	s.admitMu.Lock()
+	if s.draining {
+		s.admitMu.Unlock()
+		switch outcome, cached := s.cache.peek(id, now); outcome {
+		case admitCached:
+			s.duplicates.Add(1)
+			s.send(from, cached)
+		case admitAbandoned:
+			s.duplicates.Add(1)
+		case admitPending:
+			s.ignored.Add(1)
+		default:
+			refuse(StatusUnavailable, "server is shutting down")
+		}
+		return
+	}
 	s.mu.RLock()
 	handler := s.methods[string(m.method)]
 	s.mu.RUnlock()
 	if handler == nil {
+		s.admitMu.Unlock()
 		refuse(StatusNotFound, "unknown method")
 		return
 	}
-	outcome, entry, cached := s.cache.admit(cacheKey{keyID: m.keyID, id: m.id}, now)
+	outcome, entry, cached := s.cache.admit(id, now)
 	switch outcome {
 	case admitCached:
+		s.admitMu.Unlock()
 		s.duplicates.Add(1)
 		s.send(from, cached)
 		return
 	case admitAbandoned:
+		s.admitMu.Unlock()
 		s.duplicates.Add(1)
 		return
 	case admitPending:
+		s.admitMu.Unlock()
 		s.ignored.Add(1)
 		return
 	case admitCacheFull:
+		s.admitMu.Unlock()
 		refuse(StatusResourceExhausted, "too many requests in flight")
 		return
 	}
+	s.work.Add(2) // the handler goroutine and the pending responder
+	s.admitMu.Unlock()
 	deadline := now.Add(min(time.Duration(m.word)*time.Millisecond, s.budget))
 	ctx, cancel := context.WithDeadline(s.base, deadline)
 	// The responder outlives the receive buffer that m aliases.
@@ -351,7 +391,6 @@ func (s *Server) dispatch(datagram []byte, from netip.AddrPort) {
 	request := Request{Method: string(m.method), Body: bytes.Clone(m.body), Source: from, KeyID: m.keyID, ID: m.id, Deadline: deadline}
 	s.executed.Add(1)
 	s.inFlight.Add(1)
-	s.work.Add(2) // the handler goroutine and the pending responder
 	go s.run(ctx, handler, request, response)
 }
 

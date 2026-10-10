@@ -10,9 +10,11 @@
 // Methods (bodies are JSON):
 //
 //	test.v1/Echo   replies with the request body
-//	test.v1/Count  counts executions; replies {"count":N}
-//	test.v1/Sleep  {"ms":N}: replies {"slept_ms":N} after N ms, from another goroutine
-//	test.v1/Fail   {"status":N}: replies with status N and a standard error body
+//	test.v1/Count  counts executions; replies the count as a decimal number
+//	test.v1/Sleep  {"ms":N}: replies with the request body after N ms (at most
+//	               60000), from another goroutine
+//	test.v1/Fail   {"status":N}: replies with status N (1..8 or 10) and an error
+//	               body whose details are {"requested":N}
 //	test.v1/Big    replies with a body too large for one datagram (resource_exhausted)
 package main
 
@@ -63,17 +65,15 @@ func run() error {
 			_ = response.Reply(request.Body)
 		},
 		"test.v1/Count": func(_ context.Context, _ udpx.Request, response *udpx.Responder) {
-			_ = response.Reply([]byte(`{"count":` + strconv.FormatInt(count.Add(1), 10) + `}`))
+			_ = response.Reply([]byte(strconv.FormatInt(count.Add(1), 10)))
 		},
 		"test.v1/Sleep": func(_ context.Context, request udpx.Request, response *udpx.Responder) {
 			var wanted struct{ MS int64 }
-			if json.Unmarshal(request.Body, &wanted) != nil || wanted.MS < 0 {
-				_ = response.Fail(udpx.StatusInvalidArgument, `body must be {"ms":N}`, nil)
+			if json.Unmarshal(request.Body, &wanted) != nil || wanted.MS < 0 || wanted.MS > udpx.MaxTimeoutMS {
+				_ = response.Fail(udpx.StatusInvalidArgument, `body must be {"ms":N} with N <= 60000`, nil)
 				return
 			}
-			time.AfterFunc(time.Duration(wanted.MS)*time.Millisecond, func() {
-				_ = response.Reply([]byte(`{"slept_ms":` + strconv.FormatInt(wanted.MS, 10) + `}`))
-			})
+			time.AfterFunc(time.Duration(wanted.MS)*time.Millisecond, func() { _ = response.Reply(request.Body) })
 		},
 		"test.v1/Fail": func(_ context.Context, request udpx.Request, response *udpx.Responder) {
 			var wanted struct{ Status udpx.Status }
@@ -84,7 +84,7 @@ func run() error {
 			_ = response.Fail(wanted.Status, "requested failure", map[string]any{"requested": uint32(wanted.Status)})
 		},
 		"test.v1/Big": func(_ context.Context, _ udpx.Request, response *udpx.Responder) {
-			_ = response.Reply(make([]byte, 2*udpx.MaxDatagram))
+			_ = response.Reply(make([]byte, 2000))
 		},
 	}
 	for name, handler := range handlers {

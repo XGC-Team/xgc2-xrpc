@@ -220,11 +220,16 @@ readable by the service account only. `NewKeyRing` builds a ring from memory.
 carry a deadline. The request is one datagram with a random request id, sent
 at once and retransmitted unchanged after waits of 30, 60, 120 and 240 ms and
 then every 250 ms (`ClientConfig.Backoff/Interval`) until a valid reply or the
-deadline. A reply is valid only if the tag verifies under the request's key,
-the type is reply and the request id matches; anything else is ignored. The
-key is `ref.KeyID`, or the ring's only key when `ref.KeyID` is zero. If
-`ref.InstanceID` is set it is sent as the expected instance, and a reply from
-another instance fails with `conflict` and `outcome_unknown`. Dispositions:
+deadline; a call lasts at most 60 s whatever the deadline. A reply is valid
+only if the tag verifies under the request's key, the type is reply and the
+request id matches; anything else is ignored. The key is `ref.KeyID`, or the
+ring's only key when `ref.KeyID` is zero. If `ref.InstanceID` is set it is sent
+as the expected instance. A server of another instance answers `conflict`
+without running the request, and the call fails with `conflict` and
+`outcome_unknown`, not `response_received`: the pinned instance may have run the
+request before it went away (reply lost, process restarted), so the caller must
+not conclude that nothing happened. Other replies from another instance are
+ignored. Dispositions:
 `not_sent` when no datagram left (invalid reference, oversized request, no
 deadline, dial failure), `outcome_unknown` when at least one was sent and no
 valid reply came (including a wrong key: the server drops silently, so
@@ -242,16 +247,18 @@ any time. A handler answers through the `Responder` (`Reply`, `Fail`,
 `Request.Deadline`; `ctx` ends at the deadline, once the request is answered
 or when the server closes. Semantics:
 
-- A datagram with bad magic/version/length/flags, an unknown `key_id` or a bad
-  tag is dropped silently. Only authenticated datagrams count against the
+- A datagram with bad magic/version/length, an unknown `key_id` or a bad tag
+  is dropped silently. Only authenticated datagrams count against the
   per-source token bucket (50 requests/s, burst 100, keyed by source IP), and
-  excess is dropped.
+  excess is dropped. An authenticated request with reserved flag bits or a
+  `timeout_ms` outside 1..60000 is answered `invalid_argument`.
 - At-most-once execution: a reply cache keyed by `(key_id, request_id)` with a
   120 s TTL (from completion) and 1024 entries. A retransmission of an answered
   request gets the cached reply bytes, a retransmission of a running request
   is ignored, and one of an abandoned request stays silent. Pending entries
-  are never evicted; when the cache is full of running requests a new request
-  is answered `resource_exhausted` without executing.
+  are never evicted. At most `MaxInFlight` (64) requests run at once; a new
+  request beyond that is answered `resource_exhausted` without executing, and
+  the cache capacity must exceed it.
 - Server deadline = receipt + `min(timeout_ms, CallBudget)` (default 2 s). A
   handler that misses it produces no reply, the client reports
   `outcome_unknown`.
@@ -260,8 +267,10 @@ or when the server closes. Semantics:
 - Every server process has a random 128-bit instance; every reply carries it.
   A request that pins an instance the server does not have is answered
   `conflict` without running the handler.
-- `Shutdown(ctx)` stops reading, lets pending requests answer within the
-  context, then closes; `Close` abandons them. `Stats()` returns the counters
+- `Shutdown(ctx)` stops admitting: new requests are answered `unavailable`
+  (a retransmission of an answered request still gets its cached reply), and
+  pending requests may answer within the context before the socket closes.
+  `Close` abandons them. `Stats()` returns the counters
   (received, malformed, unauthenticated, rate limited, requests, executed,
   duplicates, ignored, replies, refused, abandoned, panics, send errors,
   in-flight, cache entries).

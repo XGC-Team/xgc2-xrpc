@@ -9,7 +9,7 @@ func key(n byte) cacheKey { return cacheKey{keyID: 1, id: RequestID{n}} }
 
 func TestCacheClassifiesRetransmissions(t *testing.T) {
 	now := time.Unix(1000, 0)
-	c := newReplyCache(120*time.Second, 8)
+	c := newReplyCache(120*time.Second, 8, 8)
 	outcome, entry, _ := c.admit(key(1), now)
 	if outcome != admitNew {
 		t.Fatalf("first arrival: %v", outcome)
@@ -36,7 +36,7 @@ func TestCacheClassifiesRetransmissions(t *testing.T) {
 
 func TestCacheExpiresAfterTTL(t *testing.T) {
 	now := time.Unix(1000, 0)
-	c := newReplyCache(120*time.Second, 8)
+	c := newReplyCache(120*time.Second, 8, 8)
 	_, entry, _ := c.admit(key(1), now)
 	c.complete(entry, []byte("reply"), now)
 	if outcome, _, _ := c.admit(key(1), now.Add(119*time.Second)); outcome != admitCached {
@@ -53,7 +53,7 @@ func TestCacheExpiresAfterTTL(t *testing.T) {
 
 func TestCachePendingEntriesAreNeverEvicted(t *testing.T) {
 	now := time.Unix(1000, 0)
-	c := newReplyCache(time.Hour, 3)
+	c := newReplyCache(time.Hour, 3, 3)
 	var entries []*cacheEntry
 	for i := byte(1); i <= 3; i++ {
 		outcome, entry, _ := c.admit(key(i), now)
@@ -79,5 +79,31 @@ func TestCachePendingEntriesAreNeverEvicted(t *testing.T) {
 	}
 	if outcome, _, _ := c.admit(key(3), now.Add(2*time.Second)); outcome != admitPending {
 		t.Fatalf("pending entry was evicted: %v", outcome)
+	}
+}
+
+func TestCacheLimitsRunningRequestsSeparately(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := newReplyCache(time.Hour, 10, 2)
+	_, first, _ := c.admit(key(1), now)
+	if outcome, _, _ := c.admit(key(2), now); outcome != admitNew {
+		t.Fatal(outcome)
+	}
+	if outcome, _, _ := c.admit(key(3), now); outcome != admitCacheFull {
+		t.Fatalf("a third running request: %v", outcome)
+	}
+	// Retransmissions of the running ones are still classified, not refused.
+	if outcome, _, _ := c.admit(key(1), now); outcome != admitPending {
+		t.Fatalf("retransmission at the limit: %v", outcome)
+	}
+	c.complete(first, []byte("done"), now)
+	if outcome, _, _ := c.admit(key(3), now); outcome != admitNew {
+		t.Fatalf("a slot was freed: %v", outcome)
+	}
+	if outcome, reply := c.peek(key(1), now); outcome != admitCached || string(reply) != "done" {
+		t.Fatalf("peek: %v %q", outcome, reply)
+	}
+	if outcome, _ := c.peek(key(9), now); outcome != admitNew || c.len() != 3 {
+		t.Fatal("peek must not record anything")
 	}
 }

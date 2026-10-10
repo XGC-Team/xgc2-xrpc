@@ -203,11 +203,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestRateLimitCanBeDisabled(t *testing.T) {
-	server, conn, runs := rawServer(t, ServerConfig{RateLimit: -1})
+	server, conn, runs := rawServer(t, ServerConfig{RateLimit: -1, MaxInFlight: 400})
 	for i := 0; i < 300; i++ {
 		request := countRequest(byte(i))
 		request.id[1] = byte(i >> 8)
 		conn.send(appendDatagram(nil, &request, testKey()))
+		if i%25 == 24 {
+			time.Sleep(time.Millisecond) // do not overrun the loopback socket buffer
+		}
 	}
 	waitFor(t, "300 executions", func() bool { return runs.Load() == 300 })
 	if server.Stats().RateLimited != 0 {
@@ -239,8 +242,8 @@ func TestReplayIsServedFromTheCacheOnlyWithinTheWindow(t *testing.T) {
 }
 
 func TestCacheCapacityBoundsDeduplication(t *testing.T) {
-	_, conn, runs := rawServer(t, ServerConfig{CacheCapacity: 2})
-	var datagrams [3][]byte
+	_, conn, runs := rawServer(t, ServerConfig{CacheCapacity: 3, MaxInFlight: 2})
+	var datagrams [4][]byte
 	for i := range datagrams {
 		request := countRequest(byte(i + 1))
 		datagrams[i] = appendDatagram(nil, &request, testKey())
@@ -249,21 +252,21 @@ func TestCacheCapacityBoundsDeduplication(t *testing.T) {
 			t.Fatal("no reply")
 		}
 	}
-	conn.send(datagrams[2]) // still remembered
-	conn.receive(time.Second)
-	if runs.Load() != 3 {
-		t.Fatalf("a remembered request ran again: %d", runs.Load())
-	}
-	conn.send(datagrams[0]) // evicted by the third request
+	conn.send(datagrams[3]) // still remembered
 	conn.receive(time.Second)
 	if runs.Load() != 4 {
+		t.Fatalf("a remembered request ran again: %d", runs.Load())
+	}
+	conn.send(datagrams[0]) // evicted by the fourth request
+	conn.receive(time.Second)
+	if runs.Load() != 5 {
 		t.Fatalf("an evicted request is new again: %d", runs.Load())
 	}
 }
 
-func TestRequestsBeyondTheCacheCapacityAreRefusedNotDropped(t *testing.T) {
+func TestRequestsBeyondTheInFlightLimitAreRefusedNotDropped(t *testing.T) {
 	ring, _ := NewKeyRing(map[uint32][]byte{1: testKey()})
-	server, err := Listen("127.0.0.1:0", ServerConfig{Keys: ring, CacheCapacity: 1})
+	server, err := Listen("127.0.0.1:0", ServerConfig{Keys: ring, MaxInFlight: 1, CacheCapacity: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,10 +286,102 @@ func TestRequestsBeyondTheCacheCapacityAreRefusedNotDropped(t *testing.T) {
 	second.id = RequestID{2}
 	c.send(appendDatagram(nil, &second, testKey()))
 	if m, _, got := c.receive(time.Second); !got || Status(m.word) != StatusResourceExhausted || m.id != second.id {
-		t.Fatalf("a full cache must answer resource_exhausted: %+v %v", m, got)
+		t.Fatalf("a full server must answer resource_exhausted: %+v %v", m, got)
 	}
 	close(release)
 	if m, _, got := c.receive(time.Second); !got || Status(m.word) != StatusOK {
 		t.Fatalf("held request: %+v %v", m, got)
+	}
+}
+
+func TestReservedFlagsAreRefusedAfterAuthentication(t *testing.T) {
+	server, conn, runs := rawServer(t, ServerConfig{})
+	request := countRequest(1)
+	request.flags = 0x0002
+	conn.send(appendDatagram(nil, &request, testKey()))
+	if m, _, got := conn.receive(time.Second); !got || Status(m.word) != StatusInvalidArgument {
+		t.Fatalf("%+v %v", m, got)
+	}
+	// Unauthenticated, the same datagram is dropped silently.
+	conn.send(appendDatagram(nil, &request, make([]byte, KeyLen)))
+	if _, _, got := conn.receive(60 * time.Millisecond); got {
+		t.Fatal("an unauthenticated request was answered")
+	}
+	if runs.Load() != 0 || server.Stats().Refused != 1 {
+		t.Fatalf("runs=%d stats=%+v", runs.Load(), server.Stats())
+	}
+}
+
+// While draining the server still answers what it has already answered, ignores
+// what is running, and refuses new requests with unavailable.
+func TestDrainingServerRefusesNewRequestsButServesTheCache(t *testing.T) {
+	ring, _ := NewKeyRing(map[uint32][]byte{1: testKey()})
+	server, err := Listen("127.0.0.1:0", ServerConfig{Keys: ring})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Close() })
+	release := make(chan struct{})
+	var runs atomic.Int32
+	server.Handle("test.v1/Count", func(ctx context.Context, request Request, response *Responder) {
+		runs.Add(1)
+		_ = response.Reply([]byte("done"))
+	})
+	server.Handle("test.v1/Hold", func(ctx context.Context, request Request, response *Responder) {
+		<-release
+		_ = response.Reply([]byte("held"))
+	})
+	conn, _ := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(server.Addr()))
+	defer conn.Close()
+	c := &raw{t: t, conn: conn, server: server}
+	answered := countRequest(1)
+	answeredDatagram := appendDatagram(nil, &answered, testKey())
+	c.send(answeredDatagram)
+	if _, _, got := c.receive(time.Second); !got {
+		t.Fatal("no reply")
+	}
+	hold := message{typ: typeRequest, keyID: 1, id: RequestID{2}, word: 5000, method: []byte("test.v1/Hold")}
+	holdDatagram := appendDatagram(nil, &hold, testKey())
+	c.send(holdDatagram)
+	waitFor(t, "the held request to run", func() bool { return server.Stats().InFlight == 1 })
+
+	done := make(chan error, 1)
+	go func() { done <- server.Shutdown(context.Background()) }()
+	// Probe with a method nobody registered: not_found until draining begins.
+	probes := byte(10)
+	waitFor(t, "the server to start draining", func() bool {
+		probes++
+		next := message{typ: typeRequest, keyID: 1, id: RequestID{probes}, word: 1000, method: []byte("test.v1/Missing")}
+		c.send(appendDatagram(nil, &next, testKey()))
+		m, _, got := c.receive(50 * time.Millisecond)
+		return got && Status(m.word) == StatusUnavailable
+	})
+	fresh := countRequest(3)
+	c.send(appendDatagram(nil, &fresh, testKey()))
+	if m, _, got := c.receive(time.Second); !got || Status(m.word) != StatusUnavailable {
+		t.Fatalf("a new request while draining: %+v %v", m, got)
+	}
+	if runs.Load() != 1 {
+		t.Fatalf("a request was executed while draining: %d", runs.Load())
+	}
+	c.send(answeredDatagram) // answered before: the cache still serves it
+	if m, _, got := c.receive(time.Second); !got || Status(m.word) != StatusOK || string(m.body) != "done" {
+		t.Fatalf("cached reply while draining: %+v %v", m, got)
+	}
+	c.send(holdDatagram) // running: ignored
+	if _, _, got := c.receive(60 * time.Millisecond); got {
+		t.Fatal("a running request was answered twice")
+	}
+	select {
+	case <-done:
+		t.Fatal("Shutdown returned with a request still running")
+	default:
+	}
+	close(release)
+	if m, _, got := c.receive(time.Second); !got || string(m.body) != "held" {
+		t.Fatalf("the held request must finish during the drain: %+v %v", m, got)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

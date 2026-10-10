@@ -92,9 +92,10 @@ type Reply struct {
 // InstanceID is Instance in the lowercase hex form of ServiceRef.InstanceID.
 func (r Reply) InstanceID() string { return hex.EncodeToString(r.Instance[:]) }
 
-// Call sends one request and waits for its reply. ctx must carry a deadline: the
-// request is retransmitted, always as the same datagram, until a reply arrives
-// or the deadline passes, and the server runs it at most once.
+// Call sends one request and waits for its reply. ctx must carry a deadline,
+// which counts for at most MaxTimeoutMS (60 s): the request is retransmitted,
+// always as the same datagram, until a reply arrives or the deadline passes, and
+// the server runs it at most once.
 //
 // Errors are *xrpc.CallError. Disposition not_sent means no datagram left this
 // host; response_received means a valid reply arrived, in which case Call
@@ -102,8 +103,9 @@ func (r Reply) InstanceID() string { return hex.EncodeToString(r.Instance[:]) }
 // means at least one datagram was sent and no valid reply arrived. Datagrams
 // that fail authentication, are not replies to this request or carry another
 // key are ignored: a wrong key shows up as outcome_unknown, never as an
-// authentication error. If ref pins an instance, a reply from another instance
-// fails with conflict and outcome_unknown.
+// authentication error. If ref pins an instance, a conflict reply from another
+// instance fails with conflict and outcome_unknown (the pinned instance may have
+// run the request before it went away); other replies from it are ignored.
 func (c *Client) Call(ctx context.Context, ref xrpc.ServiceRef, method string, body []byte, options ...CallOption) (Reply, error) {
 	var opts callOptions
 	for _, option := range options {
@@ -133,6 +135,9 @@ func (c *Client) Call(ctx context.Context, ref xrpc.ServiceRef, method string, b
 	if err != nil {
 		return notSent("invalid_argument", err)
 	}
+	// A request carries at most MaxTimeoutMS of budget, and the server never
+	// works longer on it: the call ends there too.
+	deadline = minTime(deadline, time.Now().Add(MaxTimeoutMS*time.Millisecond))
 	timeout := time.Until(deadline).Milliseconds()
 	if timeout < 1 {
 		return notSent("deadline_exceeded", context.DeadlineExceeded)
@@ -197,6 +202,13 @@ func (c *Client) Call(ctx context.Context, ref xrpc.ServiceRef, method string, b
 			continue
 		}
 		if request.expectedInstance() && reply.instance != request.instance {
+			// Only the other instance's conflict answer is meaningful; any other
+			// reply from it is not an answer to the pinned call. The pinned
+			// instance may have run the request before it went away, so the
+			// outcome stays unknown.
+			if Status(reply.word) != StatusConflict {
+				continue
+			}
 			return Reply{}, xrpc.Failure("conflict", xrpc.OutcomeUnknown, errors.New("udpx: server instance changed or does not match the pinned instance"))
 		}
 		result := Reply{Status: Status(reply.word), Body: bytes.Clone(reply.body), Instance: reply.instance, ID: request.id, Sent: sent}

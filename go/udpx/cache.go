@@ -40,17 +40,20 @@ const (
 // replyCache remembers every executed request so that a retransmission is
 // answered from the cache instead of running the handler again. Entries are
 // kept for ttl after completion; pending entries are never evicted, so the
-// handler count of one request id stays at most one.
+// handler count of one request id stays at most one, and at most maxPending
+// requests run at once.
 type replyCache struct {
-	mu       sync.Mutex
-	ttl      time.Duration
-	capacity int
-	entries  map[cacheKey]*cacheEntry
-	done     *list.List // completed entries, oldest completion first
+	mu         sync.Mutex
+	ttl        time.Duration
+	capacity   int
+	maxPending int
+	pending    int
+	entries    map[cacheKey]*cacheEntry
+	done       *list.List // completed entries, oldest completion first
 }
 
-func newReplyCache(ttl time.Duration, capacity int) *replyCache {
-	return &replyCache{ttl: ttl, capacity: capacity, entries: make(map[cacheKey]*cacheEntry), done: list.New()}
+func newReplyCache(ttl time.Duration, capacity, maxPending int) *replyCache {
+	return &replyCache{ttl: ttl, capacity: capacity, maxPending: maxPending, entries: make(map[cacheKey]*cacheEntry), done: list.New()}
 }
 
 func (c *replyCache) purge(now time.Time) {
@@ -64,12 +67,8 @@ func (c *replyCache) purge(now time.Time) {
 	}
 }
 
-// admit classifies a request. For admitNew it registers a pending entry and
-// returns it; for admitCached it returns the cached datagram.
-func (c *replyCache) admit(key cacheKey, now time.Time) (admission, *cacheEntry, []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.purge(now)
+// classify reports what is known about key without recording anything.
+func (c *replyCache) classify(key cacheKey) (admission, *cacheEntry, []byte) {
 	if entry, ok := c.entries[key]; ok {
 		switch entry.state {
 		case entryReplied:
@@ -79,6 +78,31 @@ func (c *replyCache) admit(key cacheKey, now time.Time) (admission, *cacheEntry,
 		default:
 			return admitPending, entry, nil
 		}
+	}
+	return admitNew, nil, nil
+}
+
+// peek classifies a request without admitting it: a draining server answers
+// what it already knows and refuses the rest.
+func (c *replyCache) peek(key cacheKey, now time.Time) (admission, []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.purge(now)
+	outcome, _, reply := c.classify(key)
+	return outcome, reply
+}
+
+// admit classifies a request. For admitNew it registers a pending entry and
+// returns it; for admitCached it returns the cached datagram.
+func (c *replyCache) admit(key cacheKey, now time.Time) (admission, *cacheEntry, []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.purge(now)
+	if outcome, entry, reply := c.classify(key); outcome != admitNew {
+		return outcome, entry, reply
+	}
+	if c.pending >= c.maxPending {
+		return admitCacheFull, nil, nil
 	}
 	if len(c.entries) >= c.capacity {
 		oldest := c.done.Front()
@@ -90,6 +114,7 @@ func (c *replyCache) admit(key cacheKey, now time.Time) (admission, *cacheEntry,
 	}
 	entry := &cacheEntry{key: key}
 	c.entries[key] = entry
+	c.pending++
 	return admitNew, entry, nil
 }
 
@@ -105,6 +130,7 @@ func (c *replyCache) complete(entry *cacheEntry, reply []byte, now time.Time) {
 	}
 	entry.expires = now.Add(c.ttl)
 	c.done.PushBack(entry)
+	c.pending--
 }
 
 func (c *replyCache) len() int {

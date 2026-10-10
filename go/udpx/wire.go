@@ -127,7 +127,9 @@ func appendDatagram(dst []byte, m *message, key []byte) []byte {
 var errMalformed = errors.New("udpx: not a udp.v1 datagram")
 
 // parse decodes the structure of a datagram without checking its tag: magic,
-// version, type, flags and the exact length. Replies carry no method.
+// version, type and the exact length. Replies carry no method. Reserved flag
+// bits are the server's business: it answers an authenticated request that sets
+// them invalid_argument.
 func parse(datagram []byte) (message, error) {
 	var m message
 	n := len(datagram)
@@ -139,9 +141,7 @@ func parse(datagram []byte) (message, error) {
 	}
 	m.typ = datagram[5]
 	m.flags = binary.BigEndian.Uint16(datagram[6:])
-	// Only bit 0 is defined. A reply is authenticated and has no use for the
-	// bit, so a peer that echoes it is tolerated.
-	if m.typ != typeRequest && m.typ != typeReply || m.flags&^flagExpectedInstance != 0 {
+	if m.typ != typeRequest && m.typ != typeReply {
 		return m, errMalformed
 	}
 	m.keyID = binary.BigEndian.Uint32(datagram[8:])

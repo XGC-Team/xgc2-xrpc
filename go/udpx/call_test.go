@@ -475,7 +475,7 @@ func TestCancellationInterruptsTheWait(t *testing.T) {
 
 func TestConcurrentCalls(t *testing.T) {
 	ring := ringOf(t, keyID)
-	server := startServer(t, udpx.ServerConfig{Keys: ring, RateLimit: -1})
+	server := startServer(t, udpx.ServerConfig{Keys: ring, RateLimit: -1, MaxInFlight: 200})
 	var runs atomic.Int32
 	server.Handle("test.v1/Count", func(ctx context.Context, request udpx.Request, response *udpx.Responder) {
 		_ = response.Reply([]byte(strconv.Itoa(int(runs.Add(1)))))
@@ -607,7 +607,7 @@ func TestRegistration(t *testing.T) {
 	if _, err := udpx.Listen("127.0.0.1:0", udpx.ServerConfig{}); err == nil {
 		t.Error("server without keys accepted")
 	}
-	for _, config := range []udpx.ServerConfig{{CallBudget: time.Microsecond}, {CallBudget: 61 * time.Second}, {CacheTTL: -1}, {CacheCapacity: -1}, {RateBurst: -1}} {
+	for _, config := range []udpx.ServerConfig{{CallBudget: time.Microsecond}, {CallBudget: 61 * time.Second}, {CacheTTL: -1}, {CacheCapacity: -1}, {RateBurst: -1}, {MaxInFlight: -1}, {MaxInFlight: 10, CacheCapacity: 10}, {CacheCapacity: udpx.DefaultMaxInFlight}} {
 		config.Keys = ringOf(t, keyID)
 		if s, err := udpx.Listen("127.0.0.1:0", config); err == nil {
 			s.Close()

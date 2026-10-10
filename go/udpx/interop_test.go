@@ -40,6 +40,9 @@ import (
 //	test.v1/Sleep  {"ms":N} replies after N ms without blocking its I/O thread
 //	test.v1/Fail   {"status":N} replies with status N and an error body
 //	test.v1/Big    replies with more than fits in one datagram: resource_exhausted
+//
+// The server serves only the key --key-id of FILE, answers requests of
+// unknown methods not_found or invalid_argument, and exits on SIGTERM.
 const interopServerEnv = "XGC2_XRPC_UDP_INTEROP_SERVER"
 
 type interopServer struct {
@@ -303,7 +306,7 @@ func TestInterop(t *testing.T) {
 
 	t.Run("a handler past the server budget gives no reply", func(t *testing.T) {
 		started := time.Now()
-		_, err := client.Call(within(t, 2600*time.Millisecond), direct, "test.v1/Sleep", []byte(`{"ms":30000}`))
+		_, err := client.Call(within(t, 2600*time.Millisecond), direct, "test.v1/Sleep", []byte(`{"ms":4000}`))
 		if failure := callError(t, err); failure.Code != "deadline_exceeded" || failure.Disposition != xrpc.OutcomeUnknown {
 			t.Fatalf("%+v", failure)
 		}
