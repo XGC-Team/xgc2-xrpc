@@ -170,6 +170,32 @@ void golden_datagrams() {
   assert(d.body == conflict);
 }
 
+// The vectors of the Go library's own test (go/udpx/wire_test.go), built by a
+// different implementation from the same layout: both must encode and verify the
+// same bytes. Same key and key_id 7, request id 0..15, instance 16..31.
+const char *go_golden_request =
+    "585255310101000100000007000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    "000005dc000c0007746573742e76312f4563686f7b2278223a317d09c76d589a3784cfc703d60ccc7e9ef946"
+    "f765b0534b882e984df6eb47e68627";
+const char *go_golden_reply =
+    "585255310102000000000007000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    "00000004000000387b22636f6465223a227265736f757263655f657868617573746564222c226d657373616765"
+    "223a226d222c2264657461696c73223a7b7d7dad367ae0cb0e986951e2e062f13293da29d6c591219f93a52d62"
+    "2ded4080c7e8";
+
+void go_golden_datagrams() {
+  const auto key = sequential_key();
+  const auto id = sequential_id(0), instance = sequential_id(0x10);
+  assert(hex_of(encode_request(key, 7, id, instance, 1500, "test.v1/Echo", "{\"x\":1}")) == go_golden_request);
+  const auto body = error_body(Status::ResourceExhausted, "m");
+  assert(hex_of(encode_reply(key, 7, id, instance, 4, body)) == go_golden_reply);
+  Datagram d;
+  for (const char *vector : {go_golden_request, go_golden_reply}) {
+    const auto bytes = bytes_of(vector);
+    assert(parse(bytes.data(), bytes.size(), d) == Parse::Ok && verify(d, key) && d.request_id == id);
+  }
+}
+
 void round_trips() {
   const auto key = sequential_key();
   const auto id = sequential_id(1), pin = sequential_id(100);
@@ -367,6 +393,7 @@ int main() {
   error_bodies_and_names();
   hex_ids();
   golden_datagrams();
+  go_golden_datagrams();
   round_trips();
   malformed_layouts();
   tags_bind_every_byte();
