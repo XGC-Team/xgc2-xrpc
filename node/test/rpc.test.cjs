@@ -149,7 +149,7 @@ test("policy conflicts, unsupported Unix host and native timeout overflow fail e
   assert.equal(host.server.requestTimeout, 60000);
   assert.equal(host.server.headersTimeout, 45000);
   if ("keepAliveTimeoutBuffer" in host.server) assert.equal(host.server.keepAliveTimeoutBuffer, 0);
-  assert.throws(() => host.server.listen("/tmp/foreign.sock"), /Unix lease/);
+  assert.throws(() => host.server.listen("/tmp/foreign.sock"), /unixPath/);
   await host.close();
 });
 test("request target, runtime header types and response headers are bounded", async () => {

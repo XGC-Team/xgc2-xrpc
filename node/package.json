@@ -7,7 +7,7 @@
   "types": "index.d.cts",
   "exports": "./index.cjs",
   "engines": { "node": ">=20" },
-  "files": ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "policy.cjs", "diagnostics.cjs", "diagnostic-worker.cjs", "runtime-policy.json", "README.md"],
+  "files": ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "policy.cjs", "diagnostics.cjs", "diagnostic-worker.cjs", "runtime-policy.json", "unix.cjs", "README.md"],
   "scripts": { "test": "node --test test/*.test.cjs" },
   "dependencies": { "ws": "8.22.0" }
 }

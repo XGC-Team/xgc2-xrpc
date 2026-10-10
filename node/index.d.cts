@@ -4,6 +4,10 @@ import type { Duplex } from "node:stream";
 export interface HostOptions {
   policy?: PolicyView;
   tls?: import("node:https").ServerOptions;
+  /** Listen on a private Unix socket instead of TCP; start with `host.listen()`. Absolute, canonical, shorter than 108 bytes, inside a directory owned by the effective user with mode 0700. */
+  unixPath?: string;
+  /** How long a stale-socket probe waits for the existing socket to answer. Default 250. */
+  probeTimeoutMs?: number;
   maxConnections?: number;
   maxInFlight?: number;
   maxBodyBytes?: number;
@@ -17,6 +21,14 @@ export interface HostOptions {
 }
 export interface Host {
   server: Server;
+  /** The Unix socket path of a `unixPath` host, otherwise null. */
+  readonly unixPath: string | null;
+  /**
+   * Bind a `unixPath` host: verify the private directory, reclaim a stale socket
+   * (connect refused -> unlink; accepted -> rejects with `code: "EADDRINUSE"`),
+   * bind with mode 0600. `close()` removes the socket.
+   */
+  listen(): Promise<void>;
   close(): Promise<void>;
   onUpgrade(handler: (request: IncomingMessage, socket: Duplex, head: Buffer) => void): void;
   stats(): { connections: number; inFlight: number };
@@ -65,6 +77,8 @@ export interface BootstrapInputValue {
 export function loadBootstrapInput(explicitGrantedPath: string, options: { role: "server" | "client" }): { readonly binding: BootstrapBinding; readonly resolveGrant: StartupGrantResolver; readonly application: unknown };
 export function createBoundHTTPHost(handler: RPCHandler, options: HostOptions & { binding: BootstrapBinding; instanceId: string; resolveGrant: GrantResolver; discoveryPaths?: string[] }): Host;
 export function createFetchHost(handler: (request: Request) => Response | Promise<Response>, options?: HostOptions): Host;
+/** 128 random bits as 32 lowercase hex characters; call once per process start. */
+export function newInstanceId(): string;
 export function proxyWebSocket(request: IncomingMessage, socket: Duplex, head: Buffer, address: string, options?: {
   maxPayload?: number;
   maxPendingMessages?: number;

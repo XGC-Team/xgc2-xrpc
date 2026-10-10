@@ -2,7 +2,7 @@
 
 const http = require("node:http");
 const https = require("node:https");
-const { randomUUID } = require("node:crypto");
+const { randomBytes, randomUUID } = require("node:crypto");
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { WebSocket, WebSocketServer } = require("ws");
@@ -10,6 +10,7 @@ const { resolvePolicy, derivePolicy, PolicyError, policyOptions } = require("./p
 const { HTTPClient, TransportError } = require("./client.cjs");
 const { BootstrapBinding, readBootstrapBinding, loadBootstrapInput } = require("./bootstrap.cjs");
 const { Diagnostics, DiagnosticCloseError, DiagnosticSinkError } = require("./diagnostics.cjs");
+const { UnixEndpoint, checkUnixAddress } = require("./unix.cjs");
 
 function positive(value, fallback, name) {
   const result = value ?? fallback;
@@ -19,8 +20,15 @@ function positive(value, fallback, name) {
   return result;
 }
 
-// Public HTTP edge. Authentication, routes and allowed origins belong to the
-// product. This host does not synthesize an internal ServiceRef or start it.
+// A fresh random 128-bit instance identity: call once per process start.
+function newInstanceId() {
+  return randomBytes(16).toString("hex");
+}
+
+// HTTP host with bounded admission and drain. A TCP/TLS edge is started with
+// host.server.listen(); authentication, routes and allowed origins belong to the
+// product. With unixPath the host owns a private Unix socket instead and is
+// started with host.listen().
 function createHTTPHost(handler, options = {}) {
   options = policyOptions(options, {
     HOST_MAX_CONNECTIONS: "maxConnections", HOST_MAX_IN_FLIGHT: "maxInFlight",
@@ -31,6 +39,12 @@ function createHTTPHost(handler, options = {}) {
   });
   const diagnostics = options.policy?.diagnostics;
   const emit = (event, fields) => diagnostics?.emit(event, fields);
+  const unixPath = options.unixPath ?? null;
+  if (unixPath !== null) {
+    checkUnixAddress(unixPath);
+    if (options.tls) throw new TypeError("a Unix host does not use TLS");
+  }
+  const probeTimeoutMs = positive(options.probeTimeoutMs, 250, "probeTimeoutMs");
   const maxConnections = positive(options.maxConnections, 32, "maxConnections");
   const maxInFlight = positive(options.maxInFlight, 32, "maxInFlight");
   const maxBodyBytes = positive(options.maxBodyBytes, 1048576, "maxBodyBytes");
@@ -164,11 +178,31 @@ function createHTTPHost(handler, options = {}) {
   const nativeListen = server.listen.bind(server);
   server.listen = function (...args) {
     const first = args[0];
-    if ((typeof first === "object" && first?.path != null) || (typeof first === "string" && !/^\d+$/.test(first))) {
-      throw new TypeError("Node supplemental hosts do not implement a Unix lease; use a formal SDK provider");
+    if (unixPath !== null || (typeof first === "object" && first?.path != null) || (typeof first === "string" && !/^\d+$/.test(first))) {
+      throw new TypeError("a Unix socket is listened on through the unixPath option and host.listen()");
     }
     return nativeListen(...args);
   };
+  let endpoint = null, listening = false;
+  async function listen() {
+    if (unixPath === null) throw new TypeError("listen() requires the unixPath option; use server.listen(port) for TCP");
+    if (closing || listening) throw new Error(closing ? "host is closing" : "host is already listening");
+    listening = true;
+    try {
+      endpoint = await UnixEndpoint.reserve(unixPath, { probeTimeoutMs });
+      if (closing) throw new Error("host is closing");
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        nativeListen({ path: endpoint.bindPath, backlog: maxConnections }, () => { server.removeListener("error", reject); resolve(); });
+      });
+      endpoint.recordBound();
+    } catch (error) {
+      endpoint?.release();
+      endpoint = null;
+      listening = false;
+      throw error;
+    }
+  }
   server.on("connection", (socket) => {
     if (closing || sockets.size >= maxConnections) { emit("connection_rejected", { connections: sockets.size, category: "resource_exhausted" }); socket.destroy(); return; }
     sockets.add(socket);
@@ -209,7 +243,13 @@ function createHTTPHost(handler, options = {}) {
       timer.unref();
       if (!closeStarted) {
         closeStarted = true;
-        server.close((error) => { networkClosed = true; networkError = error; changed(); });
+        server.close((error) => {
+          networkClosed = true; networkError = error;
+          // The socket stops accepting when close() is called; remove its file once nothing uses it.
+          try { endpoint?.release(); } catch (releaseError) { networkError ??= releaseError; }
+          endpoint = null;
+          changed();
+        });
         server.closeIdleConnections();
       }
       finish();
@@ -217,7 +257,7 @@ function createHTTPHost(handler, options = {}) {
     return shutdown;
   }
   return {
-    server, close, stats: () => ({ connections: sockets.size, inFlight }),
+    server, close, listen, unixPath, stats: () => ({ connections: sockets.size, inFlight }),
     onUpgrade(handler) {
       if (closing) throw new Error("host is closing");
       if (upgradeHandler) throw new Error("upgrade handler already registered");
@@ -448,4 +488,4 @@ function createBoundHTTPHost(handler, options) {
     return handler(req,res,context);
   }, { ...options, tls: credentials.tls });
 }
-module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, resolvePolicy, derivePolicy, PolicyError, HTTPClient, TransportError };
+module.exports = { createHTTPHost, createFetchHost, createRPCHost, createBoundHTTPHost, newInstanceId, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, DiagnosticCloseError, DiagnosticSinkError, proxyWebSocket, resolvePolicy, derivePolicy, PolicyError, HTTPClient, TransportError };
