@@ -1,13 +1,18 @@
 // Codec, HMAC, base64, key ring and error body of udp.v1. No sockets involved.
 #include "../src/udp_wire.hpp"
+#include <unistd.h>
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <stdexcept>
 #include <string>
-#include <unistd.h>
+#include <utility>
+#include <vector>
 using namespace xgc2::xrpc::udp;
 using namespace xgc2::xrpc::udp::detail;
 

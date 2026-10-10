@@ -5,8 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
 
 namespace xgc2::xrpc::udp {
 namespace {

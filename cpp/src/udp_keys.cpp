@@ -1,9 +1,12 @@
 #include "udp_wire.hpp"
 #include <openssl/crypto.h>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace xgc2::xrpc::udp {
 namespace {

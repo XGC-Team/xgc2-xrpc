@@ -3,8 +3,12 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace xgc2::xrpc::udp {
 namespace detail {

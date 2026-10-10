@@ -17,13 +17,19 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 using namespace xgc2::xrpc::udp;
 using namespace xgc2::xrpc::udp::detail;

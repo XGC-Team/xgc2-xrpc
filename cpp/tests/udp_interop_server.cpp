@@ -18,16 +18,18 @@
 //   test.v1/Big    tries to reply with more than 1200 bytes, which the transport
 //                  turns into resource_exhausted
 #include "xgc2/xrpc/udp.hpp"
-#include <csignal>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 using namespace xgc2::xrpc::udp;
 

@@ -14,8 +14,11 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
+#include <string>
 #include <thread>
+#include <vector>
 using namespace xgc2::xrpc::udp;
 using namespace std::chrono;
 

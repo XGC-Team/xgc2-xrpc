@@ -2,8 +2,12 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
 
 namespace xgc2::xrpc::udp::detail {
 std::optional<Address> make_address(const std::string &host, std::uint16_t port) {
