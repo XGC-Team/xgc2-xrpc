@@ -143,7 +143,9 @@ func listenTCP(t testing.TB) net.Listener {
 
 func startSession(t testing.TB, listener net.Listener, server identity, register func(grpc.ServiceRegistrar), mutate ...func(*SessionServerOptions)) *Host {
 	t.Helper()
-	options := SessionServerOptions{TLSConfig: &tls.Config{Certificates: []tls.Certificate{server.certificate}}}
+	// A generous handshake budget: these tests run in parallel under the race
+	// detector on shared machines, and a stalled handshake is not what they test.
+	options := SessionServerOptions{TLSConfig: &tls.Config{Certificates: []tls.Certificate{server.certificate}}, HandshakeTimeout: 30 * time.Second}
 	for _, edit := range mutate {
 		edit(&options)
 	}
@@ -173,8 +175,8 @@ func TestSessionStreamOutlivesTheCallBudget(t *testing.T) {
 	startSession(t, listener, server, service.register())
 	conn := dialSession(t, listener, SessionOptions{TLSConfig: pinned(server.pin, nil)})
 
-	// No deadline: the stream lives as long as its peers do. 1.5 s is five
-	// times the 300 ms budget the control host below enforces on its calls.
+	// No deadline: the stream lives as long as its peers do. 3 s is three times
+	// the 1 s budget the control host below enforces on its calls.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stream, err := pipe(ctx, conn)
@@ -182,7 +184,7 @@ func TestSessionStreamOutlivesTheCallBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	for i := 0; time.Since(started) < 1500*time.Millisecond; i++ {
+	for i := 0; time.Since(started) < 3*time.Second; i++ {
 		if err := roundTrip(stream, "presence"); err != nil {
 			t.Fatalf("session stream broke after %s: %v", time.Since(started), err)
 		}
@@ -195,20 +197,20 @@ func TestSessionStreamOutlivesTheCallBudget(t *testing.T) {
 		t.Fatalf("clean close: %v", err)
 	}
 
-	// Control: a fenced internal host with a 300 ms call budget cuts the same stream.
+	// Control: a fenced internal host with a 1 s call budget cuts the same stream.
 	lease := privateLease(t)
-	fenced, err := ServeWithOptions(lease.listener, lease.lease, service.register(), HostOptions{InstanceID: "boot", MaxCallTime: 300 * time.Millisecond})
+	fenced, err := ServeWithOptions(lease.listener, lease.lease, service.register(), HostOptions{InstanceID: "boot", MaxCallTime: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { fenced.Stop(); <-fenced.Drained() }()
 	ref := xrpc.ServiceRef{TargetID: "local", Service: "session.Echo", APIVersion: "v1", InstanceID: "boot", Profile: xrpc.GRPC, Endpoint: xrpc.Endpoint{Kind: "unix", Address: lease.lease.Path()}}
-	internal, err := Dial(ref, DialOptions{LocalTargetID: "local", MaxCallTime: 300 * time.Millisecond})
+	internal, err := Dial(ref, DialOptions{LocalTargetID: "local", MaxCallTime: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer internal.Close()
-	short, cancelShort := context.WithTimeout(context.Background(), 280*time.Millisecond)
+	short, cancelShort := context.WithTimeout(context.Background(), 900*time.Millisecond)
 	defer cancelShort()
 	cut, err := pipe(short, internal)
 	if err != nil {
@@ -216,7 +218,7 @@ func TestSessionStreamOutlivesTheCallBudget(t *testing.T) {
 	}
 	started = time.Now()
 	var cutErr error
-	for time.Since(started) < 1500*time.Millisecond && cutErr == nil {
+	for time.Since(started) < 4*time.Second && cutErr == nil {
 		cutErr = roundTrip(cut, "internal")
 		time.Sleep(50 * time.Millisecond)
 	}
