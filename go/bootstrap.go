@@ -436,7 +436,6 @@ func newBearerGrant(token string) (credentialGrant, error) {
 // are an immutable startup snapshot; every getter returns a copy.
 type BootstrapCredentials struct {
 	binding BootstrapBinding
-	role    BootstrapRole
 	tls     *tls.Config
 	headers map[string]string
 }
@@ -448,7 +447,7 @@ func (b BootstrapBinding) resolveCredentials(resolve func(string) (credentialGra
 	if role != BootstrapServer && role != BootstrapClient {
 		return nil, bootstrapError()
 	}
-	result := &BootstrapCredentials{binding: cloneBinding(b), role: role, headers: map[string]string{}}
+	result := &BootstrapCredentials{binding: cloneBinding(b), headers: map[string]string{}}
 	handles := b.SecretHandles
 	if b.Endpoint.Kind == "unix" {
 		for _, field := range []struct{ handle, kind string }{{handles.TLSIdentity, "tls_identity"}, {handles.TLSTrust, "tls_trust"}} {
@@ -519,18 +518,6 @@ func cloneCertificate(c tls.Certificate) tls.Certificate {
 		c.Leaf, _ = x509.ParseCertificate(c.Certificate[0])
 	}
 	return c
-}
-func (c *BootstrapCredentials) Binding() BootstrapBinding {
-	if c == nil {
-		return BootstrapBinding{}
-	}
-	return cloneBinding(c.binding)
-}
-func (c *BootstrapCredentials) Role() BootstrapRole {
-	if c == nil {
-		return ""
-	}
-	return c.role
 }
 func (c *BootstrapCredentials) TLSConfig() *tls.Config {
 	if c == nil || c.tls == nil {
