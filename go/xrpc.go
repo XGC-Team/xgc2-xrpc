@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const HTTP = "http.v1"
 const GRPC = "grpc.v1"
+const UDP = "udp.v1"
 
 type Endpoint struct {
 	Kind    string `json:"kind"`
@@ -40,6 +42,14 @@ func (e Endpoint) Validate() error {
 		if _, _, err := net.SplitHostPort(e.Address); err != nil {
 			return fmt.Errorf("xrpc: TLS endpoint: %w", err)
 		}
+	case "udp":
+		host, port, err := net.SplitHostPort(e.Address)
+		if err != nil || host == "" {
+			return errors.New("xrpc: UDP endpoint must be host:port (IPv6 literals in brackets)")
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+			return errors.New("xrpc: UDP endpoint port must be canonical 1..65535")
+		}
 	default:
 		return fmt.Errorf("xrpc: unsupported endpoint kind %q", e.Kind)
 	}
@@ -53,6 +63,10 @@ type ServiceRef struct {
 	InstanceID string   `json:"instance_id"`
 	Profile    string   `json:"profile"`
 	Endpoint   Endpoint `json:"endpoint"`
+	// KeyID names the udp.v1 HMAC key that authenticates calls to this service.
+	// Zero means unspecified: the caller's key ring must then hold exactly one
+	// key. It must be zero for other profiles.
+	KeyID uint32 `json:"key_id,omitempty"`
 }
 
 func (r ServiceRef) Validate() error {
@@ -64,7 +78,7 @@ func (r ServiceRef) Validate() error {
 	if r.InstanceID != "" && !ValidID(r.InstanceID) {
 		return errors.New("xrpc: instance identity must be canonical")
 	}
-	if r.Profile != HTTP && r.Profile != GRPC {
+	if r.Profile != HTTP && r.Profile != GRPC && r.Profile != UDP {
 		return errors.New("xrpc: unsupported profile")
 	}
 	if err := r.Endpoint.Validate(); err != nil {
@@ -76,7 +90,30 @@ func (r ServiceRef) Validate() error {
 	if r.Profile == GRPC && r.Endpoint.Kind == "https" {
 		return errors.New("xrpc: gRPC TLS endpoint must use host:port")
 	}
+	if (r.Profile == UDP) != (r.Endpoint.Kind == "udp") {
+		return errors.New("xrpc: udp.v1 requires a udp endpoint and no other profile accepts one")
+	}
+	if r.Profile == UDP && r.InstanceID != "" && !validUDPInstance(r.InstanceID) {
+		return errors.New("xrpc: udp.v1 instance identity must be 32 lowercase hexadecimal digits")
+	}
+	if r.Profile != UDP && r.KeyID != 0 {
+		return errors.New("xrpc: key identity applies to udp.v1 only")
+	}
 	return nil
+}
+
+// validUDPInstance reports whether id is the lowercase hexadecimal form of a
+// 128-bit udp.v1 instance identity, the form NewInstanceID produces.
+func validUDPInstance(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := range id {
+		if c := id[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateInternal rejects unbound discovery references for internal calls.
@@ -167,6 +204,7 @@ type Observer interface {
 }
 
 // Dispatcher is immutable local composition, not a registry or discovery API.
+// It composes the http.v1 and grpc.v1 profiles; udp.v1 callers use udpx.Client.
 type Dispatcher struct{ profiles map[string]Caller }
 
 func NewDispatcher(profiles map[string]Caller) (*Dispatcher, error) {
