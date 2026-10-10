@@ -24,6 +24,10 @@ import (
 const (
 	EventBackoffInitial = 500 * time.Millisecond
 	EventBackoffMax     = 5 * time.Second
+	// EventIdleTimeout is how long SubscribeEvents waits for any byte,
+	// heartbeats included, before it drops a stream as dead and reconnects:
+	// three default heartbeats. A server must heartbeat more often than this.
+	EventIdleTimeout = 3 * DefaultEventHeartbeat
 
 	maxEventLine = 1 << 20
 )
@@ -37,8 +41,9 @@ const (
 // The channel is closed when ctx ends. A failure that retrying cannot fix (the
 // server answers 4xx, or its certificate does not verify) is returned by
 // SubscribeEvents itself when it happens on the first connection, and later
-// as the final event, whose Err is set. The consumer must keep receiving or
-// cancel ctx: a slow consumer pauses the stream.
+// as the final event, whose Err is set. A connection that delivers no byte, not
+// even a heartbeat, for EventIdleTimeout is dropped and re-established. The
+// consumer must keep receiving or cancel ctx: a slow consumer pauses the stream.
 //
 // ref is an http.v1 reference with a unix or https endpoint; path is an absolute
 // request URI, query allowed. client carries the transport: nil derives one
@@ -46,11 +51,12 @@ const (
 // caller-supplied client must have no Timeout, which would cut the stream.
 // Event streams are unfenced: neither the instance nor a call budget applies.
 func SubscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceRef, path, after string) (<-chan Event, error) {
-	return subscribeEvents(ctx, client, ref, path, after, randomBelow)
+	return subscribeEvents(ctx, client, ref, path, after, randomBelow, EventIdleTimeout)
 }
 
-// subscribeEvents is SubscribeEvents with an injectable jitter source.
-func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceRef, path, after string, draw func(bound int64) int64) (<-chan Event, error) {
+// subscribeEvents is SubscribeEvents with an injectable jitter source and idle
+// timeout.
+func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceRef, path, after string, draw func(bound int64) int64, idle time.Duration) (<-chan Event, error) {
 	if err := ref.Validate(); err != nil {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
 	}
@@ -66,7 +72,7 @@ func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 	if err := ctx.Err(); err != nil {
 		return nil, xrpc.Failure(xrpc.Code(err), xrpc.NotSent, err)
 	}
-	s := &subscription{path: path, cursor: after, out: make(chan Event), draw: draw}
+	s := &subscription{path: path, cursor: after, out: make(chan Event), draw: draw, idle: idle}
 	switch ref.Endpoint.Kind {
 	case "unix":
 		s.base = "http://unix"
@@ -82,14 +88,14 @@ func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 	} else {
 		s.client = client
 	}
-	response, err := s.connect(ctx)
+	opened, err := s.connect(ctx)
 	if err != nil && !retryable(err) {
 		if s.owned {
 			s.client.CloseIdleConnections()
 		}
 		return nil, err
 	}
-	go s.run(ctx, response, err)
+	go s.run(ctx, opened, err)
 	return s.out, nil
 }
 
@@ -111,6 +117,18 @@ type subscription struct {
 	cursor string
 	out    chan Event
 	draw   func(bound int64) int64
+	idle   time.Duration
+}
+
+// stream is one open connection: the response and the way to cut it.
+type stream struct {
+	response *http.Response
+	cancel   context.CancelFunc
+}
+
+func (st *stream) close() {
+	_ = st.response.Body.Close()
+	st.cancel()
 }
 
 // transient marks a connect failure worth retrying.
@@ -124,7 +142,17 @@ func retryable(err error) bool {
 }
 
 // connect opens one stream.
-func (s *subscription) connect(ctx context.Context) (*http.Response, error) {
+func (s *subscription) connect(ctx context.Context) (*stream, error) {
+	connection, cancel := context.WithCancel(ctx)
+	opened, err := s.open(connection)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &stream{response: opened, cancel: cancel}, nil
+}
+
+func (s *subscription) open(ctx context.Context) (*http.Response, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.base+s.path, nil)
 	if err != nil {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
@@ -165,17 +193,17 @@ func (s *subscription) connect(ctx context.Context) (*http.Response, error) {
 
 // run reads the first connection, if any, then reconnects until ctx ends or a
 // failure retrying cannot fix.
-func (s *subscription) run(ctx context.Context, response *http.Response, failure error) {
+func (s *subscription) run(ctx context.Context, current *stream, failure error) {
 	defer close(s.out)
 	if s.owned {
 		defer s.client.CloseIdleConnections()
 	}
 	attempt := 0
 	for {
-		if response != nil {
+		if current != nil {
 			attempt = 0
-			err := s.read(ctx, response.Body)
-			_ = response.Body.Close()
+			err := s.read(ctx, current)
+			current.close()
 			if err != nil {
 				s.fail(ctx, err)
 				return
@@ -192,10 +220,10 @@ func (s *subscription) run(ctx context.Context, response *http.Response, failure
 		case <-timer.C:
 		}
 		attempt++
-		response, failure = s.connect(ctx)
+		current, failure = s.connect(ctx)
 		if ctx.Err() != nil {
-			if response != nil {
-				_ = response.Body.Close()
+			if current != nil {
+				current.close()
 			}
 			return
 		}
@@ -211,8 +239,11 @@ func (s *subscription) fail(ctx context.Context, err error) {
 
 // read delivers the events of one connection until it ends. A nil result means
 // reconnect and resume; an error means the stream cannot continue.
-func (s *subscription) read(ctx context.Context, body io.Reader) error {
-	scanner := bufio.NewScanner(body)
+func (s *subscription) read(ctx context.Context, st *stream) error {
+	// A connection that stays silent for s.idle, heartbeats included, is dead.
+	watchdog := time.AfterFunc(s.idle, st.cancel)
+	defer watchdog.Stop()
+	scanner := bufio.NewScanner(&idleReader{reader: st.response.Body, watchdog: watchdog, idle: s.idle})
 	scanner.Buffer(make([]byte, 0, 4096), maxEventLine)
 	id := s.cursor // the last event id persists across events and connections
 	var eventType string
@@ -260,6 +291,21 @@ func (s *subscription) read(ctx context.Context, body io.Reader) error {
 		return xrpc.Failure("resource_exhausted", xrpc.ResponseReceived, fmt.Errorf("xrpc: event line exceeds %d bytes", maxEventLine))
 	}
 	return nil
+}
+
+// idleReader re-arms the watchdog whenever bytes arrive.
+type idleReader struct {
+	reader   io.Reader
+	watchdog *time.Timer
+	idle     time.Duration
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.watchdog.Reset(r.idle)
+	}
+	return n, err
 }
 
 // reconnectDelay is the full-jitter wait before reconnect attempt number

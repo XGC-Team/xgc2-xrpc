@@ -63,8 +63,9 @@ type EventSource interface {
 // EventsOptions are plain limits for ServeEvents; zero fields select the default.
 type EventsOptions struct {
 	// Heartbeat is the interval of ": hb" comments on an idle stream, which keep
-	// intermediaries from closing it and make a dead client fail a write
-	// (default DefaultEventHeartbeat).
+	// intermediaries from closing it, make a dead client fail a write and let
+	// SubscribeEvents tell a live stream from a dead one: keep it well below
+	// EventIdleTimeout (default DefaultEventHeartbeat).
 	Heartbeat time.Duration
 	// WriteTimeout bounds each frame write. It is pushed forward on every frame
 	// with http.ResponseController, so a stream outlives the server's

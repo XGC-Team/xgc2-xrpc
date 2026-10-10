@@ -28,7 +28,7 @@ func fastJitter(int64) int64 { return int64(time.Millisecond) }
 
 func subscribe(t *testing.T, ctx context.Context, server *httptest.Server, after string) <-chan Event {
 	t.Helper()
-	events, err := subscribeEvents(ctx, server.Client(), httpsRef(server), "/events", after, fastJitter)
+	events, err := subscribeEvents(ctx, server.Client(), httpsRef(server), "/events", after, fastJitter, EventIdleTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestSubscribeEventsPermanentFailures(t *testing.T) {
 	defer cancel()
 
 	// A refusal on the first connection is returned by SubscribeEvents.
-	_, err := subscribeEvents(ctx, server.Client(), httpsRef(server), "/events", "", fastJitter)
+	_, err := subscribeEvents(ctx, server.Client(), httpsRef(server), "/events", "", fastJitter, EventIdleTimeout)
 	var failure *xrpc.CallError
 	if !errors.As(err, &failure) || failure.Code != "permission_denied" || failure.Disposition != xrpc.ResponseReceived || !strings.Contains(failure.Message, "token expired") {
 		t.Fatalf("first connection: %v", err)
@@ -326,7 +326,7 @@ func TestSubscribeEventsRejectsWhatIsNotAnEventStream(t *testing.T) {
 		w.Write([]byte(`{}`))
 	}))
 	defer server.Close()
-	if _, err := subscribeEvents(context.Background(), server.Client(), httpsRef(server), "/events", "", fastJitter); xrpc.Code(err) != "invalid_argument" {
+	if _, err := subscribeEvents(context.Background(), server.Client(), httpsRef(server), "/events", "", fastJitter, EventIdleTimeout); xrpc.Code(err) != "invalid_argument" {
 		t.Fatal(err)
 	}
 }
@@ -456,7 +456,7 @@ func TestSubscribeEventsSurvivesAHostRestart(t *testing.T) {
 	first := serve()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	events, err := subscribeEvents(ctx, nil, httpRef("unix", socket), "/events", "", fastJitter)
+	events, err := subscribeEvents(ctx, nil, httpRef("unix", socket), "/events", "", fastJitter, EventIdleTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,5 +484,58 @@ func TestSubscribeEventsSurvivesAHostRestart(t *testing.T) {
 			t.Fatalf("event %d after the restart: %+v", i, event)
 		}
 		j.append("tick", "{}")
+	}
+}
+
+// A connection that goes silent, heartbeats included, is dropped and replaced.
+func TestSubscribeEventsReconnectsAfterSilence(t *testing.T) {
+	var connections atomic.Int32
+	var mu sync.Mutex
+	var cursors []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cursors = append(cursors, r.Header.Get("Last-Event-ID"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		id := connections.Add(1)
+		w.Write([]byte("id: " + strconv.Itoa(int(id)) + "\ndata: hello\n\n"))
+		w.(http.Flusher).Flush()
+		if id == 2 {
+			// The second connection keeps its heartbeats going: it must live.
+			for r.Context().Err() == nil {
+				w.Write([]byte(": hb\n\n"))
+				w.(http.Flusher).Flush()
+				time.Sleep(20 * time.Millisecond)
+			}
+			return
+		}
+		<-r.Context().Done() // silent: no heartbeat
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := subscribeEvents(ctx, server.Client(), httpsRef(server), "/events", "", fastJitter, 150*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for want := 1; want <= 2; want++ {
+		if event := next(t, events); event.ID != strconv.Itoa(want) {
+			t.Fatalf("event %d: %+v", want, event)
+		}
+	}
+	// The heartbeating connection stays up well past the idle timeout.
+	select {
+	case event := <-events:
+		t.Fatalf("a live connection was dropped and replayed: %+v", event)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if connections.Load() != 2 {
+		t.Fatalf("%d connections", connections.Load())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(cursors) != 2 || cursors[1] != "1" {
+		t.Fatalf("resumed from %q", cursors)
 	}
 }

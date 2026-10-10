@@ -187,8 +187,10 @@ slot of its host for its lifetime.
 `httpx.SubscribeEvents(ctx, client, ref, path, after)` is the Go client. It
 reconnects with full-jitter backoff (uniform in `[0, min(5 s, 500 ms << n)]`),
 resumes from the last event id, delivers `reset` (and forgets its cursor),
-consumes `closing`, and retries transient failures (network errors, 408, 429,
-5xx). A failure retrying cannot fix (other 4xx, a non-stream response, a
+consumes `closing`, retries transient failures (network errors, 408, 429, 5xx)
+and drops a connection that delivers no byte, heartbeats included, for
+`EventIdleTimeout` (45 s, three default heartbeats), so a server must heartbeat
+more often than that. A failure retrying cannot fix (other 4xx, a non-stream response, a
 certificate that does not verify) is returned by the call when it happens on
 the first connection and later as a final `Event` whose `Err` is set. Pass a
 nil client to derive one from `ref` (Unix socket, or HTTPS with system roots);
@@ -405,6 +407,7 @@ compatibility shims.
 | `httpx.NewBound`, `httpx.ServeBound`, `httpx.ServeTLS`, `HostOptions.Authorize` | `httpx.New` with the credentials' TLS config and headers; `httpx.ServeEdge` behind the product's TLS listener |
 | `grpcx.DialBound`, `grpcx.ServeBound`, `grpcx.ServeTLS`, `grpcx.Serve`, `grpcx.FiniteUnary`, `grpcx.BoundService`, `HostOptions.Authorize` | `grpcx.ServeWithOptions` (set `HostOptions.InstanceID`, `MaxCallTime`, `MaxInFlight`), `grpcx.DialSession`/`ServeSession` for remote TLS |
 | `grpcx.ServeEdgeTLS`, `ServeEdgeWithOptions`, `PrepareEdgeTLS`, `EdgeOptions`, `Host.Serve` | `grpcx.ServeSession` |
+| `grpcx.HostOptions.ShutdownTimeout` (no host read it) | the context passed to `Host.Shutdown` |
 
 `httpx.Serve` and `grpcx.ServeWithOptions` now serve Unix listeners only: a
 remote HTTP listener is `httpx.ServeEdge`, a remote gRPC listener is
