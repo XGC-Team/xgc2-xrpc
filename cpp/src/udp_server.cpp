@@ -137,13 +137,18 @@ public:
     if (started_ || closed_) throw std::logic_error("udp server already started or shut down");
     started_ = true;
     thread_ = std::thread([this] { run(); });
+    io_thread_id_ = thread_.get_id();
   }
 
   bool shutdown(std::chrono::milliseconds drain_budget) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (io_thread_id_ == std::this_thread::get_id())
+        throw std::logic_error("udp server cannot be shut down from its own handler");
+    }
+    std::lock_guard<std::mutex> one_at_a_time(shutdown_mutex_);
     std::unique_lock<std::mutex> lock(mutex_);
     if (closed_) return drained_;
-    if (thread_.joinable() && thread_.get_id() == std::this_thread::get_id())
-      throw std::logic_error("udp server cannot be shut down from its own handler");
     admitting_ = false;
     drained_ = idle_.wait_for(lock, drain_budget, [this] { return inflight_ == 0; });
     while (!pending_.empty()) abandon_locked(*pending_.back());
@@ -152,11 +157,15 @@ public:
     stop_.store(true);
     signal_wake();
     if (thread_.joinable()) thread_.join();
+    // Handlers may hold Replies, whose destruction takes mutex_: release them outside it.
+    std::unordered_map<std::string, Server::Handler> released;
     lock.lock();
     socket_.reset();
     wake_.reset();
-    methods_.clear(); // release whatever the handlers captured
-    return drained_;
+    released.swap(methods_);
+    const bool drained = drained_;
+    lock.unlock();
+    return drained;
   }
 
   std::uint16_t port() const noexcept { return port_; }
@@ -371,8 +380,9 @@ private:
   }
 
   void finish_locked(Entry &entry) {
-    pending_.erase(std::find_if(pending_.begin(), pending_.end(),
-                                [&entry](const std::shared_ptr<Entry> &p) { return p.get() == &entry; }));
+    const auto running = std::find_if(pending_.begin(), pending_.end(),
+                                      [&entry](const std::shared_ptr<Entry> &p) { return p.get() == &entry; });
+    if (running != pending_.end()) pending_.erase(running);
     if (--inflight_ == 0) idle_.notify_all();
   }
 
@@ -464,6 +474,8 @@ private:
   Fd socket_, wake_;
   std::uint16_t port_ = 0;
   std::thread thread_;
+  std::thread::id io_thread_id_; // set by start(); shutdown() must not run on it
+  std::mutex shutdown_mutex_;
   std::atomic<bool> stop_{false};
   std::unordered_map<std::string, Server::Handler> methods_;
   // I/O thread only.

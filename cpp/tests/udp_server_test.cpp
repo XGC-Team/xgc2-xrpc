@@ -885,6 +885,87 @@ void shutdown_with_work_in_flight() {
   }
 }
 
+void handlers_may_own_replies() {
+  // The handler's own state holds a Reply. Releasing the handlers at shutdown
+  // destroys it, and a Reply's destructor needs the server's lock.
+  struct Holder {
+    std::mutex mutex;
+    std::vector<Reply> replies;
+    std::size_t size() { std::lock_guard<std::mutex> lock(mutex); return replies.size(); }
+  };
+  auto holder = std::make_shared<Holder>();
+  std::weak_ptr<Holder> watch = holder;
+  {
+    ServerOptions options;
+    options.bind_address = host;
+    Server server(options, keys());
+    server.add_method("test/Keep", [holder](Request, Reply reply) {
+      std::lock_guard<std::mutex> lock(holder->mutex);
+      holder->replies.push_back(std::move(reply));
+    });
+    server.start();
+    Peer peer;
+    peer.send_to(server.port(), Env::request("test/Keep", "", fresh_id()));
+    assert(await([&] { return holder->size() == 1; }));
+    holder.reset(); // the registered handler is now the only owner
+    assert(!watch.expired());
+  }
+  assert(watch.expired()); // destroyed with the server, without deadlock
+}
+
+void shutdown_from_two_threads() {
+  Env env;
+  Peer peer;
+  peer.send_to(env.port(), Env::request("test/Hold", "", fresh_id()));
+  assert(await([&] { return env.probe.holds == 1; }));
+  std::atomic<int> drained{0}, failed{0};
+  std::vector<std::thread> closers;
+  for (int i = 0; i < 4; ++i)
+    closers.emplace_back([&] { (env.server->shutdown(milliseconds(100)) ? drained : failed)++; });
+  for (auto &closer : closers) closer.join();
+  assert(drained == 0 && failed == 4); // the held call outlived the budget, for every caller
+}
+
+void shutdown_is_refused_inside_a_handler() {
+  Env env;
+  std::atomic<bool> refused{false}, ran{false};
+  Server *server = env.server.get();
+  // A second server whose handler tries to shut itself down.
+  ServerOptions options;
+  options.bind_address = host;
+  Server inner(options, keys());
+  inner.add_method("test/Self", [&](Request, Reply reply) {
+    try {
+      inner.shutdown();
+    } catch (const std::logic_error &) {
+      refused = true;
+    }
+    reply.complete(Status::Ok, "{}");
+    ran = true;
+  });
+  inner.start();
+  Client client(keys());
+  assert(client.call(endpoint_of(inner.port()), 7, "test/Self", "{}", steady_clock::now() + seconds(2)).status == Status::Ok);
+  assert(ran && refused);
+  (void)server;
+}
+
+void dual_stack_bind() {
+  if (host != "::1") return;
+  // "::" accepts IPv4 senders as well as IPv6 ones; a specific address is IPv6 only.
+  Env env([](ServerOptions &options) { options.bind_address = "::"; });
+  Client client(keys());
+  const auto deadline = [] { return steady_clock::now() + seconds(2); };
+  assert(client.call("[::1]:" + std::to_string(env.port()), 7, "test/Echo", "{\"v\":6}", deadline()).body == "{\"v\":6}");
+  assert(client.call("127.0.0.1:" + std::to_string(env.port()), 7, "test/Echo", "{\"v\":4}", deadline()).body == "{\"v\":4}");
+  // The rate limit counts both families under their own source address.
+  assert(env.server->stats().dropped_rate == 0);
+  Env v6_only([](ServerOptions &options) { options.bind_address = "::1"; });
+  const auto refused = client.call("127.0.0.1:" + std::to_string(v6_only.port()), 7, "test/Echo", "{}",
+                                   steady_clock::now() + milliseconds(150));
+  assert(refused.delivery == Delivery::OutcomeUnknown);
+}
+
 void construction_and_registration_rules() {
   const auto build = [](const std::function<void(ServerOptions &)> &configure, KeyRing ring = keys()) {
     ServerOptions options;
@@ -1001,6 +1082,10 @@ int main(int argc, char **argv) {
   client_ignores_what_is_not_its_reply();
   loss_never_repeats_an_execution();
   shutdown_with_work_in_flight();
+  handlers_may_own_replies();
+  shutdown_from_two_threads();
+  shutdown_is_refused_inside_a_handler();
+  dual_stack_bind();
   construction_and_registration_rules();
   concurrent_callers();
   std::cout << "udp.v1 over " << host << ": calls, at-most-once under duplicates and loss, async replies, "
