@@ -141,6 +141,13 @@ a token bucket (`requests_per_second` 50, `burst` 100, at most `max_rate_sources
 sources); excess datagrams are dropped (`dropped_rate`). Unauthenticated datagrams never
 spend tokens.
 
+**Addresses.** The server answers from its single socket and the kernel picks the reply's
+source address by route. On a host with several addresses, bind to the address that
+callers use: a client with a connected socket (the Go client's) ignores a reply that
+comes from another address, whereas this client accepts any authentic reply. `"::"`
+accepts IPv4 senders too; a specific IPv6 address does not. There is no `SO_REUSEADDR`:
+a second server on the same port fails to bind, which keeps the endpoint exclusive.
+
 **Statuses and errors.** `Status` is 0 ok, 1 invalid_argument, 2 not_found, 3 conflict,
 4 resource_exhausted, 5 deadline_exceeded, 6 cancelled, 7 unavailable, 8 internal,
 9 unauthenticated (never sent) and 10 permission_denied. Non-zero statuses carry
