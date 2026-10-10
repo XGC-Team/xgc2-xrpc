@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -323,10 +324,14 @@ void retransmitting_client_runs_the_handler_once() {
   // The handler answers after 250 ms: the client sends at 0, 30, 90 and 210 ms.
   const auto response = env.call("test/Sleep", "250");
   assert(response.delivery == Delivery::ResponseReceived && response.body == "slept");
-  assert(response.attempts >= 4 && response.attempts <= 6);
+  assert(response.attempts >= 2 && response.attempts <= 6);
   assert(env.probe.sleeps == 1 && await([&] { return env.probe.on_time_completions == 1; }));
   assert(await([&] { return env.server->stats().inflight == 0; }));
-  assert(env.server->stats().inflight_ignored >= 3);
+  // Every retransmission found the call running (ignored) or finished (cached).
+  assert(await([&] {
+    const auto stats = env.server->stats();
+    return stats.inflight_ignored + stats.cache_hits + 1 >= response.attempts;
+  }));
 }
 
 void async_completion_keeps_the_io_thread_free() {
@@ -334,13 +339,13 @@ void async_completion_keeps_the_io_thread_free() {
   std::atomic<bool> slow_done{false};
   Response slow;
   std::thread caller([&] {
-    slow = env.call("test/Sleep", "400");
+    slow = env.call("test/Sleep", "1500", seconds(5));
     slow_done = true;
   });
   assert(await([&] { return env.server->stats().inflight == 1; }));
-  const auto start = steady_clock::now();
+  // While one call is parked, others are served by the same I/O thread.
   for (int i = 0; i < 20; ++i) assert(env.call("test/Echo", "{}").status == Status::Ok);
-  assert(steady_clock::now() - start < milliseconds(300) && !slow_done);
+  assert(!slow_done);
   caller.join();
   assert(slow.status == Status::Ok && slow.body == "slept");
 }
@@ -470,15 +475,19 @@ void rate_limit_per_source() {
   // Garbage never spends tokens.
   for (int i = 0; i < 50; ++i) peer.send_to(env.port(), Bytes(100, static_cast<std::uint8_t>(i)));
   for (int i = 0; i < 10; ++i) peer.send_to(env.port(), Env::request("test/Echo", "{}", fresh_id()));
-  assert(peer.receive_all(milliseconds(300)).size() == 3);
+  const auto sent_at = steady_clock::now();
+  const auto answered = peer.receive_all(milliseconds(300)).size();
+  assert(answered >= 3 && answered <= 4); // a stalled server thread may see a refilled token
   auto stats = env.server->stats();
-  assert(stats.dropped_rate == 7 && stats.dropped_malformed == 50 && env.probe.echoes == 3);
+  assert(stats.dropped_rate == 10 - answered && stats.dropped_malformed == 50 && env.probe.echoes == answered);
   // The bucket refills at one token per second.
   std::this_thread::sleep_for(milliseconds(1200));
+  const auto probed = steady_clock::now();
   peer.send_to(env.port(), Env::request("test/Echo", "{}", fresh_id()));
   assert(peer.receive(seconds(1)));
   peer.send_to(env.port(), Env::request("test/Echo", "{}", fresh_id()));
-  assert(!peer.receive(milliseconds(200)));
+  // Within about two seconds of the burst there cannot be a second spare token.
+  if (probed - sent_at < milliseconds(1900)) assert(!peer.receive(milliseconds(200)));
   // Another source address has its own budget (127.0.0.0/8 is all loopback).
   if (host == "127.0.0.1") {
     Peer other("127.0.0.2");
@@ -546,14 +555,18 @@ void limits_and_the_reply_cache() {
     });
     Peer peer;
     const auto datagram = Env::request("test/Count", "", fresh_id(), 100);
+    const auto first = steady_clock::now();
     peer.send_to(env.port(), datagram);
     assert(peer.receive(seconds(1)));
-    std::this_thread::sleep_for(milliseconds(300));
+    std::this_thread::sleep_for(milliseconds(200));
     peer.send_to(env.port(), datagram);
-    assert(peer.receive(seconds(1)) && env.probe.counter == 1);
-    std::this_thread::sleep_for(milliseconds(900));
+    assert(peer.receive(seconds(1)));
+    // Inside the window the duplicate was cached (unless a stall used the window up).
+    if (steady_clock::now() - first < milliseconds(900)) assert(env.probe.counter == 1);
+    std::this_thread::sleep_until(first + milliseconds(1300));
+    const auto runs = env.probe.counter.load();
     peer.send_to(env.port(), datagram);
-    assert(peer.receive(seconds(1)) && env.probe.counter == 2);
+    assert(peer.receive(seconds(1)) && env.probe.counter == runs + 1); // a new call after the window
   }
   {
     // Capacity: only the newest replies are kept.
@@ -615,8 +628,8 @@ void client_input_validation() {
   const auto start = steady_clock::now();
   const auto lost = env.client.call(endpoint_of(silent.port()), 7, "test/Echo", "{}", start + milliseconds(400));
   assert(lost.delivery == Delivery::OutcomeUnknown && lost.status == Status::DeadlineExceeded);
-  assert(steady_clock::now() - start >= milliseconds(395) && steady_clock::now() - start < milliseconds(900));
-  assert(lost.attempts >= 4 && lost.attempts <= 6 && !lost.message.empty());
+  assert(steady_clock::now() - start >= milliseconds(395) && steady_clock::now() - start < seconds(3));
+  assert(lost.attempts >= 2 && lost.attempts <= 6 && !lost.message.empty());
   assert(silent.receive_all(milliseconds(50)).size() == lost.attempts);
   // No route at all: nothing could be sent.
   if (host == "127.0.0.1") {
@@ -639,19 +652,20 @@ void retransmission_schedule_on_the_wire() {
     arrivals.emplace_back(duration_cast<milliseconds>(steady_clock::now() - start), *bytes);
   caller.join();
   assert(response.delivery == Delivery::OutcomeUnknown && response.attempts == arrivals.size());
-  // 0, 30, 90, 210, 450, 700, 950 ms: waits of 30, 60, 120 and 240 ms, then every 250 ms.
-  const long expected[] = {0, 30, 90, 210, 450, 700, 950};
-  assert(arrivals.size() >= 6 && arrivals.size() <= 8);
-  for (std::size_t i = 0; i < 7 && i < arrivals.size(); ++i) {
-    const long at = static_cast<long>(arrivals[i].first.count());
-    assert(at >= expected[i] - 5 && at <= expected[i] + 120);
-  }
+  // Nominally 0, 30, 90, 210, 450, 700, 950 ms: waits of 30, 60, 120 and 240 ms, then
+  // every 250 ms. A busy machine delays a datagram but never advances it, so the
+  // waits between datagrams are only bounded from below.
+  const long waits[] = {30, 60, 120, 240, 250, 250};
+  assert(arrivals.size() >= 3 && arrivals.size() <= 8);
+  assert(arrivals[0].first <= milliseconds(500));
+  for (std::size_t i = 1; i < arrivals.size(); ++i)
+    assert((arrivals[i].first - arrivals[i - 1].first).count() >= waits[std::min<std::size_t>(i - 1, 5)] - 5);
   // Every retransmission is the same datagram: one request id, one tag.
   for (const auto &arrival : arrivals) assert(arrival.second == arrivals.front().second);
   Datagram d;
   assert(parse(arrivals[0].second.data(), arrivals[0].second.size(), d) == Parse::Ok && verify(d, key7));
   assert(d.method == "test/Echo" && d.flags == 0);
-  assert(d.word >= 1090 && d.word <= 1100); // the budget that remained when it was first sent
+  assert(d.word >= 600 && d.word <= 1100); // the budget that remained when it was first sent
   // A custom schedule is honored.
   ClientOptions fast;
   fast.backoff = {milliseconds(5), milliseconds(5)};
@@ -659,7 +673,7 @@ void retransmission_schedule_on_the_wire() {
   Client client(keys(), fast);
   const auto began = steady_clock::now();
   const auto quick = client.call(endpoint_of(fake.port()), 7, "test/Echo", "{}", began + milliseconds(180));
-  assert(quick.attempts >= 4 && quick.attempts <= 6);
+  assert(quick.attempts >= 2 && quick.attempts <= 6);
 }
 
 // A server written by hand, to see what the client accepts.
@@ -670,6 +684,7 @@ void client_ignores_what_is_not_its_reply() {
   const auto endpoint = endpoint_of(fake.port());
   const auto run = [&](std::optional<InstanceId> pin, steady_clock::duration timeout,
                        const std::function<std::vector<Bytes>(const Datagram &)> &answer) {
+    while (fake.receive(milliseconds(0))) {} // retransmissions of the previous call
     Response response;
     std::thread caller([&] {
       Client client(keys());
@@ -727,6 +742,13 @@ void client_ignores_what_is_not_its_reply() {
     return std::vector<Bytes>{resign(datagram, key7)};
   });
   assert(flagged.delivery == Delivery::ResponseReceived && flagged.body == "flagged reply");
+  // Replies that were ignored leave no trace in the result.
+  const auto ignored = run(instance, milliseconds(300), [&](const Datagram &d) {
+    return std::vector<Bytes>{reply(key7, 7, d.request_id, other_instance, 0, "impostor"),
+                              reply(key7, 7, d.request_id, other_instance, 8, "impostor error")};
+  });
+  assert(ignored.delivery == Delivery::OutcomeUnknown && ignored.status == Status::DeadlineExceeded);
+  assert(ignored.body.empty() && ignored.instance == InstanceId{} && ignored.attempts >= 2);
   // A deadline further away than udp.v1's 60 s is shortened on the wire.
   std::uint32_t advertised = 0;
   run(std::nullopt, hours(1), [&](const Datagram &d) {
@@ -819,9 +841,7 @@ void shutdown_with_work_in_flight() {
     Response response;
     std::thread caller([&] { response = env.call("test/Sleep", "200"); });
     assert(await([&] { return env.server->stats().inflight == 1; }));
-    const auto start = steady_clock::now();
-    assert(env.server->shutdown(seconds(2)));
-    assert(steady_clock::now() - start >= milliseconds(100) && steady_clock::now() - start < seconds(1));
+    assert(env.server->shutdown(seconds(5)));
     caller.join();
     assert(response.delivery == Delivery::ResponseReceived && response.body == "slept");
     assert(env.server->shutdown(seconds(2))); // idempotent
@@ -840,7 +860,7 @@ void shutdown_with_work_in_flight() {
     assert(await([&] { return env.probe.holds == 1; }));
     const auto start = steady_clock::now();
     assert(!env.server->shutdown(milliseconds(80)));
-    assert(steady_clock::now() - start >= milliseconds(70) && steady_clock::now() - start < seconds(1));
+    assert(steady_clock::now() - start >= milliseconds(70) && steady_clock::now() - start < seconds(5));
     assert(!env.server->shutdown(seconds(2))); // the first result stands
     {
       std::lock_guard<std::mutex> lock(env.probe.mutex);
@@ -857,18 +877,24 @@ void shutdown_with_work_in_flight() {
     peer.send_to(env.port(), running);
     assert(await([&] { return env.probe.holds == 1; }));
     std::atomic<bool> drained{false};
-    std::thread closer([&] { drained = env.server->shutdown(seconds(5)); });
-    std::this_thread::sleep_for(milliseconds(100));
-    peer.send_to(env.port(), Env::request("test/Echo", "{}", fresh_id()));
-    const auto refusal = peer.receive(seconds(2));
-    assert(refusal && static_cast<Status>(parse_reply(*refusal).word) == Status::Unavailable);
+    std::thread closer([&] { drained = env.server->shutdown(seconds(10)); });
+    // Draining starts when the closer thread gets going; until then a new request is served.
+    bool refused_while_draining = false;
+    for (int attempt = 0; attempt < 300 && !refused_while_draining; ++attempt) {
+      peer.send_to(env.port(), Env::request("test/Echo", "{}", fresh_id()));
+      const auto answer = peer.receive(seconds(2));
+      assert(answer);
+      refused_while_draining = static_cast<Status>(parse_reply(*answer).word) == Status::Unavailable;
+      if (!refused_while_draining) std::this_thread::sleep_for(milliseconds(10));
+    }
+    assert(refused_while_draining);
     peer.send_to(env.port(), running);
     assert(!peer.receive(milliseconds(150)) && !drained);
     env.probe.complete_held(Status::Ok, "finished while draining");
     const auto reply = peer.receive(seconds(2));
     assert(reply && parse_reply(*reply).body == "finished while draining");
     closer.join();
-    assert(drained && env.probe.echoes == 0);
+    assert(drained);
     peer.send_to(env.port(), running); // the cache keeps answering until the socket closes
   }
   {

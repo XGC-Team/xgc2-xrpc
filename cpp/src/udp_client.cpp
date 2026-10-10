@@ -95,7 +95,7 @@ Response Client::call(std::string_view endpoint, std::uint32_t key_id, std::stri
       const auto n = ::recvfrom(socket.fd, buffer.data(), buffer.size(), 0, nullptr, nullptr);
       if (n < 0) {
         if (errno == EINTR) continue;
-        break; // EAGAIN, or an ICMP error that says nothing about a reply
+        break; // EAGAIN: nothing more to read now
       }
       detail::Datagram reply;
       // Anything that is not an authentic answer to this very request is
@@ -105,19 +105,18 @@ Response Client::call(std::string_view endpoint, std::uint32_t key_id, std::stri
           reply.type != detail::Type::Reply || reply.key_id != key_id ||
           reply.request_id != request_id || reply.word > 10 || !detail::verify(reply, *key))
         continue;
-      response.status = static_cast<Status>(reply.word);
+      const auto status = static_cast<Status>(reply.word);
+      // Only the other instance's fence answer means anything to a pinned call;
+      // its other replies are not answers to it.
+      const bool other_instance = expected_instance && reply.instance != *expected_instance;
+      if (other_instance && status != Status::Conflict) continue;
+      response.status = status;
       response.body.assign(reply.body);
       response.instance = reply.instance;
-      if (expected_instance && reply.instance != *expected_instance) {
-        // Only the other instance's fence answer means anything to a pinned
-        // call; its other replies are not answers to it. The pinned instance
-        // may have run the request before it went away, so the outcome is unknown.
-        if (response.status != Status::Conflict) continue;
-        response.delivery = Delivery::OutcomeUnknown;
-        response.message = "the server instance changed: it is not the pinned instance";
-        return response;
-      }
-      response.delivery = Delivery::ResponseReceived;
+      // The pinned instance may have run the request before it went away, so
+      // the outcome stays unknown even though this reply says it was not run.
+      response.delivery = other_instance ? Delivery::OutcomeUnknown : Delivery::ResponseReceived;
+      if (other_instance) response.message = "the server instance changed: it is not the pinned instance";
       return response;
     }
   }
