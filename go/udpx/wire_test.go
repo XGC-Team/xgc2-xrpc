@@ -166,3 +166,27 @@ func TestMethodNames(t *testing.T) {
 		}
 	}
 }
+
+// Whatever arrives on the socket, parsing must not panic and must account for
+// every byte of an accepted datagram.
+func FuzzParse(f *testing.F) {
+	for _, vector := range []string{goldenRequest, goldenReply} {
+		raw, _ := hex.DecodeString(vector)
+		f.Add(raw)
+	}
+	f.Add([]byte{})
+	f.Add(bytes.Repeat([]byte{0xff}, MaxDatagram+1))
+	f.Fuzz(func(t *testing.T, datagram []byte) {
+		m, err := parse(datagram)
+		if err != nil {
+			return
+		}
+		if headerLen+len(m.method)+len(m.body)+tagLen != len(datagram) || len(datagram) > MaxDatagram {
+			t.Fatalf("accepted a datagram of %d bytes with method %d and body %d", len(datagram), len(m.method), len(m.body))
+		}
+		_ = authentic(datagram, testKey())
+		if m.typ == typeRequest && (len(m.method) < 1 || len(m.method) > MaxMethodLen) {
+			t.Fatal("request with an out-of-range method")
+		}
+	})
+}

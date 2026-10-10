@@ -3,6 +3,7 @@ package udpx
 import (
 	"context"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -384,4 +385,38 @@ func TestDrainingServerRefusesNewRequestsButServesTheCache(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+// The receive path takes arbitrary bytes from the network: it must neither
+// panic nor execute anything for datagrams that are not authentic requests.
+func FuzzDispatch(f *testing.F) {
+	ring, err := NewKeyRing(map[uint32][]byte{1: testKey()})
+	if err != nil {
+		f.Fatal(err)
+	}
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		f.Fatal(err)
+	}
+	server, err := NewServer(conn, ServerConfig{Keys: ring, RateLimit: -1})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Cleanup(func() { server.Close() })
+	var runs atomic.Int32
+	server.Handle("test.v1/Count", func(ctx context.Context, request Request, response *Responder) {
+		runs.Add(1)
+		_ = response.Reply(nil)
+	})
+	valid := countRequest(1)
+	f.Add(appendDatagram(nil, &valid, testKey()))
+	f.Add([]byte("garbage"))
+	source := netip.MustParseAddrPort("127.0.0.1:9") // discard port: replies go nowhere
+	f.Fuzz(func(t *testing.T, datagram []byte) {
+		before := runs.Load()
+		server.dispatch(append([]byte(nil), datagram...), source)
+		if m, err := parse(datagram); (err != nil || !authentic(datagram, testKey())) && runs.Load() != before {
+			t.Fatalf("a datagram that is not an authentic request was executed: %+v", m)
+		}
+	})
 }
