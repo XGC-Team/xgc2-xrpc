@@ -56,6 +56,21 @@ settings, including the connection ceiling, share one reference across clones
 and boot generations. A small per-call response cap does not create another
 pool.
 
+Every call that does not return a value fails with a `CallError` whose
+`disposition` says what the caller may conclude; `Ok` always means the peer
+answered:
+
+| `Disposition` | Meaning |
+|---|---|
+| `NotSent` | Nothing reached the peer (rejected locally, no listener). Retrying cannot duplicate an effect. |
+| `OutcomeUnknown` | The request may have been processed but no usable answer arrived: deadline, lost connection, truncated body, answer from another instance. Mutations are never replayed. |
+| `ResponseReceived` | The peer answered with an error status, or with an answer the client refuses (larger than `response_bytes`, not JSON). `CallError::status` and `CallError::code` carry the HTTP status and the error code, taken from the standard `{"error":{"code","message"}}` envelope or implied by the status. |
+
+The error codes are `invalid_argument`, `not_found`, `conflict`,
+`resource_exhausted`, `deadline_exceeded`, `cancelled`, `unavailable`,
+`internal`, `unauthenticated` and `permission_denied`; `Fault` carries them on
+the host side and a handler may use other codes of its own.
+
 A held GET response occupies one connection, so it can coexist with a mutation
 when both the per-reference and process/host admission ceilings allow at least
 two concurrent calls. Use `Client::unix_with_limits` or

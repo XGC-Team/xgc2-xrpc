@@ -199,6 +199,8 @@ impl Fault {
         use hyper::StatusCode as S;
         match self.code {
             "invalid_argument" => S::BAD_REQUEST,
+            "unauthenticated" => S::UNAUTHORIZED,
+            "permission_denied" => S::FORBIDDEN,
             "not_found" => S::NOT_FOUND,
             "conflict" => S::CONFLICT,
             "resource_exhausted" => S::TOO_MANY_REQUESTS,
@@ -207,6 +209,23 @@ impl Fault {
             "unavailable" => S::SERVICE_UNAVAILABLE,
             _ => S::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+/// The error code a client reports for an HTTP error status that carries no
+/// standard error envelope. The inverse of `Fault::status`, widened to the
+/// statuses proxies and other SDKs produce.
+pub(crate) fn code_for_status(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_argument",
+        401 => "unauthenticated",
+        403 => "permission_denied",
+        404 => "not_found",
+        409 => "conflict",
+        413 | 429 | 431 => "resource_exhausted",
+        408 | 504 => "deadline_exceeded",
+        499 => "cancelled",
+        502 | 503 => "unavailable",
+        _ => "internal",
     }
 }
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Value, Fault>> + Send>>;
@@ -218,16 +237,30 @@ where
 {
     Arc::new(move |ctx, path, value| Box::pin(f(ctx, path, value)))
 }
+/// What the caller may conclude about a call that did not return a value.
+/// A call that returns `Ok` always means the peer answered (`ResponseReceived`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
+    /// Nothing reached the peer: the request was rejected locally or never
+    /// left this process. Retrying cannot duplicate an effect.
     NotSent,
+    /// The request may have been processed but no usable answer arrived
+    /// (timeout, lost connection, answer that failed validation).
     OutcomeUnknown,
+    /// The peer answered with an error status or an answer the client refuses
+    /// (for example one larger than `Limits::response_bytes`).
     ResponseReceived,
 }
 #[derive(Debug)]
 pub struct CallError {
     pub disposition: Disposition,
     pub message: String,
+    /// Error code of the peer's answer: the `error.code` of the standard
+    /// envelope, or the code implied by the HTTP status. `None` unless the
+    /// peer answered with an error status.
+    pub code: Option<String>,
+    /// HTTP status of the peer's error answer.
+    pub status: Option<u16>,
 }
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

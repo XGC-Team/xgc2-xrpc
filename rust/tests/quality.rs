@@ -346,6 +346,12 @@ fn clients_share_endpoint_connection_and_pool_capacity_is_finite() {
     assert!(BlockingClient::unix(&runtime, dir.path().join("other"), "boot").is_err());
     drop(first);
     drop(second);
+    // A finished call's task releases its client clone just after it replied.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.handle().stats().references != 0 {
+        assert!(Instant::now() < deadline, "session slot was not released");
+        thread::sleep(Duration::from_millis(1));
+    }
     let next = BlockingClient::unix(&runtime, dir.path().join("other"), "boot").unwrap();
     drop(next);
     host.close().unwrap();

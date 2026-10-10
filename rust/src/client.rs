@@ -310,6 +310,38 @@ fn error(disposition: Disposition, message: impl Into<String>) -> CallError {
     CallError {
         disposition,
         message: message.into(),
+        code: None,
+        status: None,
+    }
+}
+/// Failure inside one call attempt. `answer` is set once the peer replied with
+/// an HTTP error status.
+struct Failed {
+    message: String,
+    answer: Option<(u16, String)>,
+}
+impl From<String> for Failed {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            answer: None,
+        }
+    }
+}
+impl From<&str> for Failed {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+/// The peer answered with an error status. `code` is the envelope's error
+/// code when it sent one; otherwise the code implied by the status.
+fn rejected(status: u16, code: Option<String>, message: String) -> Failed {
+    Failed {
+        message,
+        answer: Some((
+            status,
+            code.unwrap_or_else(|| crate::code_for_status(status).to_owned()),
+        )),
     }
 }
 impl Client {
@@ -556,7 +588,7 @@ impl Client {
                 .try_acquire_owned()
                 .map_err(|_| error(disposition, "runtime call admission full"))?,
         };
-        let result = timeout_at(deadline, async {
+        let result: Result<Result<Value, Failed>, ()> = timeout_at(deadline, async {
             // The serializer reserves/grows only within the supplied body cap.
             let body = match value {
                 Some(value) => encode(&value, self.limits.body_bytes).map_err(|e| e.to_string())?,
@@ -665,38 +697,42 @@ impl Client {
                 return Err("response request ID mismatch".into());
             }
             let status = reply.status();
-            let bytes = bounded_body(reply.into_body(), self.limits.response_bytes)
-                .await
-                .map_err(|e| e.to_string())?;
+            let bytes = match bounded_body(reply.into_body(), self.limits.response_bytes).await {
+                Ok(bytes) => bytes,
+                Err(fault) => {
+                    // An oversize answer was received and refused; a body cut
+                    // short by the connection leaves the outcome unknown.
+                    if fault.code == "resource_exhausted" {
+                        disposition = Disposition::ResponseReceived;
+                        sent.store(2, Ordering::Release);
+                    }
+                    return Err(fault.to_string().into());
+                }
+            };
             connection.last_used = Instant::now();
-            if bytes.is_empty() && !status.is_success() {
-                disposition = Disposition::ResponseReceived;
-                sent.store(2, Ordering::Release);
-                return Err(format!("HTTP {status}"));
-            }
-            if method == Method::HEAD && bytes.is_empty() {
-                disposition = Disposition::ResponseReceived;
-                sent.store(2, Ordering::Release);
-                if !status.is_success() {
-                    return Err(format!("HTTP {status}"));
-                }
-                connection.complete = true;
-                if let Some(expires) = &connection.expires {
-                    expires.send_replace(
-                        Instant::now()
-                            + self
-                                .limits
-                                .idle_timeout
-                                .min(self.limits.client_reference_idle_timeout),
-                    );
-                }
-                return Ok(Value::Null);
-            }
-            let body: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            // The peer answered completely: whatever follows is its verdict.
             disposition = Disposition::ResponseReceived;
             sent.store(2, Ordering::Release);
+            let rejection = |code: Option<String>, message: String| {
+                rejected(status.as_u16(), code, message)
+            };
+            if bytes.is_empty() && !status.is_success() {
+                return Err(rejection(None, format!("HTTP {status}")));
+            }
+            let body = if method == Method::HEAD && bytes.is_empty() {
+                Value::Null
+            } else {
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(body) => body,
+                    Err(_) if !status.is_success() => {
+                        return Err(rejection(None, format!("HTTP {status}")))
+                    }
+                    Err(error) => return Err(format!("response is not JSON: {error}").into()),
+                }
+            };
             if !status.is_success() {
-                return Err(body.to_string());
+                let code = body["error"]["code"].as_str().map(str::to_owned);
+                return Err(rejection(code, body.to_string()));
             }
             connection.complete = true;
             if let Some(expires) = &connection.expires {
@@ -716,13 +752,18 @@ impl Client {
             failure => {
                 // The selected ConnectionCall invalidates only its incomplete
                 // framing. Capacity waiters never touch another caller's IO.
-                Err(error(
-                    disposition,
-                    match failure {
-                        Ok(Err(message)) => message,
-                        _ => "caller deadline exceeded".into(),
+                Err(match failure {
+                    Ok(Err(Failed {
+                        message,
+                        answer: Some((status, code)),
+                    })) => CallError {
+                        status: Some(status),
+                        code: Some(code),
+                        ..error(disposition, message)
                     },
-                ))
+                    Ok(Err(failed)) => error(disposition, failed.message),
+                    _ => error(disposition, "caller deadline exceeded"),
+                })
             }
         }
     }
