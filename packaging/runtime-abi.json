@@ -1,12 +1,18 @@
 {
   "schema": "xgc2.xrpc.runtime-abi.v1",
   "distributions": {
-    "focal": {"glibc_max": "2.31"},
-    "jammy": {"glibc_max": "2.35"},
-    "noble": {"glibc_max": "2.39"}
+    "bionic": {"glibc_max": "2.27", "cpp": ["udp"]},
+    "focal": {"glibc_max": "2.31", "cpp": ["unix", "diagnostics", "bootstrap", "http", "json_http", "grpc", "udp"]},
+    "jammy": {"glibc_max": "2.35", "cpp": ["unix", "diagnostics", "bootstrap", "http", "json_http", "grpc", "udp"]},
+    "noble": {"glibc_max": "2.39", "cpp": ["unix", "diagnostics", "bootstrap", "http", "json_http", "grpc", "udp"]}
   },
   "architectures": {"amd64": "Advanced Micro Devices X86-64", "arm64": "AArch64"},
-  "cpp": {"standard": 20, "gnu_min": 11, "soname": 1, "grpc_min": "1.16"},
+  "cpp": {
+    "standard": 17,
+    "gnu_min": {"udp": 7, "unix": 9, "diagnostics": 9, "bootstrap": 9, "http": 9, "json_http": 9, "grpc": 9},
+    "soname": 1,
+    "grpc_min": "1.16"
+  },
   "python": {"minimum": "3.8", "deployment_line": "3.8", "system_python_replacement": false},
   "go": {"minimum": "1.24"},
   "rust": {"minimum": "1.85"},
