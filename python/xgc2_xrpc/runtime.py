@@ -134,7 +134,7 @@ class Runtime:
 
     def session_count(self):
         with self._ownership_lock:
-            return len(self._sessions)+len(self._retiring_sessions)+len(getattr(self,"_grpc_channels",{}))+len(self._session_reservations)
+            return len(self._sessions)+len(self._retiring_sessions)+len(self._session_reservations)
 
     def reserve_session(self):
         with self._ownership_lock:

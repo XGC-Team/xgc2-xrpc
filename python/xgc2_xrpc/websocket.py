@@ -1,9 +1,10 @@
-"""Borrowed native aiohttp WebSockets and a bounded, awaited relay seam.
+"""A bounded outbound WebSocket client over native aiohttp.
 
 Equivalent handles share one Runtime-owned session/connector. Its reservation
-counts with HTTP/gRPC pools until native cleanup succeeds. A call owns one
+counts with the HTTP pools until native cleanup succeeds. A call owns one
 permit until its consumer and native cleanup actually finish. The deadline
-also closes the native response independently of consumer cancellation.
+also closes the native response independently of consumer cancellation. The
+consumer receives a borrowed socket that is valid only while it runs.
 
 Byte totals count TEXT/BINARY/PING/PONG payloads, not framing or mandatory
 close-handshake bytes. Native reader queues, parser/read buffers and headers
@@ -24,7 +25,6 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 
-from .app import DEADLINE_KEY, HOST_KEY
 from .http import Fault, Limits, TransportError
 
 _CALL = ContextVar("xrpc_websocket_call", default=None)
@@ -179,7 +179,6 @@ class _CallState:
         self.pool = self.ws = self.response = self.borrowed = None
         self.run_task = self.consumer_task = self.cleanup_task = None
         self.cleanup_error = self.timer = None
-        self.release_waiter = None  # initialized only on the owning loop for a relay
         self.pending = set()
         client.runtime.register_native_owner(self)
 
@@ -234,25 +233,6 @@ class _CallState:
             self.timer.cancel()
         self._release()
 
-    async def wait_released(self):
-        """Keep a relay's product handler alive through this call's cleanup.
-
-        A host may cancel its request repeatedly after aborting the network.
-        Those cancellations cannot release the product's domain lease before
-        the independently owned consumer/native close actually finishes.
-        """
-        self.client.runtime.require_loop()
-        if not self.released and self.release_waiter is None:
-            self.release_waiter = self.client.runtime.loop.create_future()
-        cancelled = False
-        while not self.released:
-            try:
-                await asyncio.shield(self.release_waiter)
-            except asyncio.CancelledError:
-                cancelled = True
-        if cancelled:
-            raise asyncio.CancelledError()
-
     def _release(self):
         if not self.finished or self.pending or self.cleanup_error is not None or self.released:
             return
@@ -263,16 +243,14 @@ class _CallState:
                 self.pool.calls.discard(self)
         self.client.runtime._outbound.release()
         self.client.runtime.unregister_native_owner(self)
-        if self.release_waiter is not None:
-            self.release_waiter.set_result(None)
 
 
-class BoundedWebSocket:
+class _BorrowedWebSocket:
     """Borrowed native messages: valid only inside the awaited consumer.
 
     Receives expose native WSMessage values. Ping/pong are explicit so their
-    payloads also count; the relay forwards them one hop at a time.
-    Concurrent writes are rejected rather than queued behind a slow writer.
+    payloads also count. Concurrent writes are rejected rather than queued
+    behind a slow writer.
     """
     def __init__(self, state):
         self._state, self._active = state, True
@@ -493,7 +471,7 @@ class WebSocketClient:
                 timeout=min(self.limits.shutdown_timeout, remaining), receive_timeout=None,
                 ssl=self.tls_context if self.tls_context is not None else True,
                 compress=0, autoclose=False, autoping=False, heartbeat=None, max_msg_size=call.options["max_msg_bytes"] + 1)
-            borrowed = call.borrowed = BoundedWebSocket(call)
+            borrowed = call.borrowed = _BorrowedWebSocket(call)
             call.consumer_task = call.track(self.runtime.loop.create_task(call.options["consumer"](borrowed)))
             return await asyncio.shield(call.consumer_task)
         except asyncio.CancelledError:
@@ -624,74 +602,3 @@ class WebSocketClient:
 
     def __exit__(self, *_):
         self.close()
-
-
-async def relay_websocket(request, client, path, *, timeout, headers=(), protocols=None,
-                          max_msg_bytes=None, total_send_bytes=None, total_receive_bytes=None):
-    """Await two native message-by-message pumps inside the edge request.
-
-    Headers are explicitly selected by the product owner. Subprotocols are
-    offered upstream before preparing downstream; its selected protocol is
-    then preserved. There is no reconnect, payload queue or detached relay.
-    On timeout/cancellation/failure this request still owns its domain lease
-    until this relay's consumer and native close actually finish. The Host
-    independently aborts the network at its deadline. Other client calls do
-    not participate in this wait; standalone consume_async stays bounded.
-    """
-    client.runtime.require_loop()
-    host = request.get(HOST_KEY)
-    if host is not None and host.runtime is not client.runtime:
-        raise RuntimeError("relay and native Host must share an explicit Runtime")
-    remaining = request.get(DEADLINE_KEY, time.monotonic() + timeout) - time.monotonic()
-    timeout = min(_positive(timeout, "timeout"), remaining)
-    if timeout <= 0:
-        raise TransportError("relay deadline exceeded before dispatch", "not_sent")
-    offered = []
-    for value in request.headers.getall("Sec-WebSocket-Protocol", ()):
-        offered.extend(part.strip() for part in value.split(",") if part.strip())
-    protocols = tuple(offered) if protocols is None else tuple(protocols)
-    if any(protocol not in offered for protocol in protocols):
-        raise ValueError("relay protocol must be offered by the incoming peer")
-    async def consume(upstream):
-        from .app import BoundedWebSocketResponse
-        downstream = BoundedWebSocketResponse(max_msg_size=upstream.max_msg_bytes,
-            max_receive_bytes=upstream.max_send_bytes, max_send_bytes=upstream.max_receive_bytes,
-            receive_timeout=timeout, timeout=min(timeout, client.limits.shutdown_timeout),
-            protocols=(upstream.protocol,) if upstream.protocol else (), compress=False,
-            autoping=False, autoclose=False)
-        await downstream.prepare(request)
-        async def pump(source, destination):
-            while True:
-                message = await source.receive()
-                if message.type == aiohttp.WSMsgType.TEXT:
-                    await destination.send_str(message.data)
-                elif message.type == aiohttp.WSMsgType.BINARY:
-                    await destination.send_bytes(message.data)
-                elif message.type == aiohttp.WSMsgType.PING:
-                    await destination.ping(message.data)
-                elif message.type == aiohttp.WSMsgType.PONG:
-                    await destination.pong(message.data)
-                elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
-                    reason = message.extra if isinstance(message.extra, str) else ""
-                    reason_bytes = reason.encode("utf-8") if len(reason) <= 123 else b""
-                    await destination.close(code=_close_code(message.data), message=reason_bytes if len(reason_bytes) <= 123 else b"")
-                    return
-                elif message.type == aiohttp.WSMsgType.ERROR:
-                    raise TransportError("relay peer failed", "outcome_unknown")
-        tasks = [asyncio.create_task(pump(upstream, downstream)), asyncio.create_task(pump(downstream, upstream))]
-        try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await downstream.close()
-        return downstream
-    options = client._options(path, consume, timeout, headers, protocols, max_msg_bytes, total_send_bytes, total_receive_bytes)
-    call = client._admit(options)
-    try:
-        return await client._consume_admitted_async(call)
-    finally:
-        await call.wait_released()

@@ -9,7 +9,7 @@ import time
 import unittest
 
 from aiohttp import web
-from xgc2_xrpc import Client, Fault, Host, Limits, RawClient, RawStreamResponse, Response, Runtime, TransportError
+from xgc2_xrpc import Client, Fault, Host, Limits, RawStreamResponse, Response, Runtime, TransportError
 
 
 class NativeConformanceTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class NativeConformanceTests(unittest.TestCase):
                 self.assertEqual(error.exception.disposition,"not_sent")
                 self.assertEqual(calls,[])
 
-    def test_environment_caps_native_raw_and_rpc_sync_and_async_deadlines(self):
+    def test_environment_caps_native_rpc_sync_and_async_deadlines(self):
         with tempfile.TemporaryDirectory() as directory,Runtime() as server_runtime,Runtime.from_environment({"XGC2_XRPC_CALL_TIMEOUT_MS":"50"}) as client_runtime:
             path=os.path.join(directory,"deadline.sock")
             async def reply(request):
@@ -64,54 +64,12 @@ class NativeConformanceTests(unittest.TestCase):
                 return web.Response(body=b"ok",headers={"X-Request-ID":request.headers.get("X-Request-ID","public")})
             app=web.Application()
             app.router.add_get("/slow",reply)
-            with Host.from_app(app,path=path,runtime=server_runtime),Client(path,runtime=client_runtime) as client,RawClient("http://public.test",uds=path,runtime=client_runtime) as raw:
+            with Host.from_app(app,path=path,runtime=server_runtime),Client(path,runtime=client_runtime) as client:
                 for operation in (lambda:client.call("/slow",method="GET",timeout=.3),
-                                  lambda:raw.request("/slow",timeout=.3),
-                                  lambda:client_runtime.run(client.call_async("/slow",method="GET",timeout=.3),1),
-                                  lambda:client_runtime.run(raw.request_async("/slow",timeout=.3),1)):
+                                  lambda:client_runtime.run(client.call_async("/slow",method="GET",timeout=.3),1)):
                     started=time.monotonic()
                     with self.assertRaises(TransportError): operation()
                     self.assertLess(time.monotonic()-started,.2)
-
-    def test_rpc_consumer_network_deadline_keeps_noncooperative_call_owned(self):
-        entered,release,network_closed=threading.Event(),threading.Event(),threading.Event()
-        with tempfile.TemporaryDirectory() as directory,Runtime(max_calls=1) as runtime:
-            path=os.path.join(directory,"borrowed.sock")
-            async def reply(request):
-                response=RawStreamResponse(max_bytes=16,headers={"X-Request-ID":request.headers["X-Request-ID"]})
-                await response.prepare(request)
-                await response.write(b"x")
-                try: await asyncio.Event().wait()
-                finally: network_closed.set()
-                return response
-            app=web.Application()
-            app.router.add_get("/stream",reply)
-            host=Host.from_app(app,path=path,runtime=runtime).start()
-            client=Client(path,runtime=runtime,limits=Limits(shutdown_timeout=.02))
-            borrowed=[]
-            async def consume(stream):
-                borrowed.append(stream)
-                entered.set()
-                try: await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    while not release.is_set():
-                        try: await asyncio.sleep(.005)
-                        except asyncio.CancelledError: pass
-            future=runtime.submit(client.consume_async("/stream",consume,method="GET",timeout=.05))
-            try:
-                self.assertTrue(entered.wait(1))
-                self.assertTrue(network_closed.wait(1))
-                self.assertTrue(borrowed[0]._closed)
-                self.assertFalse(runtime._outbound.acquire(blocking=False))
-                with self.assertRaises(RuntimeError): client.close()
-                self.assertTrue(client._tasks)
-            finally:
-                release.set()
-                try:
-                    with self.assertRaises(TransportError): future.result(1)
-                finally:
-                    client.close()
-                    host.close()
 
     def test_cancelled_http_blocking_work_retains_whole_call_admission(self):
         entered,release=threading.Event(),threading.Event()
@@ -168,28 +126,17 @@ class NativeConformanceTests(unittest.TestCase):
                         self.assertEqual(len(dispatched)-before,int(case["dispatch"]))
                         self.assertEqual(bytes(raw).count(b"HTTP/1.1"),1)
 
-    def test_httpx_stream_consumer_owned_lifetime_and_byte_admission(self):
+    def test_oversized_response_is_refused_as_response_received(self):
         with tempfile.TemporaryDirectory() as directory,Runtime() as runtime:
-            path=os.path.join(directory,"stream.sock")
+            path=os.path.join(directory,"capture.sock")
             payload=bytes(range(256))*128
-            borrowed=[]
             async def capture(context,value):
                 return Response(payload,content_type="application/octet-stream")
             with Host(path,{("GET","/capture"):capture},runtime=runtime),Client(path,runtime=runtime) as client:
-                async def consume(stream):
-                    borrowed.append(stream)
-                    chunks=[]
-                    async for chunk in stream.iter_raw(257):
-                        chunks.append(chunk)
-                    return b"".join(chunks)
-                self.assertEqual(client.consume("/capture",consume,method="GET"),payload)
-                async def late():
-                    with self.assertRaisesRegex(RuntimeError,"lifetime"):
-                        await borrowed[0].read()
-                asyncio.run(late())
+                self.assertEqual(client.call("/capture",method="GET").body,payload)
             with Host(path,{("GET","/capture"):capture},runtime=runtime),Client(path,runtime=runtime,limits=Limits(response_bytes=128)) as client:
                 with self.assertRaises(TransportError) as error:
-                    client.consume("/capture",consume,method="GET")
+                    client.call("/capture",method="GET")
                 self.assertEqual(error.exception.disposition,"response_received")
 
     def test_oversized_json_caller_does_not_send_and_admission_is_reusable(self):

@@ -631,7 +631,7 @@ class _OwnedHttpStream:
     """Native response cleanup and deadline outlive cancelling waiters."""
     def __init__(self,client,context,deadline):
         self.client,self.context,self.deadline=client,context,deadline
-        self.response=self.borrowed=self.task=self.timer=None
+        self.response=self.task=self.timer=None
         self.close_failure=None
         self.observed_native_close=False
 
@@ -642,8 +642,6 @@ class _OwnedHttpStream:
         return self.response
 
     def expire(self):
-        if self.borrowed is not None:
-            self.borrowed._closed=True
         self.start_close()
 
     def start_close(self):
@@ -750,8 +748,8 @@ class Client:
         return client
 
     async def _acquire_session(self):
-        # HTTP is loop-owned, gRPC sync channels may be created on other
-        # threads. Check and insert under their common capacity lock.
+        # Session capacity is shared with other native owners that may run on
+        # other threads. Check and insert under their common capacity lock.
         if self._closed:
             raise TransportError("client closed","not_sent")
         if self._key in getattr(self.runtime,"_http_poisoned",{}):
@@ -808,7 +806,7 @@ class Client:
             self.runtime.cancel_session(self._session_reservation)
             self._session_reservation=None
 
-    async def call_async(self,path,value=None,*,timeout=2.0,method="POST",request_id=None,consumer=None):
+    async def call_async(self,path,value=None,*,timeout=2.0,method="POST",request_id=None):
         self.runtime.require_loop()
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0:
             raise TransportError("finite positive timeout required","not_sent")
@@ -816,11 +814,11 @@ class Client:
         if not self.runtime._outbound.acquire(blocking=False):
             raise TransportError("runtime call admission full","not_sent")
         try:
-            return await self._call_admitted(path,value,timeout=timeout,method=method,request_id=request_id,consumer=consumer)
+            return await self._call_admitted(path,value,timeout=timeout,method=method,request_id=request_id)
         finally:
             self.runtime._outbound.release()
 
-    async def _call_admitted(self,path,value=None,*,timeout=2.0,method="POST",request_id=None,state=None,consumer=None):
+    async def _call_admitted(self,path,value=None,*,timeout=2.0,method="POST",request_id=None,state=None):
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0:
             raise TransportError("finite positive timeout required","not_sent")
         timeout=min(timeout,self.limits.call_timeout)
@@ -895,14 +893,7 @@ class Client:
                     length=response.headers.get("Content-Length")
                     if length is not None and int(length)>self.limits.response_bytes:
                         raise TransportError("response exceeds limit","response_received")
-                    if consumer is not None and response.status_code<400:
-                        incoming=IncomingStream(response,self.limits.response_bytes,owner=owned)
-                        owned.borrowed=incoming
-                        try:
-                            return await consumer(incoming)
-                        finally:
-                            incoming._closed=True
-                    data=await IncomingStream(response,self.limits.response_bytes,owner=owned).read()
+                    data=await _read_body(response,self.limits.response_bytes,owned)
                     if response.status_code>=400:
                         fault=_json(data).get("error",{})
                         raise Fault(fault.get("code","internal"),fault.get("message","RPC failed"),response.status_code)
@@ -965,17 +956,6 @@ class Client:
     def json(self,path,value=None,**kwargs):
         return _json(self.call(path,value,**kwargs).body)
 
-    async def consume_async(self,path,consumer,value=None,**kwargs):
-        """Consume a native HTTPX raw response inside the call's owned lifetime."""
-        if not inspect.iscoroutinefunction(consumer):
-            raise TypeError("stream consumer must be async")
-        return await self.call_async(path,value,consumer=consumer,**kwargs)
-
-    def consume(self,path,consumer,value=None,**kwargs):
-        if not inspect.iscoroutinefunction(consumer):
-            raise TypeError("stream consumer must be async")
-        return self.call(path,value,consumer=consumer,**kwargs)
-
     async def close_async(self):
         self.runtime.require_loop()
         self._closed=True
@@ -1017,47 +997,19 @@ class Client:
         self.close()
 
 
-class IncomingStream:
-    """Native HTTPX response borrowed only during Client.consume[_async]."""
-    def __init__(self,response,max_bytes,*,owner=None):
-        self._response=response
-        self._maximum=max_bytes
-        self._bytes=0
-        self._closed=False
-        self._owner=owner
-        self.status=response.status_code
-        self.headers=response.headers
-        self.content_type=response.headers.get("Content-Type","")
-
-    async def iter_raw(self,chunk_size=65536):
-        if self._closed:
-            raise RuntimeError("stream lifetime ended")
-        if type(chunk_size) is not int or chunk_size<=0:
-            raise ValueError("positive chunk size required")
-        maximum=min(chunk_size,self._maximum+1)
-        try:
-            # Native arrivals are yielded immediately. chunk_size bounds each
-            # emitted chunk; it must never become a target to buffer toward.
-            async for chunk in self._response.aiter_raw():
-                if self._closed:
-                    raise RuntimeError("stream lifetime ended")
-                self._bytes+=len(chunk)
-                if self._bytes>self._maximum:
-                    raise TransportError("response exceeds limit","response_received")
-                for offset in range(0,len(chunk),maximum):
-                    if self._closed:
-                        raise RuntimeError("stream lifetime ended")
-                    yield chunk if len(chunk)<=maximum else chunk[offset:offset+maximum]
-        except (OSError,httpx.HTTPError) as error:
-            if self._owner is not None and self._owner.task is None and not self._owner.observed_native_close and self._response.is_closed:
-                self._owner.native_failure(error)
-            raise
-        else:
-            if self._owner is not None and self._response.is_closed:
-                self._owner.observed_native_close=True
-
-    async def read(self):
-        output=bytearray()
-        async for chunk in self.iter_raw():
+async def _read_body(response,maximum,owner):
+    """Read a native HTTPX response under a total byte cap, keeping native cleanup observable."""
+    output=bytearray()
+    try:
+        # Native arrivals are consumed as they come; the cap is checked on every chunk.
+        async for chunk in response.aiter_raw():
+            if len(output)+len(chunk)>maximum:
+                raise TransportError("response exceeds limit","response_received")
             output.extend(chunk)
-        return bytes(output)
+    except (OSError,httpx.HTTPError) as error:
+        if owner.task is None and not owner.observed_native_close and response.is_closed:
+            owner.native_failure(error)
+        raise
+    if response.is_closed:
+        owner.observed_native_close=True
+    return bytes(output)

@@ -70,7 +70,7 @@ def probe(calls=1000,concurrency=8):
             "maintained":maintained,"after":sample(),
             "limitations":["Loopback load only; no throughput guarantee or universal RSS ceiling",
                            "RSS includes caller load threads, tracing and Python/native allocator retention",
-                           "TLS client and grpc profiles have separate native preadmission bounds"]}
+                           "TLS clients have separate native preadmission bounds"]}
 
 
 if __name__=="__main__":
