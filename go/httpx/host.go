@@ -185,6 +185,7 @@ type Host struct {
 	listener *netlimit.Listener
 	lease    *unixlease.Lease
 	once     sync.Once
+	draining chan struct{} // closed when Shutdown begins; event streams end on it
 	done     chan struct{}
 	err      error
 	mu       sync.Mutex
@@ -272,7 +273,7 @@ func ServeEdge(listener net.Listener, handler http.Handler, options HostOptions)
 func serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, options HostOptions) (*Host, error) {
 	options = options.defaults()
 	limited := netlimit.New(listener, options.MaxConnections)
-	host := &Host{listener: limited, lease: lease, done: make(chan struct{}), stopped: make(chan struct{}), drained: make(chan struct{}), options: options}
+	host := &Host{listener: limited, lease: lease, draining: make(chan struct{}), done: make(chan struct{}), stopped: make(chan struct{}), drained: make(chan struct{}), options: options}
 	tracked := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host.mu.Lock()
 		if host.stopping {
@@ -283,7 +284,7 @@ func serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 		host.handlers.Add(1)
 		host.mu.Unlock()
 		defer host.handlers.Done()
-		handler.ServeHTTP(w, r)
+		handler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), drainKey{}, (<-chan struct{})(host.draining))))
 	})
 	host.server = &http.Server{Handler: tracked, ReadHeaderTimeout: options.HeaderTimeout, IdleTimeout: options.IdleTimeout, WriteTimeout: options.WriteTimeout, MaxHeaderBytes: options.MaxHeaderBytes, TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}}
 	go func() {
@@ -319,6 +320,7 @@ func (h *Host) Shutdown(ctx context.Context) error {
 		h.mu.Lock()
 		h.stopping = true
 		h.mu.Unlock()
+		close(h.draining)
 		go func() {
 			h.stopErr = h.server.Shutdown(ctx)
 			if h.stopErr != nil {
