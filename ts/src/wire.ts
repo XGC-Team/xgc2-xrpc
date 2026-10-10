@@ -51,6 +51,11 @@ export function parseUrl(value: string | URL, what: string): URL {
   return url;
 }
 
+/** Whether `value` can travel as an HTTP header value. */
+export function isHeaderValue(value: unknown): value is string {
+  return typeof value === "string" && HEADER_VALUE.test(value);
+}
+
 /**
  * Validate caller headers. Names the protocol owns are rejected so a caller
  * cannot break request correlation, the deadline or framing.
@@ -63,7 +68,7 @@ export function checkHeaders(
   const seen = new Set<string>();
   for (const [name, value] of Object.entries(headers ?? {})) {
     const lower = name.toLowerCase();
-    if (!HEADER_NAME.test(name) || typeof value !== "string" || !HEADER_VALUE.test(value)) {
+    if (!HEADER_NAME.test(name) || !isHeaderValue(value)) {
       throw new XrpcError("invalid_argument", `invalid header ${JSON.stringify(name)}`, "not_sent");
     }
     if (seen.has(lower)) {

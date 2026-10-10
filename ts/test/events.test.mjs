@@ -563,3 +563,26 @@ test("caller headers are sent and protocol headers are refused", async () => {
     await server.close();
   }
 });
+
+test("a cursor that cannot be a header value is refused instead of crashing", async () => {
+  const server = await serve((_req, res, record) => {
+    if (record.index === 0) {
+      const out = stream(res);
+      out.write(frame({ id: "\u20ac1", data: "euro" }));
+      out.end();
+    } else {
+      stream(res);
+    }
+  });
+  try {
+    await assert.rejects(
+      events(`${server.url}/`, { backoff: FAST, onEvent: () => {} }),
+      (error) => error instanceof XrpcError && error.code === "invalid_argument",
+    );
+    await assert.rejects(events(`${server.url}/`, { after: "bad\nvalue", onEvent: () => {} }), (error) => error.code === "invalid_argument");
+    await assert.rejects(events(`${server.url}/`, { after: 7, onEvent: () => {} }), (error) => error.code === "invalid_argument");
+    assert.equal(server.requests.length, 1, "only the first connection was made");
+  } finally {
+    await server.close();
+  }
+});

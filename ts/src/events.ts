@@ -1,6 +1,6 @@
 import { XrpcError, errorFromAnswer } from "./errors.js";
 import { SseParser, type SseFrame } from "./sse.js";
-import { DEFAULT_MAX_BYTES, checkHeaders, parseUrl, positiveInteger, sleep } from "./wire.js";
+import { DEFAULT_MAX_BYTES, checkHeaders, isHeaderValue, parseUrl, positiveInteger, sleep } from "./wire.js";
 
 /** One event of the stream. */
 export interface StreamEvent {
@@ -99,6 +99,9 @@ export async function events(url: string | URL, options: EventsOptions): Promise
     throw new XrpcError("invalid_argument", "onEvent is required", "not_sent");
   }
   const { signal } = options;
+  if (options.after !== undefined && !isHeaderValue(options.after)) {
+    throw new XrpcError("invalid_argument", "after must be a string usable as a Last-Event-ID header value", "not_sent");
+  }
   let cursor = options.after === "" ? undefined : options.after;
   let failures = 0;
 
@@ -169,7 +172,13 @@ async function attempt(
   try {
     const headers = new Headers(extra);
     headers.set("Accept", "text/event-stream");
-    if (cursor.value !== undefined) headers.set("Last-Event-ID", cursor.value);
+    if (cursor.value !== undefined) {
+      // A server may send ids a header cannot carry; resuming is then impossible.
+      if (!isHeaderValue(cursor.value)) {
+        throw new XrpcError("invalid_argument", "the stream cursor cannot be sent as a Last-Event-ID header", "not_sent");
+      }
+      headers.set("Last-Event-ID", cursor.value);
+    }
     arm();
     let response: Response;
     try {
