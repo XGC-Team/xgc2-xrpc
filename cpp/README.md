@@ -69,7 +69,7 @@ options.bind_address = "0.0.0.0";           // or "::" for IPv6 and IPv4 senders
 options.port = 19520;
 options.instance = domain_instance_id;      // optional: reuse the domain's 128-bit identity
 Server server(options, keys);
-server.add_method("xgc2.chassis.hold.v2/Engage", [&](Request request, Reply reply) {
+server.add_method("xgc2.chassis.hold/Engage", [&](Request request, Reply reply) {
   // request.body is the JSON text. Hand slow work to another thread and complete the
   // Reply from there before request.deadline; this thread is the I/O thread.
   tick_queue.push([reply = std::move(reply)]() mutable { reply.complete(Status::Ok, "{\"held\":true}"); });
@@ -80,7 +80,7 @@ server.shutdown(std::chrono::milliseconds(500));      // stop admitting, drain, 
 
 // Client: blocking, stateless, safe from any number of threads.
 Client client(keys);
-const Response response = client.call("192.168.1.20:19520", /*key_id=*/7, "xgc2.chassis.hold.v2/Engage",
+const Response response = client.call("192.168.1.20:19520", /*key_id=*/7, "xgc2.chassis.hold/Engage",
     "{}", std::chrono::steady_clock::now() + std::chrono::seconds(2), expected_instance /* optional pin */);
 switch (response.delivery) {
 case Delivery::ResponseReceived: /* response.status, response.body, response.instance */ break;

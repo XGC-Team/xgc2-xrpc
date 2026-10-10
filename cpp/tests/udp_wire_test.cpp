@@ -208,12 +208,12 @@ void round_trips() {
   for (const std::uint32_t key_id : {0u, 1u, 0x01020304u, 0xffffffffu})
     for (const auto &expected : {std::optional<InstanceId>{}, std::optional<InstanceId>{pin}})
       for (const std::uint32_t timeout : {1u, 2u, 60000u}) {
-        const auto bytes = encode_request(key, key_id, id, expected, timeout, "xgc2.chassis.hold.v2/Engage", "{}");
+        const auto bytes = encode_request(key, key_id, id, expected, timeout, "xgc2.chassis.hold/Engage", "{}");
         assert(parse(bytes.data(), bytes.size(), d) == Parse::Ok && verify(d, key));
         assert(d.key_id == key_id && d.word == timeout && d.request_id == id);
         assert((d.flags & flag_expected_instance) == (expected ? 1u : 0u));
         assert(d.instance == (expected ? *expected : InstanceId{}));
-        assert(d.method == "xgc2.chassis.hold.v2/Engage" && d.body == "{}");
+        assert(d.method == "xgc2.chassis.hold/Engage" && d.body == "{}");
       }
   // The largest datagram: a 128-byte method and a body that fills 1200 bytes.
   const std::string method(max_method_bytes, 'm'), body(max_body_bytes(method.size()), 'b');

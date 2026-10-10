@@ -622,7 +622,7 @@ void client_input_validation() {
   expect_not_sent(call(good, 7, "test/Echo", now - seconds(1)), Status::DeadlineExceeded);
   assert(env.server->stats().received == 0);
   assert(env.call(std::string(128, 'm'), "{}").status == Status::NotFound); // the longest method
-  assert(env.call("xgc2.chassis.hold.v2/\xc3\xa9\xe2\x82\xac", "{}").status == Status::NotFound); // UTF-8 is fine
+  assert(env.call("xgc2.chassis.hold/\xc3\xa9\xe2\x82\xac", "{}").status == Status::NotFound); // UTF-8 is fine
   ClientOptions bad;
   bad.steady_interval = milliseconds(0);
   throws<std::invalid_argument>([&] { Client client(keys(), bad); });

@@ -94,7 +94,7 @@ fn invalid_local_references_fail_before_shared_session_admission() {
         ("instance_id", "bad instance"),
         ("instance_id", "é"),
         ("profile", "grpc.v1"),
-        ("profile", "http.v2"),
+        ("profile", "http.v9"),
     ] {
         let mut invalid = serde_json::to_value(&base).unwrap();
         invalid[field] = json!(value);

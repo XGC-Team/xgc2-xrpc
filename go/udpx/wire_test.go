@@ -155,7 +155,7 @@ func TestStatusNames(t *testing.T) {
 }
 
 func TestMethodNames(t *testing.T) {
-	for _, ok := range []string{"a", "xgc2.chassis.hold.v2/Engage", "test.v1/Echo", "é/ü", strings.Repeat("m", MaxMethodLen)} {
+	for _, ok := range []string{"a", "xgc2.chassis.hold/Engage", "test.v1/Echo", "é/ü", strings.Repeat("m", MaxMethodLen)} {
 		if !validMethod(ok) {
 			t.Errorf("%q rejected", ok)
 		}

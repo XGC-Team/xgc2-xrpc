@@ -9,7 +9,7 @@ import (
 )
 
 func ref(profile, kind, address string) xrpc.ServiceRef {
-	return xrpc.ServiceRef{TargetID: "robot-1", Service: "xgc2.chassis.hold.v2", APIVersion: "v2", Profile: profile, Endpoint: xrpc.Endpoint{Kind: kind, Address: address}}
+	return xrpc.ServiceRef{TargetID: "robot-1", Service: "xgc2.chassis.hold", APIVersion: "v1", Profile: profile, Endpoint: xrpc.Endpoint{Kind: kind, Address: address}}
 }
 
 func TestServiceRefProfileAndEndpointPairs(t *testing.T) {
@@ -40,7 +40,7 @@ func TestServiceRefProfileAndEndpointPairs(t *testing.T) {
 		"grpc udp":          ref(xrpc.GRPC, "udp", "10.0.0.1:1"),
 		"udp unix":          ref(xrpc.UDP, "unix", "/run/a.sock"),
 		"udp tls":           ref(xrpc.UDP, "tls", "10.0.0.1:1"),
-		"unknown profile":   ref("udp.v2", "udp", "10.0.0.1:1"),
+		"unknown profile":   ref("udp.v9", "udp", "10.0.0.1:1"),
 		"udp no port":       ref(xrpc.UDP, "udp", "192.168.1.20"),
 		"udp no host":       ref(xrpc.UDP, "udp", ":19520"),
 		"udp port zero":     ref(xrpc.UDP, "udp", "10.0.0.1:0"),
@@ -88,7 +88,7 @@ func TestServiceRefKeyIdentityJSON(t *testing.T) {
 	}
 	// Other languages publish key_id as a JSON number and may omit it.
 	var foreign xrpc.ServiceRef
-	document := `{"target_id":"robot-1","service":"xgc2.chassis.hold.v2","api_version":"v2","instance_id":"","profile":"udp.v1","endpoint":{"kind":"udp","address":"[::1]:19520"}}`
+	document := `{"target_id":"robot-1","service":"xgc2.chassis.hold","api_version":"v1","instance_id":"","profile":"udp.v1","endpoint":{"kind":"udp","address":"[::1]:19520"}}`
 	if err := json.Unmarshal([]byte(document), &foreign); err != nil || foreign.KeyID != 0 || foreign.Validate() != nil {
 		t.Fatalf("foreign=%+v err=%v", foreign, err)
 	}
