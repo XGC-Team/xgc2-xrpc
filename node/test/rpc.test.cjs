@@ -9,7 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
 const { execFileSync } = require("node:child_process");
-const { HTTPClient, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, createHTTPHost } = require("..");
+const { HTTPClient, TransportError, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, createHTTPHost } = require("..");
 const corpus = require("../../contracts/fixtures/wire.json");
 const bootstraps = require("../../contracts/fixtures/bootstrap.json");
 const boot = corpus.instance_id;
@@ -281,4 +281,38 @@ test("common bootstrap resolves native TLS/auth grants once and gates domain dis
     assert.equal((await client.call(ref(address),"/v1/echo",{timeoutMs:1000,headers:authorization.headers})).status,200);
     assert.equal(dispatch,1); assert.equal(resolved.length,3);
   } finally { client.close(); await host.close(); }
+});
+test("every call outcome carries one of the three dispositions", async () => {
+  const fixture = await httpsHost((req, res) => {
+    if (req.url === "/status") {
+      res.statusCode = 503;
+      res.setHeader("Content-Type", "application/json");
+      res.end('{"error":{"code":"unavailable","message":"draining"}}');
+    } else if (req.url === "/big") res.end(Buffer.alloc(100));
+    else if (req.url === "/lost") res.socket.destroy();
+    else res.end('{"ok":true}');
+  });
+  const client = new HTTPClient({ localTarget: "local", tls: { ca: cert }, maxResponseBytes: 64 });
+  const options = { timeoutMs: 1000 };
+  try {
+    const ok = await client.call(ref(fixture.address), "/ok", options);
+    assert.equal(ok.disposition, "response_received");
+    assert.equal(ok.status, 200);
+    // An error status is an answer: the caller interprets it, the transport did not fail.
+    const refused = await client.call(ref(fixture.address), "/status", options);
+    assert.equal(refused.disposition, "response_received");
+    assert.equal(refused.status, 503);
+    const streamed = await client.stream(ref(fixture.address), "/ok", options);
+    assert.equal(streamed.disposition, "response_received");
+    streamed.close();
+    // The peer answered and the client refuses the answer.
+    await assert.rejects(client.call(ref(fixture.address), "/big", options), (e) => e instanceof TransportError && e.code === "resource_exhausted" && e.disposition === "response_received");
+    // The request may have run; no usable answer arrived.
+    await assert.rejects(client.call(ref(fixture.address), "/lost", { ...options, method: "POST", json: {} }), (e) => e.disposition === "outcome_unknown");
+    await assert.rejects(client.call(ref(fixture.address, "stale"), "/ok", options), (e) => e.code === "conflict" && e.disposition === "outcome_unknown");
+    // Nothing was sent.
+    await assert.rejects(client.call(ref(fixture.address), "/ok", { ...options, requestId: "not valid" }), (e) => e.code === "invalid_argument" && e.disposition === "not_sent");
+    await assert.rejects(client.call(ref(fixture.address), "/ok", { ...options, signal: AbortSignal.abort() }), (e) => e.code === "cancelled" && e.disposition === "not_sent");
+  } finally { client.close(); await fixture.close(); }
+  assert.throws(() => new TransportError("internal", "maybe", "unclassified"), /disposition/);
 });

@@ -116,15 +116,18 @@ export interface ServiceRef {
   target_id: string; service: string; api_version: string; instance_id: string;
   profile: "http.v1" | "grpc.v1"; endpoint: { kind: "unix" | "https" | "tls"; address: string };
 }
+export type Disposition = "not_sent" | "outcome_unknown" | "response_received";
+/** A call that produced no answer. `code` is one of the shared XRPC error codes. */
 export class TransportError extends Error {
   code: string;
-  disposition: "not_sent" | "outcome_unknown";
+  /** `not_sent`: nothing reached the peer. `outcome_unknown`: it may have run, no usable answer. `response_received`: the peer answered and the client refused the answer (for example one over the size limit). */
+  disposition: Disposition;
 }
 export interface CallOptions {
   timeoutMs: number; requestId?: string; method?: string; signal?: AbortSignal;
   headers?: Record<string, string>; body?: string | Uint8Array; json?: unknown;
 }
-/** Plain limits; defaults in parentheses. */
+/** Plain limits; defaults in parentheses. A returned answer always has `disposition: "response_received"`; HTTP error statuses are answers, not failures. */
 export class HTTPClient {
   constructor(options?: {
     diagnostics?: Diagnostics; localTarget?: string; tls?: ClientTLSOptions;
@@ -145,8 +148,8 @@ export class HTTPClient {
     /** Idle time before an unused reference is released, ms (30000). */
     referenceIdleTimeoutMs?: number;
   });
-  call(ref: ServiceRef, path: string, options: CallOptions): Promise<{ status: number; headers: import("node:http").IncomingHttpHeaders; body: Buffer; requestId: string }>;
-  stream(ref: ServiceRef, path: string, options: CallOptions): Promise<{ status: number; headers: import("node:http").IncomingHttpHeaders; body: import("node:stream").Readable; requestId: string; close(): void }>;
+  call(ref: ServiceRef, path: string, options: CallOptions): Promise<{ disposition: "response_received"; status: number; headers: import("node:http").IncomingHttpHeaders; body: Buffer; requestId: string }>;
+  stream(ref: ServiceRef, path: string, options: CallOptions): Promise<{ disposition: "response_received"; status: number; headers: import("node:http").IncomingHttpHeaders; body: import("node:stream").Readable; requestId: string; close(): void }>;
   close(): void;
   stats(): { references: number; inFlight: number; closed: boolean };
 }

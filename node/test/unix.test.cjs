@@ -44,6 +44,7 @@ test("a Unix host serves fenced RPC calls on a 0600 socket and removes it on clo
       assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
       const reply = await client.call(ref(socket), "/v1/echo", { timeoutMs: 1000, requestId: "unix:1" });
       assert.equal(reply.status, 200);
+      assert.equal(reply.disposition, "response_received");
       assert.equal(JSON.parse(reply.body).requestId, "unix:1");
       await assert.rejects(client.call(ref(socket, "stale"), "/v1/echo", { timeoutMs: 1000 }), (e) => e.code === "conflict" && e.disposition === "outcome_unknown");
       assert.equal(host.stats().inFlight, 0);
