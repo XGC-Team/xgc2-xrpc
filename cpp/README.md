@@ -169,8 +169,13 @@ thread: they must not block, and must not call `shutdown` or destroy the server.
 
 ### Interop server and tests
 
-`xgc2-xrpc-udp-interop-server` (built with the tests, from `tests/udp_interop_server.cpp`)
-is the peer of the cross-language tests:
+`xgc2-xrpc-udp-interop-server` (from `tests/udp_interop_server.cpp`, built when tests are
+enabled, which is the default) is the peer of the cross-language tests:
+
+```sh
+cmake -S . -B build -DXGC2_XRPC_COMPONENTS=udp
+cmake --build build --target xgc2-xrpc-udp-interop-server      # build/cpp/xgc2-xrpc-udp-interop-server
+```
 
 ```
 xgc2-xrpc-udp-interop-server --bind <address> --port <port|0> --key-file <path> --key-id <id>
