@@ -940,8 +940,8 @@ void shutdown_is_refused_inside_a_handler() {
     } catch (const std::logic_error &) {
       refused = true;
     }
-    reply.complete(Status::Ok, "{}");
     ran = true;
+    reply.complete(Status::Ok, "{}");
   });
   inner.start();
   Client client(keys());
