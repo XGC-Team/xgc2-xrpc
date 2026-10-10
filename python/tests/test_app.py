@@ -1,5 +1,6 @@
 import asyncio
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -52,13 +53,27 @@ class AppTests(unittest.TestCase):
         router.add_post("/upload",upload)
         async def check():
             async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=self.path)) as client:
-                async with client.post("http://local/upload",data=b"x"*9) as response:
-                    self.assertEqual(response.status,413)
-                    await response.read()
+                # A declared length over the limit is refused from the head alone. The
+                # body is never written, so the 413 cannot race the connection close.
+                with socket.socket(socket.AF_UNIX) as peer:
+                    peer.settimeout(2)
+                    peer.connect(self.path)
+                    peer.sendall(b"POST /upload HTTP/1.1\r\nHost: local\r\nContent-Length: 9\r\n\r\n")
+                    self.assertTrue(peer.recv(4096).startswith(b"HTTP/1.1 413"))
                 self.assertEqual(calls,[])
-                async with client.post("http://local/upload",data=b"x"*8) as response:
-                    self.assertEqual(response.status,200)
-                    self.assertEqual(await response.read(),b"ok")
+                # A client that does send the 9 bytes sees the 413 or, if the host closes
+                # first, a broken connection; the handler never runs either way.
+                try:
+                    async with client.post("http://local/upload",data=b"x"*9) as response:
+                        self.assertEqual(response.status,413)
+                        await response.read()
+                except aiohttp.ClientConnectionError:
+                    pass
+                self.assertEqual(calls,[])
+                async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=self.path)) as fresh:
+                    async with fresh.post("http://local/upload",data=b"x"*8) as response:
+                        self.assertEqual(response.status,200)
+                        self.assertEqual(await response.read(),b"ok")
         with Host.from_app(router,path=self.path,runtime=self.runtime,limits=Limits(body_bytes=8)):
             asyncio.run(check())
         self.assertEqual(calls,[b"x"*8])
@@ -113,8 +128,13 @@ class AppTests(unittest.TestCase):
                 async with client.post("http://local/raw",data=pieces(b"a\x00b\r\nc")) as response:
                     self.assertEqual(response.status,200)
                     self.assertEqual(await response.read(),b"a\x00b\r\nc")
-                async with client.post("http://local/raw",data=pieces(b"x"*9)) as response:
-                    self.assertEqual(response.status,413)
+                # The limit trips while the chunked body is still being sent: the client
+                # sees the 413 or, if the host closes first, a broken connection.
+                try:
+                    async with client.post("http://local/raw",data=pieces(b"x"*9)) as response:
+                        self.assertEqual(response.status,413)
+                except aiohttp.ClientConnectionError:
+                    pass
         with Host.from_app(router,path=self.path,runtime=self.runtime,limits=Limits(body_bytes=8)):
             asyncio.run(check())
 
