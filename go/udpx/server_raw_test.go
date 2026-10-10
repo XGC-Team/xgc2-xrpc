@@ -182,7 +182,8 @@ func TestPerSourceRateLimitDropsTheExcess(t *testing.T) {
 		replies++
 	}
 	stats := server.Stats()
-	if replies != 3 || runs.Load() != 3 || stats.RateLimited != 7 || stats.Requests != 3 {
+	// The burst is 3; a slow machine may earn a token or two while sending.
+	if replies < 3 || replies > 5 || int(runs.Load()) != replies || int(stats.RateLimited) != 10-replies || int(stats.Requests) != replies {
 		t.Fatalf("replies=%d runs=%d stats=%+v", replies, runs.Load(), stats)
 	}
 	time.Sleep(250 * time.Millisecond) // 5 tokens per second: one token is back

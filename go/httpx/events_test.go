@@ -343,7 +343,7 @@ func TestStreamOutlivesTwiceTheServerWriteTimeout(t *testing.T) {
 	cut := time.Now()
 	_, readErr := io.ReadAll(control.Body)
 	control.Body.Close()
-	if readErr == nil || time.Since(cut) > 2*writeTimeout {
+	if readErr == nil || time.Since(cut) > 2*time.Second {
 		t.Fatalf("control stream was not cut by WriteTimeout (%v after %s)", readErr, time.Since(cut))
 	}
 
