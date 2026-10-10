@@ -1,8 +1,8 @@
 {
   "name": "@xgc2/xrpc",
   "version": "0.1.0",
-  "description": "Bounded HTTP RPC clients and HTTP/WebSocket hosts for XGC2 service edges",
-  "license": "MIT",
+  "description": "Bounded HTTP RPC clients and HTTP, Unix-socket and WebSocket hosts for XGC2 service edges",
+  "license": "Apache-2.0",
   "main": "index.cjs",
   "types": "index.d.cts",
   "exports": "./index.cjs",
