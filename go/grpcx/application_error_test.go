@@ -49,7 +49,7 @@ func TestApplicationErrorVersusCommittedResponseReceiveLimit(t *testing.T) {
 			}
 			return interceptor(ctx, input, &grpc.UnaryServerInfo{Server: server, FullMethod: "/fixture.Representation/Echo"}, handler)
 		}}}}, struct{}{})
-	}, HostOptions{InstanceID: "boot", MaxResponseBytes: 1024}, BoundService("boot", time.Second, 4)...)
+	}, HostOptions{InstanceID: "boot", MaxResponseBytes: 1024, MaxCallTime: time.Second, MaxInFlight: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

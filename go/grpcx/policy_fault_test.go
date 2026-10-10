@@ -101,7 +101,7 @@ func TestSetupSocketBudgetIncludesTLSAndHTTP2Preface(t *testing.T) {
 	}
 }
 
-func TestSuccessfulConnectionOutlivesFirstCallerAndPolicyOverridesNativeOptions(t *testing.T) {
+func TestSuccessfulConnectionOutlivesFirstCallerAndHostLimitsOverrideNativeOptions(t *testing.T) {
 	lease, err := unixlease.Reserve(context.Background(), filepath.Join(privateTempDir(t), "rpc.sock"), unixlease.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -110,14 +110,7 @@ func TestSuccessfulConnectionOutlivesFirstCallerAndPolicyOverridesNativeOptions(
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Defaults: map[string]string{"MAX_REQUEST_BYTES": "32", "MAX_RESPONSE_BYTES": "32"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	limits, err := (HostOptions{InstanceID: "boot"}).WithPolicy(policy)
-	if err != nil {
-		t.Fatal(err)
-	}
+	limits := HostOptions{InstanceID: "boot", MaxRequestBytes: 32, MaxResponseBytes: 32}
 	host, err := ServeWithOptions(listener, lease, func(r grpc.ServiceRegistrar) { healthpb.RegisterHealthServer(r, health.NewServer()) }, limits, grpc.MaxRecvMsgSize(1<<20))
 	if err != nil {
 		t.Fatal(err)
@@ -167,11 +160,11 @@ func TestKnownNotSentSurvivesProfileMapping(t *testing.T) {
 func TestMetadataCannotDuplicateWireIdentity(t *testing.T) {
 	ref := xrpc.ServiceRef{InstanceID: "boot"}
 	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(RequestIDMetadata, "a", RequestIDMetadata, "b"))
-	if _, err := clientMetadata(ctx, ref, nil, false); xrpc.Code(err) != "invalid_argument" {
+	if _, err := clientMetadata(ctx, ref, nil); xrpc.Code(err) != "invalid_argument" {
 		t.Fatal("duplicate request identity", err)
 	}
 	ctx = metadata.NewOutgoingContext(context.Background(), metadata.Pairs(InstanceIDMetadata, "other"))
-	if _, err := clientMetadata(ctx, ref, nil, false); xrpc.Code(err) != "invalid_argument" {
+	if _, err := clientMetadata(ctx, ref, nil); xrpc.Code(err) != "invalid_argument" {
 		t.Fatal("instance override", err)
 	}
 	if err := validateAuthMetadata(metadata.Pairs(RequestIDMetadata, "owned")); err == nil {

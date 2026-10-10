@@ -95,27 +95,9 @@ func TestCallWithHeadersRejectsDifferentCompleteReferenceBeforeEffect(t *testing
 	}
 }
 
-func TestRuntimePolicyRequestAdmissionAndSeparateResponseBound(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Defaults: map[string]string{"MAX_REQUEST_BYTES": "4", "MAX_RESPONSE_BYTES": "8", "HOST_MAX_IN_FLIGHT": "1"}, Environment: []string{"XGC2_XRPC_HOST_MAX_CONNECTIONS=3"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	options, err := (HostOptions{}).WithPolicy(policy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if options.MaxBodyBytes != 4 || options.MaxResponseBytes != 8 || options.MaxConnections != 3 || options.MaxInFlight != 1 {
-		t.Fatalf("host mapping=%+v", options)
-	}
-	if _, err = (HostOptions{MaxBodyBytes: 9}).WithPolicy(policy); err == nil {
-		t.Fatal("conflicting option accepted")
-	}
+func TestClientRequestAdmissionAndSeparateResponseBound(t *testing.T) {
 	client, calls := fixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("0123456789")) }), 4)
-	config, err := (Config{LocalTargetID: "local", Service: client.config.Service}).WithPolicy(policy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bounded, err := New(config)
+	bounded, err := New(Config{LocalTargetID: "local", Service: client.config.Service, MaxRequestBytes: 4, MaxResponseBytes: 8})
 	if err != nil {
 		t.Fatal(err)
 	}

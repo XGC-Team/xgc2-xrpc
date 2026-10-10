@@ -1,7 +1,6 @@
 package xrpc
 
 import (
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -36,7 +35,7 @@ func TestSharedBootstrapCorpus(t *testing.T) {
 	}
 	for _, test := range corpus.Cases {
 		t.Run(test.Name, func(t *testing.T) {
-			_, err := ParseBootstrapBinding(test.Binding)
+			_, err := parseBootstrapBinding(test.Binding)
 			if (err == nil) != test.Valid {
 				t.Fatalf("valid=%v err=%v", test.Valid, err)
 			}
@@ -48,7 +47,7 @@ func localBinding() BootstrapBinding {
 }
 func TestBootstrapStrictIdentityAndRequiredFields(t *testing.T) {
 	data, _ := json.Marshal(localBinding())
-	if _, err := ParseBootstrapBinding(data); err != nil {
+	if _, err := parseBootstrapBinding(data); err != nil {
 		t.Fatal(err)
 	}
 	bad := []string{strings.Replace(string(data), `"schema_version":1`, `"schema_version":1,"schema_version":1`, 1), strings.Replace(string(data), `"secret_handles":{}`, `"secret_handles":null`, 1), strings.Replace(string(data), `"storage_grants":[]`, `"storage_grants":null`, 1), string(data) + ` {}`,
@@ -58,7 +57,7 @@ func TestBootstrapStrictIdentityAndRequiredFields(t *testing.T) {
 		strings.Replace(string(data), `"secret_handles":{}`, `"secret_handles":{"Authorization":"caller"}`, 1),
 		strings.Repeat(" ", MaxBootstrapBytes) + string(data)}
 	for _, value := range bad {
-		if _, err := ParseBootstrapBinding([]byte(value)); err == nil {
+		if _, err := parseBootstrapBinding([]byte(value)); err == nil {
 			t.Fatal("malformed input accepted")
 		}
 	}
@@ -97,32 +96,32 @@ func TestPrivateBootstrapFilesRejectWithoutBlocking(t *testing.T) {
 	if err := os.WriteFile(path, []byte("1234"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := ReadPrivateBootstrapFile(path, 4); err != nil || string(data) != "1234" {
+	if data, err := readPrivateBootstrapFile(path, 4); err != nil || string(data) != "1234" {
 		t.Fatal(err)
 	}
-	if _, err := ReadPrivateBootstrapFile(path, 3); err == nil {
+	if _, err := readPrivateBootstrapFile(path, 3); err == nil {
 		t.Fatal("overflow")
 	}
 	link := filepath.Join(directory, "link")
 	_ = os.Symlink(path, link)
-	if _, err := ReadPrivateBootstrapFile(link, 4); err == nil {
+	if _, err := readPrivateBootstrapFile(link, 4); err == nil {
 		t.Fatal("symlink")
 	}
 	_ = os.Remove(link)
 	if err := os.Link(path, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadPrivateBootstrapFile(path, 4); err == nil {
+	if _, err := readPrivateBootstrapFile(path, 4); err == nil {
 		t.Fatal("hard link")
 	}
 	_ = os.Remove(link)
 	_ = os.Chmod(path, 0644)
-	if _, err := ReadPrivateBootstrapFile(path, 4); err == nil {
+	if _, err := readPrivateBootstrapFile(path, 4); err == nil {
 		t.Fatal("public file")
 	}
 	_ = os.Chmod(path, 0600)
 	_ = os.Chmod(directory, 0755)
-	if _, err := ReadPrivateBootstrapFile(path, 4); err == nil {
+	if _, err := readPrivateBootstrapFile(path, 4); err == nil {
 		t.Fatal("public parent")
 	}
 	_ = os.Chmod(directory, 0700)
@@ -131,7 +130,7 @@ func TestPrivateBootstrapFilesRejectWithoutBlocking(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { _, err := ReadPrivateBootstrapFile(fifo, 4); done <- err }()
+	go func() { _, err := readPrivateBootstrapFile(fifo, 4); done <- err }()
 	select {
 	case err := <-done:
 		if err == nil {
@@ -199,30 +198,14 @@ func TestBootstrapInputLoadsOneCredentialSnapshot(t *testing.T) {
 	if input.Credentials().TLSConfig().Certificates[0].PrivateKey.(*ecdsa.PrivateKey).D.Int64() == 1 {
 		t.Fatal("private key snapshot mutable")
 	}
-	if _, err := input.ResolveGrant("missing"); err == nil {
-		t.Fatal("unresolved grant")
-	}
-	for _, values := range [][]string{nil, {"Bearer replacement"}, {"Bearer one-token", "Bearer one-token"}} {
-		if input.Credentials().Authorize(context.Background(), values) {
-			t.Fatal("bad authorization")
-		}
-	}
-	if !input.Credentials().Authorize(context.Background(), []string{"Bearer one-token"}) {
-		t.Fatal("grant refused")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if input.Credentials().Authorize(ctx, []string{"Bearer one-token"}) {
-		t.Fatal("expired grant accepted")
-	}
-	if _, err := NewTLSTrustGrant(append([]byte("junk"), cert...)); err == nil {
+	if _, err := newTLSTrustGrant(append([]byte("junk"), cert...)); err == nil {
 		t.Fatal("impure CA accepted")
 	}
-	if _, err := NewTLSTrustGrant(append([]byte("-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"), cert...)); err == nil {
+	if _, err := newTLSTrustGrant(append([]byte("-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"), cert...)); err == nil {
 		t.Fatal("invalid PEM block skipped")
 	}
 	for _, token := range []string{"token\n", "=", "one=two", "", strings.Repeat("x", 1025)} {
-		if _, err := NewBearerGrant(token); err == nil {
+		if _, err := newBearerGrant(token); err == nil {
 			t.Fatal("invalid bearer accepted")
 		}
 	}
@@ -244,7 +227,7 @@ func TestLocalBootstrapInputHasNoSyntheticCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if input.Credentials().TLSConfig() != nil || !input.Credentials().Authorize(context.Background(), nil) {
+	if input.Credentials().TLSConfig() != nil || len(input.Credentials().Headers()) != 0 {
 		t.Fatal("local lease requires synthetic credentials")
 	}
 	application := json.RawMessage(strings.Repeat("[", 33) + "0" + strings.Repeat("]", 33))
@@ -295,7 +278,7 @@ func TestBootstrapLoaderRejectsMalformedGrantDescriptors(t *testing.T) {
 		t.Fatal("opaque number interpreted", err)
 	}
 	binding.SecretHandles = SecretHandles{TLSIdentity: "missing"}
-	if _, err := binding.ResolveCredentials(func(string) (CredentialGrant, error) { return CredentialGrant{}, bootstrapError() }, BootstrapServer); err == nil {
+	if _, err := binding.resolveCredentials(func(string) (credentialGrant, error) { return credentialGrant{}, bootstrapError() }, BootstrapServer); err == nil {
 		t.Fatal("local named grant not resolved")
 	}
 }

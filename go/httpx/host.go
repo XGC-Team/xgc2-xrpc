@@ -17,52 +17,75 @@ import (
 	unixlease "github.com/XGC-Team/xgc2-xrpc/go/unix"
 )
 
+// HostOptions are plain limits. A zero field selects the default named in its
+// comment; nothing is read from the process environment.
 type HostOptions struct {
-	// Authorize runs after finite admission and before domain dispatch. It must
-	// return true while the request context remains live.
-	Authorize func(*http.Request) bool
 	// DiscoveryPaths names GET-only public description routes. All other routes stay instance-bound.
-	DiscoveryPaths   []string
-	InstanceID       string
-	MaxBodyBytes     int64
+	DiscoveryPaths []string
+	InstanceID     string
+	// MaxBodyBytes bounds one request body (default xrpc.DefaultMaxMessageBytes).
+	MaxBodyBytes int64
+	// MaxResponseBytes bounds one response body. Serve defaults it to
+	// xrpc.DefaultMaxMessageBytes; ServeEdge and RunEdge leave a zero value
+	// unbounded so a domain stream keeps its own contract.
 	MaxResponseBytes int64
-	MaxHeaderBytes   int
-	MaxConnections   int
-	MaxInFlight      int
-	MaxCallTime      time.Duration
-	HeaderTimeout    time.Duration
-	IdleTimeout      time.Duration
-	WriteTimeout     time.Duration
-	ShutdownTimeout  time.Duration
-	Diagnostics      *xrpc.Diagnostics
-	Metrics          *xrpc.Metrics
-	Service          string
+	// MaxHeaderBytes bounds decoded header fields (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes int
+	// MaxConnections bounds accepted connections (default xrpc.DefaultMaxConnections).
+	MaxConnections int
+	// MaxInFlight bounds admitted calls (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// MaxCallTime caps the caller's budget on Serve (default xrpc.DefaultCallTimeout).
+	// ServeEdge applies it only when set, so zero preserves streaming.
+	MaxCallTime time.Duration
+	// HeaderTimeout bounds reading request headers (default xrpc.DefaultHeaderTimeout).
+	HeaderTimeout time.Duration
+	// IdleTimeout closes idle keep-alive connections (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// WriteTimeout is net/http's absolute response deadline; zero disables it.
+	// ServeEvents extends it on every frame, so streams outlive it.
+	WriteTimeout time.Duration
+	// TLSConfig makes ServeEdge and RunEdge serve TLS 1.2+ with this identity and
+	// client-certificate policy (nil serves the listener as it is). The
+	// connection limiter sits below TLS, so net/http owns the handshake and
+	// Request.TLS carries the peer certificates; a TLS listener wrapped by the
+	// caller would hide the *tls.Conn from net/http. Serve, which is for Unix
+	// sockets, rejects it.
+	TLSConfig *tls.Config
+	// ShutdownTimeout is the drain budget of RunEdge (default xrpc.DefaultShutdownTimeout).
+	ShutdownTimeout time.Duration
+	Diagnostics     *xrpc.Diagnostics
+	Metrics         *xrpc.Metrics
+	Service         string
 }
 
+// defaults applies the documented xrpc limits to zero fields. MaxResponseBytes
+// is not defaulted here: internal hosts default it in Handler, while edges keep
+// streaming responses unbounded.
 func (o HostOptions) defaults() HostOptions {
 	if o.MaxBodyBytes <= 0 {
-		o.MaxBodyBytes = xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES")
+		o.MaxBodyBytes = xrpc.DefaultMaxMessageBytes
 	}
 	if o.MaxHeaderBytes <= 0 {
-		o.MaxHeaderBytes = int(xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES"))
+		o.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if o.MaxConnections <= 0 {
-		o.MaxConnections = int(xrpc.DefaultPolicyInteger("HOST_MAX_CONNECTIONS"))
+		o.MaxConnections = xrpc.DefaultMaxConnections
 	}
 	if o.MaxInFlight <= 0 {
-		o.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		o.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	if o.MaxCallTime <= 0 {
-		o.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		o.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if o.HeaderTimeout <= 0 {
-		o.HeaderTimeout = time.Duration(xrpc.DefaultPolicyInteger("HEADER_TIMEOUT_MS")) * time.Millisecond
+		o.HeaderTimeout = xrpc.DefaultHeaderTimeout
 	}
 	if o.IdleTimeout <= 0 {
-		o.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		o.IdleTimeout = xrpc.DefaultIdleTimeout
 	}
 	if o.ShutdownTimeout <= 0 {
-		o.ShutdownTimeout = time.Duration(xrpc.DefaultPolicyInteger("SHUTDOWN_TIMEOUT_MS")) * time.Millisecond
+		o.ShutdownTimeout = xrpc.DefaultShutdownTimeout
 	}
 	return o
 }
@@ -75,7 +98,7 @@ func Handler(next http.Handler, options HostOptions) http.Handler {
 		options.Metrics = &xrpc.Metrics{}
 	}
 	if options.MaxResponseBytes <= 0 {
-		options.MaxResponseBytes = xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES")
+		options.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 	}
 	slots := make(chan struct{}, options.MaxInFlight)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,18 +169,7 @@ func Handler(next http.Handler, options HostOptions) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, options.MaxBodyBytes)
 		w.Header().Set(RequestIDHeader, r.Header.Get(RequestIDHeader))
 		bounded := &responseLimitWriter{ResponseWriter: w, remaining: options.MaxResponseBytes, head: r.Method == http.MethodHead, maxHeaderBytes: int64(options.MaxHeaderBytes)}
-		request := r.WithContext(ctx)
-		if options.Authorize != nil {
-			allowed := options.Authorize(request)
-			if ctx.Err() != nil {
-				panic(http.ErrAbortHandler)
-			}
-			if !allowed {
-				writeError(bounded, 403, "permission_denied", "caller authorization rejected")
-				return
-			}
-		}
-		next.ServeHTTP(bounded, request)
+		next.ServeHTTP(bounded, r.WithContext(ctx))
 		bounded.checkHeaders()
 		if bounded.abort {
 			panic(http.ErrAbortHandler)
@@ -180,6 +192,7 @@ type Host struct {
 	listener *netlimit.Listener
 	lease    *unixlease.Lease
 	once     sync.Once
+	draining chan struct{} // closed when Shutdown begins; event streams end on it
 	done     chan struct{}
 	err      error
 	mu       sync.Mutex
@@ -191,8 +204,9 @@ type Host struct {
 	options  HostOptions
 }
 
-// Serve consumes an already reserved listener. A TCP listener must be wrapped
-// in authenticated TLS by the owning product; ServeTLS provides that wrapper.
+// Serve consumes an already reserved Unix listener and applies the fenced
+// internal-RPC contract: finite wire metadata, instance binding and a call
+// budget. Remote or public listeners use ServeEdge.
 func Serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, options HostOptions) (*Host, error) {
 	if listener == nil || handler == nil {
 		return nil, errors.New("xrpc: listener and handler required")
@@ -201,9 +215,10 @@ func Serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 		return nil, errors.New("xrpc: invalid host instance identity")
 	}
 	if listener.Addr().Network() != "unix" {
-		if _, ok := listener.(*tlsListener); !ok {
-			return nil, errors.New("xrpc: remote HTTP listener requires TLS")
-		}
+		return nil, errors.New("xrpc: internal HTTP hosts serve Unix listeners; use ServeEdge for public listeners")
+	}
+	if options.TLSConfig != nil {
+		return nil, errors.New("xrpc: internal HTTP hosts serve Unix listeners without TLS; TLSConfig belongs to ServeEdge")
 	}
 	if options.Metrics == nil {
 		options.Metrics = &xrpc.Metrics{}
@@ -214,9 +229,19 @@ func Serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 // ServeEdge hosts an explicit public gateway. Its product retains HTTP auth,
 // CORS, routes, SSE and WebSocket semantics. No RPC caller headers are required.
 // MaxCallTime and WriteTimeout are opt-in for edges; zero preserves streaming.
+// HostOptions.TLSConfig serves the listener over TLS; hand ServeEdge the raw
+// listener in that case, not one wrapped by tls.NewListener.
 func ServeEdge(listener net.Listener, handler http.Handler, options HostOptions) (*Host, error) {
 	if listener == nil || handler == nil {
 		return nil, errors.New("xrpc: listener and handler required")
+	}
+	if options.TLSConfig != nil {
+		if len(options.TLSConfig.Certificates) == 0 && options.TLSConfig.GetCertificate == nil && options.TLSConfig.GetConfigForClient == nil {
+			return nil, errors.New("xrpc: server TLS identity required")
+		}
+		options.TLSConfig = options.TLSConfig.Clone()
+		options.TLSConfig.MinVersion = max(options.TLSConfig.MinVersion, tls.VersionTLS12)
+		options.TLSConfig.NextProtos = []string{"http/1.1"}
 	}
 	timeout := options.MaxCallTime
 	normalized := options.defaults()
@@ -267,17 +292,12 @@ func ServeEdge(listener net.Listener, handler http.Handler, options HostOptions)
 
 func serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, options HostOptions) (*Host, error) {
 	options = options.defaults()
-	var tlsConfig *tls.Config
-	if secured, ok := listener.(*tlsListener); ok {
-		listener, tlsConfig = secured.Listener, secured.config
-	}
 	limited := netlimit.New(listener, options.MaxConnections)
 	var serving net.Listener = limited
-	if tlsConfig != nil {
-		// net/http must receive *tls.Conn to own the handshake and populate Request.TLS.
-		serving = tls.NewListener(limited, tlsConfig)
+	if options.TLSConfig != nil {
+		serving = tls.NewListener(limited, options.TLSConfig)
 	}
-	host := &Host{listener: limited, lease: lease, done: make(chan struct{}), stopped: make(chan struct{}), drained: make(chan struct{}), options: options}
+	host := &Host{listener: limited, lease: lease, draining: make(chan struct{}), done: make(chan struct{}), stopped: make(chan struct{}), drained: make(chan struct{}), options: options}
 	tracked := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host.mu.Lock()
 		if host.stopping {
@@ -288,7 +308,7 @@ func serve(listener net.Listener, lease *unixlease.Lease, handler http.Handler, 
 		host.handlers.Add(1)
 		host.mu.Unlock()
 		defer host.handlers.Done()
-		handler.ServeHTTP(w, r)
+		handler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), drainKey{}, (<-chan struct{})(host.draining))))
 	})
 	host.server = &http.Server{Handler: tracked, ReadHeaderTimeout: options.HeaderTimeout, IdleTimeout: options.IdleTimeout, WriteTimeout: options.WriteTimeout, MaxHeaderBytes: options.MaxHeaderBytes, TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}}
 	go func() {
@@ -313,20 +333,6 @@ func (h *Host) Done() <-chan struct{} { return h.done }
 // Wait returns the serving error after the listener exits.
 func (h *Host) Wait() error { <-h.done; return h.err }
 
-type tlsListener struct {
-	net.Listener
-	config *tls.Config
-}
-
-func ServeTLS(listener net.Listener, handler http.Handler, config *tls.Config, options HostOptions) (*Host, error) {
-	if config == nil || len(config.Certificates) == 0 && config.GetCertificate == nil {
-		return nil, errors.New("xrpc: server TLS identity required")
-	}
-	cloned := config.Clone()
-	cloned.MinVersion = max(cloned.MinVersion, tls.VersionTLS12)
-	cloned.NextProtos = []string{"http/1.1"}
-	return Serve(&tlsListener{Listener: listener, config: cloned}, nil, handler, options)
-}
 func (h *Host) Shutdown(ctx context.Context) error {
 	if h == nil {
 		return nil
@@ -338,6 +344,7 @@ func (h *Host) Shutdown(ctx context.Context) error {
 		h.mu.Lock()
 		h.stopping = true
 		h.mu.Unlock()
+		close(h.draining)
 		go func() {
 			h.stopErr = h.server.Shutdown(ctx)
 			if h.stopErr != nil {

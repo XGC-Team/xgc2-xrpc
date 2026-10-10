@@ -90,7 +90,10 @@ func TestProfileSeparatesRepresentationAndWireBudgets(t *testing.T) {
 				t.Fatal("test did not cross representation-only budget")
 			}
 			call := xrpc.Call{Service: xrpc.ServiceRef{TargetID: "local", Service: "fixture.Representation", APIVersion: "v1", InstanceID: "boot", Profile: xrpc.GRPC, Endpoint: xrpc.Endpoint{Kind: "unix", Address: lease.Path()}}, Method: "/fixture.Representation/Echo", RequestID: "bytes:1", Payload: raw}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Two multi-megabyte JSON round trips share this budget; under the race
+			// detector on a busy machine they need far more than the 5 s they were
+			// given. The test is about budgets, not speed.
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			result, err := profile.Call(ctx, call)
 			if err != nil {

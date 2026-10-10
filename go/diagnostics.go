@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/XGC-Team/xgc2-xrpc/go/internal/policy"
 	"io"
 	"strings"
 	"sync"
@@ -28,8 +27,13 @@ type Diagnostic struct {
 }
 
 type DiagnosticOptions struct {
-	Sink             io.Writer
-	OwnSink          bool
+	Sink    io.Writer
+	OwnSink bool
+	// Level is the most verbose level emitted: error, warn, info, debug or trace.
+	// The default is info; SetLevel changes it while the owner runs.
+	Level string
+	// Format is json or text. The default is json.
+	Format           string
 	MaxRecordBytes   int
 	MaxQueuedRecords int
 }
@@ -43,7 +47,6 @@ type DiagnosticStatus struct {
 	Dropped        uint64    `json:"dropped_records"`
 	SinkErrors     uint64    `json:"sink_errors"`
 	Drained        bool      `json:"drained"`
-	Revision       uint64    `json:"policy_revision"`
 	Level          string    `json:"level"`
 	Format         string    `json:"format"`
 }
@@ -53,8 +56,6 @@ type DiagnosticStatus struct {
 // and sink; Done closes only when the real writer has finished.
 type Diagnostics struct {
 	mu                           sync.Mutex
-	policy                       *Policy
-	appliedSnapshot              EffectivePolicy
 	level                        atomic.Int32
 	format                       string
 	options                      DiagnosticOptions
@@ -69,34 +70,33 @@ type Diagnostics struct {
 	}
 }
 
+var levelNames = [...]string{"error", "warn", "info", "debug", "trace"}
+
 func severity(level string) int32 {
-	switch level {
-	case "error":
-		return 0
-	case "warn":
-		return 1
-	case "info":
-		return 2
-	case "debug":
-		return 3
-	case "trace":
-		return 4
+	for i, name := range levelNames {
+		if level == name {
+			return int32(i)
+		}
 	}
 	return -1
 }
 
-func NewDiagnostics(policy *Policy, options DiagnosticOptions) (*Diagnostics, error) {
-	if policy == nil || policyIsRole(policy) || options.Sink == nil {
-		return nil, errors.New("xrpc: resolved diagnostic policy and explicit sink required")
+// NewDiagnostics starts the single writer that owns options.Sink.
+func NewDiagnostics(options DiagnosticOptions) (*Diagnostics, error) {
+	if options.Sink == nil {
+		return nil, errors.New("xrpc: explicit diagnostic sink required")
 	}
-	effective := policy.Effective()
-	level, ok := effective.Fields["LOG_LEVEL"].Value.(string)
-	if !ok {
-		return nil, errors.New("xrpc: LOG_LEVEL capability is not selected")
+	if options.Level == "" {
+		options.Level = "info"
 	}
-	format, ok := effective.Fields["LOG_FORMAT"].Value.(string)
-	if !ok {
-		return nil, errors.New("xrpc: LOG_FORMAT capability is not selected")
+	if options.Format == "" {
+		options.Format = "json"
+	}
+	if severity(options.Level) < 0 {
+		return nil, errors.New("xrpc: diagnostic level must be error, warn, info, debug or trace")
+	}
+	if options.Format != "json" && options.Format != "text" {
+		return nil, errors.New("xrpc: diagnostic format must be json or text")
 	}
 	if options.MaxRecordBytes == 0 {
 		options.MaxRecordBytes = 2048
@@ -112,17 +112,8 @@ func NewDiagnostics(policy *Policy, options DiagnosticOptions) (*Diagnostics, er
 			return nil, errors.New("xrpc: owned diagnostic sink must be closeable")
 		}
 	}
-	if err := claimDiagnosticPolicy(policy); err != nil {
-		return nil, err
-	}
-	// An earlier owner may have applied verbosity and drained between the
-	// initial capability check and this claim. The claimed owner now pins
-	// initialization to the actual latest parent snapshot.
-	effective = policy.Effective()
-	level, _ = effective.Fields["LOG_LEVEL"].Value.(string)
-	format, _ = effective.Fields["LOG_FORMAT"].Value.(string)
-	d := &Diagnostics{policy: policy, appliedSnapshot: effective, format: format, options: options, queue: make(chan []byte, options.MaxQueuedRecords), done: make(chan struct{})}
-	d.level.Store(severity(level))
+	d := &Diagnostics{format: options.Format, options: options, queue: make(chan []byte, options.MaxQueuedRecords), done: make(chan struct{})}
+	d.level.Store(severity(options.Level))
 	go d.write()
 	return d, nil
 }
@@ -213,7 +204,6 @@ func (d *Diagnostics) Emit(record Diagnostic) {
 
 func (d *Diagnostics) write() {
 	defer close(d.done)
-	defer func() { d.mu.Lock(); owner := d.policy; d.mu.Unlock(); releaseDiagnosticPolicy(owner) }()
 	for record := range d.queue {
 		if err := writeAll(d.options.Sink, record); err != nil {
 			d.sinkErrors.Add(1)
@@ -282,9 +272,7 @@ func (d *Diagnostics) Status() DiagnosticStatus {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	effective := d.appliedSnapshot
-	level, _ := effective.Fields["LOG_LEVEL"].Value.(string)
-	status := DiagnosticStatus{Time: time.Now().UTC(), QueuedRecords: len(d.queue), QueueCapacity: cap(d.queue), MaxRecordBytes: d.options.MaxRecordBytes, Written: d.written.Load(), Dropped: d.dropped.Load(), SinkErrors: d.sinkErrors.Load(), Revision: effective.Revision, Level: level, Format: d.format}
+	status := DiagnosticStatus{Time: time.Now().UTC(), QueuedRecords: len(d.queue), QueueCapacity: cap(d.queue), MaxRecordBytes: d.options.MaxRecordBytes, Written: d.written.Load(), Dropped: d.dropped.Load(), SinkErrors: d.sinkErrors.Load(), Level: levelNames[d.level.Load()], Format: d.format}
 	select {
 	case <-d.done:
 		status.Drained = true
@@ -293,70 +281,22 @@ func (d *Diagnostics) Status() DiagnosticStatus {
 	return status
 }
 
-// UpdatePolicy applies live verbosity with compare-and-swap revision semantics.
-// LOG_FORMAT and resource budgets require restart. No values are persisted.
-func (d *Diagnostics) UpdatePolicy(expected uint64, updates map[string]string) (*Policy, error) {
+// SetLevel changes verbosity while the owner runs. The format and the queue
+// bounds are fixed at construction.
+func (d *Diagnostics) SetLevel(level string) error {
 	if d == nil {
-		return nil, errors.New("xrpc: diagnostics owner required")
+		return errors.New("xrpc: diagnostics owner required")
+	}
+	value := severity(level)
+	if value < 0 {
+		return errors.New("xrpc: diagnostic level must be error, warn, info, debug or trace")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		return nil, errors.New("xrpc: diagnostics owner closed")
+		return errors.New("xrpc: diagnostics owner closed")
 	}
-	policy, err := d.policy.Update(expected, updates)
-	if err != nil {
-		return nil, err
-	}
-	level, _ := policy.Effective().Fields["LOG_LEVEL"].Value.(string)
-	oldLevel := d.level.Load()
-	d.level.Store(severity(level))
-	if err := publishDiagnosticPolicy(policy, expected); err != nil {
-		d.level.Store(oldLevel)
-		return nil, err
-	}
-	d.policy = policy
-	d.appliedSnapshot = policy.Effective()
-	return policy, nil
-}
-
-// CheckDiagnosticPolicy prevents a transport from silently accepting explicit
-// logging settings while no diagnostic owner is wired into that transport.
-func CheckDiagnosticPolicy(p *Policy, diagnostics *Diagnostics) error {
-	if p == nil {
-		return errors.New("xrpc: resolved runtime policy required")
-	}
-	if diagnostics == nil {
-		snapshot := p.Effective()
-		for _, name := range []string{"LOG_LEVEL", "LOG_FORMAT"} {
-			field, selected := snapshot.Fields[name]
-			if selected && field.Source != "sdk_default" {
-				return fmt.Errorf("xrpc: %s requires an explicit diagnostics owner", name)
-			}
-		}
-		return nil
-	}
-	// Serialize the cold startup/query check with the one actual log owner so a
-	// concurrent verbosity publication cannot compare two different revisions.
-	diagnostics.mu.Lock()
-	defer diagnostics.mu.Unlock()
-	if diagnostics.closed {
-		return errors.New("xrpc: diagnostics owner is closing or closed")
-	}
-	if policyIsRole(p) && !sameDiagnosticPolicyOwner(p, diagnostics.policy) {
-		return errors.New("xrpc: role policy requires its parent's diagnostics owner")
-	}
-	snapshot := p.Effective()
-	actual := diagnostics.appliedSnapshot
-	for _, name := range []string{"LOG_LEVEL", "LOG_FORMAT"} {
-		field, selected := snapshot.Fields[name]
-		if !selected {
-			return fmt.Errorf("xrpc: diagnostic policy missing %s", name)
-		}
-		if field.Value != actual.Fields[name].Value {
-			return fmt.Errorf("xrpc: diagnostics owner policy conflicts with %s", name)
-		}
-	}
+	d.level.Store(value)
 	return nil
 }
 
@@ -417,12 +357,3 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	}
 	return MetricsSnapshot{Time: time.Now().UTC(), InFlight: m.inFlight.Load(), PeakInFlight: m.peak.Load(), Admitted: m.admitted.Load(), Rejected: m.rejected.Load(), Completed: m.completed.Load(), Deadlines: m.deadline.Load(), Cancelled: m.cancelled.Load(), PeerErrors: m.peerErrors.Load()}
 }
-
-func policyIsRole(p *Policy) bool { return policy.IsRole(p) }
-func publishDiagnosticPolicy(p *Policy, expected uint64) error {
-	return policy.PublishApplied(p, expected)
-}
-
-func claimDiagnosticPolicy(p *Policy) error       { return policy.ClaimDiagnostic(p) }
-func releaseDiagnosticPolicy(p *Policy)           { policy.ReleaseDiagnostic(p) }
-func sameDiagnosticPolicyOwner(a, b *Policy) bool { return policy.SameOwner(a, b) }
