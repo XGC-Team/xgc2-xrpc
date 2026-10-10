@@ -110,9 +110,10 @@ func ValidCursor(cursor string) bool {
 // internal Serve host bounds every response by the call budget and size. Each
 // stream holds one admission slot of its host for its lifetime, so size
 // HostOptions.MaxInFlight and MaxConnections for the expected subscribers.
-// ServeEvents returns nil when the client left, the stream was drained or the
-// source finished, and an error when the source failed or emitted an invalid
-// event; the response is over either way.
+// Authenticate and validate the request before calling ServeEvents: the
+// response is committed as 200 on entry. ServeEvents returns nil when the
+// client left, the stream was drained or the source finished, and an error when
+// the source failed or emitted an invalid event; the response is over either way.
 func ServeEvents(w http.ResponseWriter, r *http.Request, source EventSource, options EventsOptions) error {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
