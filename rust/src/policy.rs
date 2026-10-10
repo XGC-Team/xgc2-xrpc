@@ -70,7 +70,7 @@ impl Default for PolicyOptions {
 /// Policy capabilities enforced by this build. Diagnostic configuration is
 /// intentionally absent until a bounded diagnostics implementation consumes it.
 pub fn supported_capabilities() -> BTreeSet<String> {
-    let mut capabilities: BTreeSet<String> = [
+    let capabilities: BTreeSet<String> = [
         "host",
         "http",
         "rpc",
@@ -81,9 +81,6 @@ pub fn supported_capabilities() -> BTreeSet<String> {
     .into_iter()
     .map(str::to_owned)
     .collect();
-    if cfg!(feature = "grpc") {
-        capabilities.insert("grpc".to_owned());
-    }
     capabilities
 }
 

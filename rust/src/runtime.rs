@@ -128,8 +128,6 @@ pub(crate) struct Shared {
     pub executions: Arc<Semaphore>,
     pub blocking: Arc<Semaphore>,
     pub sessions: Mutex<HashMap<String, Weak<Session>>>,
-    #[cfg(feature = "grpc")]
-    pub grpc_sessions: Mutex<HashMap<String, Weak<crate::grpc::GrpcSession>>>,
     pub hosts: AtomicUsize,
     pub session_count: AtomicUsize,
     pub closing: AtomicBool,
@@ -256,8 +254,6 @@ impl Runtime {
             blocking: Arc::new(Semaphore::new(options.blocking_workers)),
             options,
             sessions: Mutex::new(HashMap::new()),
-            #[cfg(feature = "grpc")]
-            grpc_sessions: Mutex::new(HashMap::new()),
             hosts: AtomicUsize::new(0),
             session_count: AtomicUsize::new(0),
             closing: AtomicBool::new(false),

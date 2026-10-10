@@ -3,8 +3,6 @@
 #![doc = include_str!("../README.md")]
 mod client;
 pub mod ffi;
-#[cfg(feature = "grpc")]
-pub mod grpc;
 mod host;
 pub mod policy;
 mod runtime;

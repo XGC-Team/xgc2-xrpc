@@ -80,8 +80,7 @@ fn shared_environment_fixture_corpus() {
                     );
                 } else {
                     assert!(
-                        field.starts_with("LOG_")
-                            || (field.starts_with("GRPC_") && !cfg!(feature = "grpc")),
+                        field.starts_with("LOG_") || field.starts_with("GRPC_"),
                         "{name}: unexpected omitted field {field}"
                     );
                 }
