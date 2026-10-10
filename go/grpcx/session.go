@@ -32,7 +32,9 @@ type SessionOptions struct {
 	// count, because it is skipped when a TLS session is resumed.
 	TLSConfig *tls.Config
 	// Keepalive is passed to the channel unchanged. The zero value sends no
-	// pings; grpc-go raises a Time below 10 s to 10 s.
+	// pings; grpc-go raises a Time below 10 s to 10 s. The server must permit
+	// the interval: pings more frequent than its KeepaliveEnforcement.MinTime
+	// (default five minutes) end the connection with GOAWAY too_many_pings.
 	Keepalive keepalive.ClientParameters
 	// MaxRequestBytes and MaxResponseBytes bound one sent and one received
 	// message (default xrpc.DefaultMaxMessageBytes).
@@ -97,7 +99,9 @@ type SessionServerOptions struct {
 	// Keepalive and KeepaliveEnforcement are passed to the server unchanged.
 	// The zero values mean grpc-go's defaults: no idle timeout, no maximum
 	// connection age, pings only after two hours, and clients may ping no more
-	// often than every five minutes. The SDK sets none of them.
+	// often than every five minutes (a client keepalive interval shorter than
+	// KeepaliveEnforcement.MinTime gets GOAWAY too_many_pings). The SDK sets
+	// none of them.
 	Keepalive            keepalive.ServerParameters
 	KeepaliveEnforcement keepalive.EnforcementPolicy
 	// MaxRequestBytes and MaxResponseBytes bound one received and one sent

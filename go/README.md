@@ -138,6 +138,11 @@ semantics and keepalive policy:
   are passed to grpc-go unchanged. The SDK sets no idle timeout and no maximum
   connection age; the zero values are grpc-go's own defaults. (grpc-go raises a
   client ping interval below 10 s to 10 s and a server one below 1 s to 1 s.)
+  The two sides must agree: a client that pings more often than the server's
+  `KeepaliveEnforcement.MinTime` (default five minutes) is disconnected with
+  GOAWAY `too_many_pings` after a few pings, so a product that sets
+  `SessionOptions.Keepalive` sets `MinTime` (and `PermitWithoutStream` if it
+  pings idle connections) on the server too.
 - TLS is mandatory (1.2+). `SessionOptions.TLSConfig` may set
   `InsecureSkipVerify` only together with `VerifyConnection`, which then
   carries the whole trust decision: certificate pinning, trust on first use.
@@ -408,14 +413,14 @@ compatibility shims.
 | `NewDiagnostics(policy, opts)`, `Diagnostics.UpdatePolicy`, `DiagnosticStatus.Revision` | `NewDiagnostics(opts)` with `Level`/`Format`, `Diagnostics.SetLevel` |
 | `NewRotatingFileSink`, `FileSinkOptions` | supervisor-owned collection and rotation of stderr |
 | `NewBearerGrant`, `NewTLSIdentityGrant`, `NewTLSTrustGrant`, `NewAuthorizationGrant`, `GrantResolver`, `CredentialGrant`, `ParseBootstrapBinding`, `ReadPrivateBootstrapFile`, `BootstrapInput.ResolveGrant`, `BootstrapBinding.ResolveCredentials`, `BootstrapCredentials.Authorize/Binding/Role`, `Authorization` | `LoadBootstrapInput` |
-| `httpx.NewBound`, `httpx.ServeBound`, `httpx.ServeTLS`, `HostOptions.Authorize` | `httpx.New` with the credentials' TLS config and headers; `httpx.ServeEdge` behind the product's TLS listener |
+| `httpx.NewBound`, `httpx.ServeBound`, `httpx.ServeTLS`, `HostOptions.Authorize` | `httpx.New` with the credentials' TLS config and headers; `httpx.ServeEdge` with `HostOptions.TLSConfig` |
 | `grpcx.DialBound`, `grpcx.ServeBound`, `grpcx.ServeTLS`, `grpcx.Serve`, `grpcx.FiniteUnary`, `grpcx.BoundService`, `HostOptions.Authorize` | `grpcx.ServeWithOptions` (set `HostOptions.InstanceID`, `MaxCallTime`, `MaxInFlight`), `grpcx.DialSession`/`ServeSession` for remote TLS |
 | `grpcx.ServeEdgeTLS`, `ServeEdgeWithOptions`, `PrepareEdgeTLS`, `EdgeOptions`, `Host.Serve` | `grpcx.ServeSession` |
 | `grpcx.HostOptions.ShutdownTimeout` (no host read it) | the context passed to `Host.Shutdown` |
 
 `httpx.Serve` and `grpcx.ServeWithOptions` now serve Unix listeners only: a
-remote HTTP listener is `httpx.ServeEdge`, a remote gRPC listener is
-`grpcx.ServeSession`. Consumers that pin an earlier revision keep compiling
+remote HTTP listener is `httpx.ServeEdge` (with `HostOptions.TLSConfig` for TLS),
+a remote gRPC listener is `grpcx.ServeSession`. Consumers that pin an earlier revision keep compiling
 against it; moving to this revision means replacing their policy resolution
 (`ResolvePolicy`/`WithPolicy`/`NewDiagnostics(policy, ...)`) with option
 structs and their uses of the removed hosts with the replacements above.
