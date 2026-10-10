@@ -1,80 +1,123 @@
-# C++17 throughout: GNU 7.5 (Bionic) and clang 10 or newer.
-find_package(Threads REQUIRED)
-find_package(Boost 1.70 REQUIRED)
-find_package(OpenSSL 1.1.1 REQUIRED COMPONENTS Crypto)
-find_package(nlohmann_json 3.7 CONFIG REQUIRED)
-include(CMakePackageConfigHelpers)
+# XgcXrpc, C++17 (GNU 7.5 and newer, clang 10 and newer).
+#
+# XGC2_XRPC_COMPONENTS selects the shared libraries to build. A component pulls
+# in the ones it links against, and only the dependencies of the selected
+# components are searched for:
+#
+#   unix       POSIX only                  diagnostics  C++ standard library only
+#   bootstrap  OpenSSL (Crypto)            http         Boost >= 1.70 (Asio, Beast), OpenSSL
+#   json_http  nlohmann_json >= 3.7        grpc         gRPC++ >= 1.16, Protobuf, pkg-config
+#   udp        OpenSSL (Crypto) only, nothing else of this SDK (GNU 7.5 is enough)
+#
+# `-DXGC2_XRPC_COMPONENTS=udp` builds and installs the udp.v1 library alone.
+# grpc is not built by default because it needs the gRPC development packages.
+set(XGC2_XRPC_COMPONENTS "unix;diagnostics;bootstrap;http;json_http;udp" CACHE STRING
+  "Components to build: unix diagnostics bootstrap http json_http grpc udp")
+set(_xrpc_known unix diagnostics bootstrap http json_http grpc udp)
+set(_xrpc_components ${XGC2_XRPC_COMPONENTS})
+foreach(_xrpc_name IN LISTS _xrpc_components)
+  if(NOT _xrpc_name IN_LIST _xrpc_known)
+    message(FATAL_ERROR "Unknown XGC2_XRPC_COMPONENTS entry '${_xrpc_name}'; known: ${_xrpc_known}")
+  endif()
+endforeach()
+if("json_http" IN_LIST _xrpc_components)
+  list(APPEND _xrpc_components http)
+endif()
+if("http" IN_LIST _xrpc_components)
+  list(APPEND _xrpc_components unix diagnostics bootstrap)
+endif()
+if("grpc" IN_LIST _xrpc_components)
+  list(APPEND _xrpc_components unix diagnostics)
+endif()
+if("bootstrap" IN_LIST _xrpc_components)
+  list(APPEND _xrpc_components unix)
+endif()
+list(REMOVE_DUPLICATES _xrpc_components)
+if(NOT _xrpc_components)
+  message(FATAL_ERROR "XGC2_XRPC_COMPONENTS selects nothing")
+endif()
+message(STATUS "XgcXrpc components: ${_xrpc_components}")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+include(CMakePackageConfigHelpers)
 
-add_library(xgc2_xrpc_unix SHARED src/unix.cpp)
-add_library(xgc2_xrpc_diagnostics SHARED src/diagnostics.cpp)
-add_library(xgc2_xrpc_http SHARED src/http.cpp)
-add_library(xgc2_xrpc_bootstrap SHARED src/bootstrap.cpp)
-add_library(xgc2_xrpc_json_http SHARED src/json_http.cpp)
-add_library(XgcXrpc::unix ALIAS xgc2_xrpc_unix)
-add_library(XgcXrpc::diagnostics ALIAS xgc2_xrpc_diagnostics)
-add_library(XgcXrpc::http ALIAS xgc2_xrpc_http)
-add_library(XgcXrpc::bootstrap ALIAS xgc2_xrpc_bootstrap)
-add_library(XgcXrpc::json_http ALIAS xgc2_xrpc_json_http)
-set_target_properties(xgc2_xrpc_unix PROPERTIES EXPORT_NAME unix)
-set_target_properties(xgc2_xrpc_diagnostics PROPERTIES EXPORT_NAME diagnostics INSTALL_RPATH "$ORIGIN")
-set_target_properties(xgc2_xrpc_http PROPERTIES EXPORT_NAME http INSTALL_RPATH "$ORIGIN")
-set_target_properties(xgc2_xrpc_bootstrap PROPERTIES EXPORT_NAME bootstrap INSTALL_RPATH "$ORIGIN")
-set_target_properties(xgc2_xrpc_json_http PROPERTIES EXPORT_NAME json_http INSTALL_RPATH "$ORIGIN")
-foreach(target xgc2_xrpc_unix xgc2_xrpc_diagnostics xgc2_xrpc_http xgc2_xrpc_bootstrap xgc2_xrpc_json_http)
+find_package(Threads REQUIRED)
+if("bootstrap" IN_LIST _xrpc_components OR "udp" IN_LIST _xrpc_components)
+  find_package(OpenSSL 1.1.1 REQUIRED COMPONENTS Crypto)
+endif()
+# Only http uses Boost; the bootstrap and diagnostics tests read JSON fixtures with it.
+if("http" IN_LIST _xrpc_components OR (BUILD_TESTING AND
+    ("bootstrap" IN_LIST _xrpc_components OR "diagnostics" IN_LIST _xrpc_components)))
+  find_package(Boost 1.70 REQUIRED)
+endif()
+if("json_http" IN_LIST _xrpc_components)
+  find_package(nlohmann_json 3.7 CONFIG REQUIRED)
+endif()
+if("grpc" IN_LIST _xrpc_components)
+  find_package(Protobuf REQUIRED)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(XgcXrpcNativeGrpc REQUIRED IMPORTED_TARGET grpc++>=1.16)
+endif()
+
+# One shared library per component: target xgc2_xrpc_<component>, alias
+# XgcXrpc::<component>, export file XgcXrpc<Export>Targets.cmake.
+function(xgc2_xrpc_component component export_name)
+  cmake_parse_arguments(ARG "" "" "SOURCES;HEADERS" ${ARGN})
+  set(target xgc2_xrpc_${component})
+  add_library(${target} SHARED ${ARG_SOURCES})
+  add_library(XgcXrpc::${component} ALIAS ${target})
+  set_target_properties(${target} PROPERTIES EXPORT_NAME ${component}
+    VERSION ${PROJECT_VERSION} SOVERSION 1 INSTALL_RPATH "$ORIGIN")
   target_compile_features(${target} PUBLIC cxx_std_17)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   target_include_directories(${target} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-  set_target_properties(${target} PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 1)
-endforeach()
-target_include_directories(xgc2_xrpc_http SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
-target_compile_definitions(xgc2_xrpc_http PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
-target_link_libraries(xgc2_xrpc_bootstrap PUBLIC xgc2_xrpc_unix PRIVATE OpenSSL::Crypto Threads::Threads)
-target_link_libraries(xgc2_xrpc_http PUBLIC xgc2_xrpc_unix
-  xgc2_xrpc_diagnostics xgc2_xrpc_bootstrap PRIVATE Threads::Threads)
-target_link_libraries(xgc2_xrpc_json_http PUBLIC xgc2_xrpc_http nlohmann_json::nlohmann_json)
-
-option(XGC2_XRPC_ENABLE_GRPC "Build the optional native gRPC C++ SDK" OFF)
-if(XGC2_XRPC_ENABLE_GRPC)
-  find_package(Protobuf REQUIRED)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(XgcXrpcNativeGrpc REQUIRED IMPORTED_TARGET grpc++>=1.16)
-  add_library(xgc2_xrpc_grpc SHARED src/grpc.cpp)
-  add_library(XgcXrpc::grpc ALIAS xgc2_xrpc_grpc)
-  set_target_properties(xgc2_xrpc_grpc PROPERTIES EXPORT_NAME grpc
-    VERSION ${PROJECT_VERSION} SOVERSION 1 INSTALL_RPATH "$ORIGIN")
-  target_compile_features(xgc2_xrpc_grpc PUBLIC cxx_std_17)
-  target_compile_options(xgc2_xrpc_grpc PRIVATE -Wall -Wextra -Wpedantic)
-  target_include_directories(xgc2_xrpc_grpc PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-  target_link_libraries(xgc2_xrpc_grpc PUBLIC xgc2_xrpc_unix
-    xgc2_xrpc_diagnostics PkgConfig::XgcXrpcNativeGrpc Threads::Threads)
-  install(TARGETS xgc2_xrpc_grpc EXPORT XgcXrpcGrpcTargets
+  install(TARGETS ${target} EXPORT XgcXrpc${export_name}Targets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-  install(EXPORT XgcXrpcGrpcTargets NAMESPACE XgcXrpc::
+  install(EXPORT XgcXrpc${export_name}Targets NAMESPACE XgcXrpc::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc)
+  list(TRANSFORM ARG_HEADERS PREPEND include/xgc2/xrpc/)
+  install(FILES ${ARG_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xgc2/xrpc)
+endfunction()
+
+# stop.hpp and delivery.hpp are header-only vocabulary of the unix base.
+if("unix" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(unix Unix SOURCES src/unix.cpp HEADERS unix.hpp stop.hpp delivery.hpp)
+endif()
+if("diagnostics" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(diagnostics Diagnostics SOURCES src/diagnostics.cpp HEADERS diagnostics.hpp)
+endif()
+if("bootstrap" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(bootstrap Bootstrap SOURCES src/bootstrap.cpp HEADERS bootstrap.hpp)
+  target_link_libraries(xgc2_xrpc_bootstrap PUBLIC xgc2_xrpc_unix PRIVATE OpenSSL::Crypto Threads::Threads)
+endif()
+if("http" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(http Http SOURCES src/http.cpp HEADERS http.hpp bounded_output.hpp)
+  target_include_directories(xgc2_xrpc_http SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
+  target_compile_definitions(xgc2_xrpc_http PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
+  target_link_libraries(xgc2_xrpc_http PUBLIC xgc2_xrpc_unix xgc2_xrpc_diagnostics
+    xgc2_xrpc_bootstrap PRIVATE Threads::Threads)
+endif()
+if("json_http" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(json_http JsonHttp SOURCES src/json_http.cpp HEADERS json_http.hpp)
+  target_link_libraries(xgc2_xrpc_json_http PUBLIC xgc2_xrpc_http nlohmann_json::nlohmann_json)
+endif()
+if("grpc" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(grpc Grpc SOURCES src/grpc.cpp HEADERS grpc.hpp)
+  target_link_libraries(xgc2_xrpc_grpc PUBLIC xgc2_xrpc_unix xgc2_xrpc_diagnostics
+    PkgConfig::XgcXrpcNativeGrpc Threads::Threads)
+endif()
+if("udp" IN_LIST _xrpc_components)
+  xgc2_xrpc_component(udp Udp SOURCES src/udp_wire.cpp src/udp_keys.cpp src/udp_net.cpp
+    src/udp_server.cpp src/udp_client.cpp HEADERS udp.hpp)
+  target_link_libraries(xgc2_xrpc_udp PRIVATE OpenSSL::Crypto Threads::Threads)
 endif()
 
-foreach(component Unix Diagnostics Bootstrap Http JsonHttp)
-  string(TOLOWER "${component}" target_component)
-  if(component STREQUAL "JsonHttp")
-    set(target_component json_http)
-  endif()
-  install(TARGETS xgc2_xrpc_${target_component} EXPORT XgcXrpc${component}Targets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-  install(EXPORT XgcXrpc${component}Targets NAMESPACE XgcXrpc::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc)
-endforeach()
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 configure_package_config_file(cmake/XgcXrpcConfig.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/XgcXrpcConfig.cmake
   INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc)
@@ -85,45 +128,75 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/XgcXrpcConfig.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc)
 
 if(BUILD_TESTING)
-  add_executable(xrpc_cpp_json_test tests/json_http_test.cpp)
-  target_link_libraries(xrpc_cpp_json_test PRIVATE XgcXrpc::json_http Threads::Threads)
-  target_compile_options(xrpc_cpp_json_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
-  add_test(NAME xrpc_cpp_json COMMAND xrpc_cpp_json_test)
-  set_tests_properties(xrpc_cpp_json PROPERTIES TIMEOUT 30)
-  add_executable(xrpc_cpp_bootstrap_test tests/bootstrap_test.cpp)
-  target_compile_features(xrpc_cpp_bootstrap_test PRIVATE cxx_std_17)
-  target_compile_options(xrpc_cpp_bootstrap_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
-  target_include_directories(xrpc_cpp_bootstrap_test SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
-  target_compile_definitions(xrpc_cpp_bootstrap_test PRIVATE
-    XRPC_BOOTSTRAP_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../contracts/fixtures/bootstrap.json")
-  target_link_libraries(xrpc_cpp_bootstrap_test PRIVATE XgcXrpc::bootstrap OpenSSL::Crypto)
-  add_test(NAME xrpc_cpp_bootstrap COMMAND xrpc_cpp_bootstrap_test)
-  set_tests_properties(xrpc_cpp_bootstrap PROPERTIES TIMEOUT 30)
-  foreach(case runtime http_host resources wire fault diagnostics diagnostic_transport stop)
-    if(case STREQUAL "runtime")
-      set(test_source tests/runtime_test.cpp)
-    else()
-      set(test_source tests/${case}_test.cpp)
-    endif()
-    add_executable(xrpc_cpp_${case}_test ${test_source})
-    target_compile_features(xrpc_cpp_${case}_test PRIVATE cxx_std_17)
-    target_compile_options(xrpc_cpp_${case}_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
-    target_link_libraries(xrpc_cpp_${case}_test PRIVATE XgcXrpc::http Threads::Threads)
-    if(case STREQUAL "wire" OR case STREQUAL "diagnostics")
-      target_include_directories(xrpc_cpp_${case}_test SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
-      target_compile_definitions(xrpc_cpp_${case}_test PRIVATE BOOST_ERROR_CODE_HEADER_ONLY
-        XRPC_WIRE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../contracts/fixtures/wire.json")
-    endif()
-    add_test(NAME xrpc_cpp_${case} COMMAND xrpc_cpp_${case}_test)
-    set_tests_properties(xrpc_cpp_${case} PROPERTIES TIMEOUT 30)
-  endforeach()
-  if(XGC2_XRPC_ENABLE_GRPC)
+  set(_xrpc_test_flags -Wall -Wextra -Wpedantic -UNDEBUG)
+  # xgc2_xrpc_test(<name> <source> LINK <libraries>...): one executable and one
+  # ctest of the same name (xrpc_cpp_<name>), 30 s limit unless TIMEOUT is given.
+  function(xgc2_xrpc_test name source)
+    cmake_parse_arguments(ARG "" "TIMEOUT" "LINK;SOURCES;ARGS" ${ARGN})
+    add_executable(xrpc_cpp_${name}_test ${source} ${ARG_SOURCES})
+    target_compile_features(xrpc_cpp_${name}_test PRIVATE cxx_std_17)
+    target_compile_options(xrpc_cpp_${name}_test PRIVATE ${_xrpc_test_flags})
+    target_link_libraries(xrpc_cpp_${name}_test PRIVATE ${ARG_LINK} Threads::Threads)
+    add_test(NAME xrpc_cpp_${name} COMMAND xrpc_cpp_${name}_test ${ARG_ARGS})
+    set_tests_properties(xrpc_cpp_${name} PROPERTIES TIMEOUT 30)
+  endfunction()
+  function(xgc2_xrpc_boost_json_test name)
+    target_include_directories(xrpc_cpp_${name}_test SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
+    target_compile_definitions(xrpc_cpp_${name}_test PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
+  endfunction()
+
+  if("unix" IN_LIST _xrpc_components)
+    xgc2_xrpc_test(stop tests/stop_test.cpp LINK XgcXrpc::unix)
+  endif()
+  if("diagnostics" IN_LIST _xrpc_components)
+    xgc2_xrpc_test(diagnostics tests/diagnostics_test.cpp LINK XgcXrpc::diagnostics)
+    xgc2_xrpc_boost_json_test(diagnostics)
+  endif()
+  if("bootstrap" IN_LIST _xrpc_components)
+    xgc2_xrpc_test(bootstrap tests/bootstrap_test.cpp LINK XgcXrpc::bootstrap OpenSSL::Crypto)
+    xgc2_xrpc_boost_json_test(bootstrap)
+    target_compile_definitions(xrpc_cpp_bootstrap_test PRIVATE
+      XRPC_BOOTSTRAP_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../contracts/fixtures/bootstrap.json")
+  endif()
+  if("http" IN_LIST _xrpc_components)
+    foreach(case runtime http_host resources fault diagnostic_transport)
+      xgc2_xrpc_test(${case} tests/${case}_test.cpp LINK XgcXrpc::http)
+    endforeach()
+    xgc2_xrpc_test(wire tests/wire_test.cpp LINK XgcXrpc::http)
+    xgc2_xrpc_boost_json_test(wire)
+    target_compile_definitions(xrpc_cpp_wire_test PRIVATE
+      XRPC_WIRE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../contracts/fixtures/wire.json")
+  endif()
+  if("json_http" IN_LIST _xrpc_components)
+    xgc2_xrpc_test(json_http tests/json_http_test.cpp LINK XgcXrpc::json_http)
+  endif()
+  if("udp" IN_LIST _xrpc_components)
+    # The tests reach the library's internals (codec, address helpers) through
+    # its exported symbols and the private headers in src/.
+    xgc2_xrpc_test(udp_wire tests/udp_wire_test.cpp LINK XgcXrpc::udp)
+    xgc2_xrpc_test(udp_server tests/udp_server_test.cpp LINK XgcXrpc::udp ARGS 127.0.0.1)
+    # IPv6 loopback, or a private one made in a user+network namespace; exit 77
+    # (skipped) where neither exists. See the comment in the test.
+    add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND xrpc_cpp_udp_server_test ::1)
+    set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    set_tests_properties(xrpc_cpp_udp_server PROPERTIES TIMEOUT 60)
+    # The peer of the cross-language tests: a fixed command line and READY line
+    # (see the header of the source); the Go interop test starts this binary.
+    add_executable(xgc2-xrpc-udp-interop-server tests/udp_interop_server.cpp)
+    target_compile_features(xgc2-xrpc-udp-interop-server PRIVATE cxx_std_17)
+    target_compile_options(xgc2-xrpc-udp-interop-server PRIVATE ${_xrpc_test_flags})
+    target_link_libraries(xgc2-xrpc-udp-interop-server PRIVATE XgcXrpc::udp Threads::Threads)
+    xgc2_xrpc_test(udp_interop tests/udp_interop_test.cpp LINK XgcXrpc::udp
+      ARGS $<TARGET_FILE:xgc2-xrpc-udp-interop-server>)
+    add_dependencies(xrpc_cpp_udp_interop_test xgc2-xrpc-udp-interop-server)
+  endif()
+  if("grpc" IN_LIST _xrpc_components)
     find_program(XgcXrpcGrpcPlugin grpc_cpp_plugin)
     if(NOT XgcXrpcGrpcPlugin)
       message(FATAL_ERROR "gRPC fixture generation requires grpc_cpp_plugin")
     endif()
     set(grpc_fixture_dir "${CMAKE_CURRENT_BINARY_DIR}/grpc-fixture")
-    file(MAKE_DIRECTORY "${grpc_fixture_dir}")
+    file(MAKE_DIRECTORY "${grpc_fixture_dir}/google/rpc")
     add_custom_command(OUTPUT
       "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.pb.h"
       "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.h"
@@ -134,7 +207,6 @@ if(BUILD_TESTING)
       DEPENDS tests/grpc_fixture.proto VERBATIM)
     # Vendored googleapis messages: the test decodes the hand-written
     # application-error marker with generated code. Never part of the SDK.
-    file(MAKE_DIRECTORY "${grpc_fixture_dir}/google/rpc")
     add_custom_command(OUTPUT
       "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/status.pb.h"
       "${grpc_fixture_dir}/google/rpc/error_details.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.h"
@@ -144,14 +216,15 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/google/rpc/status.proto
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/google/rpc/error_details.proto
       DEPENDS tests/proto/google/rpc/status.proto tests/proto/google/rpc/error_details.proto VERBATIM)
-    add_executable(xrpc_cpp_grpc_test tests/grpc_test.cpp
+    xgc2_xrpc_test(grpc tests/grpc_test.cpp LINK XgcXrpc::grpc protobuf::libprotobuf
+      SOURCES
+        "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc"
+        "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.cc")
+    # Generated code is not held to the SDK's warning level.
+    target_include_directories(xrpc_cpp_grpc_test SYSTEM PRIVATE "${grpc_fixture_dir}")
+    set_source_files_properties(
       "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc"
-      "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.cc")
-    target_compile_features(xrpc_cpp_grpc_test PRIVATE cxx_std_17)
-    target_compile_options(xrpc_cpp_grpc_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
-    target_include_directories(xrpc_cpp_grpc_test PRIVATE "${grpc_fixture_dir}")
-    target_link_libraries(xrpc_cpp_grpc_test PRIVATE XgcXrpc::grpc protobuf::libprotobuf)
-    add_test(NAME xrpc_cpp_grpc COMMAND xrpc_cpp_grpc_test)
-    set_tests_properties(xrpc_cpp_grpc PROPERTIES TIMEOUT 30)
+      "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.cc"
+      PROPERTIES COMPILE_OPTIONS -w)
   endif()
 endif()

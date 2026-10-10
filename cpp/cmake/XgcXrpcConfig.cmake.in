@@ -1,10 +1,22 @@
 @PACKAGE_INIT@
 set(XgcXrpc_FOUND TRUE)
 unset(XgcXrpc_NOT_FOUND_MESSAGE)
+
+# Components by export name, in dependency order. An installation provides the
+# subset it was built with (the Bionic package only udp), so which components
+# exist is decided by the installed export files.
+set(_XgcXrpc_exports Unix Diagnostics Bootstrap Http JsonHttp Grpc Udp)
 set(_XgcXrpc_components ${XgcXrpc_FIND_COMPONENTS})
 set(_XgcXrpc_default_components FALSE)
 if(NOT _XgcXrpc_components)
-  set(_XgcXrpc_components unix diagnostics http)
+  # Without COMPONENTS: the installed core. json_http and grpc need further
+  # third-party packages and are always requested by name.
+  foreach(_XgcXrpc_export Unix Diagnostics Bootstrap Http Udp)
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/XgcXrpc${_XgcXrpc_export}Targets.cmake")
+      string(TOLOWER "${_XgcXrpc_export}" _XgcXrpc_component)
+      list(APPEND _XgcXrpc_components ${_XgcXrpc_component})
+    endif()
+  endforeach()
   set(_XgcXrpc_default_components TRUE)
 endif()
 if("json_http" IN_LIST _XgcXrpc_components)
@@ -25,7 +37,7 @@ foreach(_XgcXrpc_component IN LISTS _XgcXrpc_components)
 endforeach()
 
 # Dependency order permits each export to validate only its own library.
-foreach(_XgcXrpc_export Unix Diagnostics Bootstrap Http JsonHttp Grpc)
+foreach(_XgcXrpc_export IN LISTS _XgcXrpc_exports)
   string(TOLOWER "${_XgcXrpc_export}" _XgcXrpc_component)
   if(_XgcXrpc_export STREQUAL "JsonHttp")
     set(_XgcXrpc_component json_http)
@@ -106,6 +118,7 @@ foreach(_XgcXrpc_component IN LISTS _XgcXrpc_components)
   endif()
 endforeach()
 check_required_components(XgcXrpc)
+unset(_XgcXrpc_exports)
 unset(_XgcXrpc_components)
 unset(_XgcXrpc_default_components)
 unset(_XgcXrpc_component)
