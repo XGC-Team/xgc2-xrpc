@@ -124,8 +124,8 @@ public:
   ~ServerCore() { shutdown(std::chrono::milliseconds::zero()); }
 
   void add_method(std::string name, Server::Handler handler) {
-    if (name.empty() || name.size() > max_method_bytes || !handler)
-      throw std::logic_error("udp method needs a name of 1..128 bytes and a handler");
+    if (!valid_method(name) || !handler)
+      throw std::logic_error("udp method needs a name of 1..128 bytes of UTF-8 without spaces and a handler");
     std::lock_guard<std::mutex> lock(mutex_);
     if (started_) throw std::logic_error("udp methods are fixed once the server has started");
     if (!methods_.emplace(std::move(name), std::move(handler)).second)

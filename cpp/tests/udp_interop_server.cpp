@@ -21,6 +21,7 @@
 #include <csignal>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -94,14 +95,18 @@ int main(int argc, char **argv) {
     KeyRing keys;
     keys.add(static_cast<std::uint32_t>(key_id), std::string(key->begin(), key->end()));
 
+    // The handlers use these, so they are declared before (and outlive) the server.
+    std::atomic<std::uint64_t> counter{0};
+    // Sleep waits on this, so that a shutdown does not have to outwait a long one.
+    std::mutex sleepers_mutex;
+    std::condition_variable wake_sleepers;
+    bool stopping = false;
+    std::vector<std::thread> sleepers;
+
     ServerOptions options;
     options.bind_address = bind;
     options.port = static_cast<std::uint16_t>(port);
     Server server(options, std::move(keys));
-
-    std::atomic<std::uint64_t> counter{0};
-    std::mutex sleepers_mutex;
-    std::vector<std::thread> sleepers;
     server.add_method("test.v1/Echo", [](Request request, Reply reply) {
       reply.complete(Status::Ok, request.body);
     });
@@ -115,9 +120,11 @@ int main(int argc, char **argv) {
         return;
       }
       std::lock_guard<std::mutex> lock(sleepers_mutex);
-      sleepers.emplace_back([ms = *ms, body = std::move(request.body), reply = std::move(reply)]() mutable {
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        reply.complete(Status::Ok, body);
+      sleepers.emplace_back([&, ms = *ms, body = std::move(request.body), reply = std::move(reply)]() mutable {
+        std::unique_lock<std::mutex> wait(sleepers_mutex);
+        const bool shutdown = wake_sleepers.wait_for(wait, std::chrono::milliseconds(ms), [&] { return stopping; });
+        wait.unlock();
+        if (!shutdown) reply.complete(Status::Ok, body);
       });
     });
     server.add_method("test.v1/Fail", [](Request request, Reply reply) {
@@ -137,6 +144,11 @@ int main(int argc, char **argv) {
 
     int received = 0;
     sigwait(&signals, &received);
+    {
+      std::lock_guard<std::mutex> lock(sleepers_mutex);
+      stopping = true;
+    }
+    wake_sleepers.notify_all();
     server.shutdown(std::chrono::milliseconds(500));
     for (auto &sleeper : sleepers) sleeper.join();
     return 0;

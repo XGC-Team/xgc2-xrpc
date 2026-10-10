@@ -52,8 +52,8 @@ Response Client::call(std::string_view endpoint, std::uint32_t key_id, std::stri
   if (!key) return not_sent(Status::InvalidArgument, "no key for this key_id");
   const auto target = detail::parse_endpoint(endpoint);
   if (!target) return not_sent(Status::InvalidArgument, "endpoint must be a numeric host:port");
-  if (method.empty() || method.size() > max_method_bytes)
-    return not_sent(Status::InvalidArgument, "method must be 1..128 bytes");
+  if (!detail::valid_method(method))
+    return not_sent(Status::InvalidArgument, "method must be 1..128 bytes of UTF-8 without spaces or control characters");
   if (body.size() > detail::max_body_bytes(method.size()))
     return not_sent(Status::ResourceExhausted, "request does not fit one 1200-byte datagram");
   if (deadline == SteadyClock::time_point::max())
@@ -100,19 +100,24 @@ Response Client::call(std::string_view endpoint, std::uint32_t key_id, std::stri
       detail::Datagram reply;
       // Anything that is not an authentic answer to this very request is
       // ignored, whoever sent it: the tag, not the source address, decides.
+      // Flag bits of a reply carry no meaning and are not interpreted.
       if (detail::parse(buffer.data(), static_cast<std::size_t>(n), reply) != detail::Parse::Ok ||
           reply.type != detail::Type::Reply || reply.key_id != key_id ||
-          reply.request_id != request_id || reply.flags != 0 || reply.word > 10 ||
-          !detail::verify(reply, *key))
+          reply.request_id != request_id || reply.word > 10 || !detail::verify(reply, *key))
         continue;
-      const auto status = static_cast<Status>(reply.word);
-      // A pinned client that reaches another instance gets conflict from it.
-      if (expected_instance && reply.instance != *expected_instance && status != Status::Conflict)
-        continue;
-      response.delivery = Delivery::ResponseReceived;
-      response.status = status;
+      response.status = static_cast<Status>(reply.word);
       response.body.assign(reply.body);
       response.instance = reply.instance;
+      if (expected_instance && reply.instance != *expected_instance) {
+        // Only the other instance's fence answer means anything to a pinned
+        // call; its other replies are not answers to it. The pinned instance
+        // may have run the request before it went away, so the outcome is unknown.
+        if (response.status != Status::Conflict) continue;
+        response.delivery = Delivery::OutcomeUnknown;
+        response.message = "the server instance changed: it is not the pinned instance";
+        return response;
+      }
+      response.delivery = Delivery::ResponseReceived;
       return response;
     }
   }

@@ -161,24 +161,32 @@ void random_bytes(std::uint8_t *out, std::size_t size) {
   if (RAND_bytes(out, static_cast<int>(size)) != 1) throw std::runtime_error("RAND_bytes failed");
 }
 
+namespace {
+// Length of the well-formed UTF-8 sequence at text[i] (1 for ASCII), or 0.
+std::size_t utf8_length(std::string_view text, std::size_t i) {
+  const auto c = static_cast<unsigned char>(text[i]);
+  if (c < 0x80) return 1;
+  const std::size_t length = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3
+                           : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+  if (length == 0 || i + length > text.size()) return 0;
+  std::uint32_t code = length == 2 ? c & 0x1f : length == 3 ? c & 0x0f : c & 0x07;
+  for (std::size_t k = 1; k < length; ++k) {
+    const auto next = static_cast<unsigned char>(text[i + k]);
+    if ((next & 0xc0) != 0x80) return 0;
+    code = code << 6 | (next & 0x3f);
+  }
+  const bool overlong = (length == 3 && code < 0x800) || (length == 4 && code < 0x10000);
+  return overlong || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) ? 0 : length;
+}
+} // namespace
+
 void append_json_string(std::string &out, std::string_view text) {
   static const char hex[] = "0123456789abcdef";
   out.push_back('"');
   for (std::size_t i = 0; i < text.size();) {
     const auto c = static_cast<unsigned char>(text[i]);
     if (c >= 0x80) {
-      std::size_t length = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3
-                         : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
-      std::uint32_t code = length == 2 ? c & 0x1f : length == 3 ? c & 0x0f : c & 0x07;
-      bool valid = length != 0 && i + length <= text.size();
-      for (std::size_t k = 1; valid && k < length; ++k) {
-        const auto next = static_cast<unsigned char>(text[i + k]);
-        valid = (next & 0xc0) == 0x80;
-        code = code << 6 | (next & 0x3f);
-      }
-      valid = valid && !(length == 3 && code < 0x800) && !(length == 4 && code < 0x10000) &&
-              code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff);
-      if (valid) {
+      if (const auto length = utf8_length(text, i)) {
         out.append(text.substr(i, length));
         i += length;
       } else {
@@ -206,6 +214,17 @@ void append_json_string(std::string &out, std::string_view text) {
     }
   }
   out.push_back('"');
+}
+
+bool valid_method(std::string_view method) {
+  if (method.empty() || method.size() > max_method_bytes) return false;
+  for (std::size_t i = 0; i < method.size();) {
+    const auto length = utf8_length(method, i);
+    const auto c = static_cast<unsigned char>(method[i]);
+    if (length == 0 || (length == 1 && (c <= ' ' || c == 0x7f))) return false;
+    i += length;
+  }
+  return true;
 }
 } // namespace detail
 

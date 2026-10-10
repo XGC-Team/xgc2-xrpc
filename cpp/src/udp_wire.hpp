@@ -64,4 +64,6 @@ std::optional<std::vector<std::uint8_t>> base64_decode(std::string_view text);
 void random_bytes(std::uint8_t *out, std::size_t size);
 // JSON string literal of the text, quotes included; invalid UTF-8 becomes U+FFFD.
 void append_json_string(std::string &out, std::string_view text);
+// A method name: 1..128 bytes of valid UTF-8 without spaces or control characters.
+bool valid_method(std::string_view method);
 } // namespace xgc2::xrpc::udp::detail

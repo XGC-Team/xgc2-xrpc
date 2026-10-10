@@ -236,11 +236,11 @@ struct Response {
   // ResponseReceived: the server's status. Otherwise the local failure class:
   // InvalidArgument (unusable arguments), ResourceExhausted (does not fit one
   // datagram), DeadlineExceeded (deadline passed first), Unavailable (no
-  // datagram could be sent).
+  // datagram could be sent), or Conflict with OutcomeUnknown (see Client::call).
   Status status = Status::Unavailable;
-  std::string body;    // the server's reply body when ResponseReceived
+  std::string body;    // the server's reply body whenever a reply was accepted
   std::string message; // local failure detail, empty when ResponseReceived
-  InstanceId instance{}; // the replying server's instance; zero otherwise
+  InstanceId instance{}; // the replying server's instance; zero if none replied
   unsigned attempts = 0; // datagrams sent
 };
 
@@ -255,9 +255,12 @@ public:
   // server runs it once), until a valid reply arrives or the deadline passes.
   // A deadline further than max_timeout_ms away is shortened to it. A reply is
   // valid only if its tag verifies with key_id's key and it is a reply to this
-  // request id from the pinned instance. With expected_instance set, a server
-  // of another instance answers conflict; that authenticated reply is returned
-  // as ResponseReceived with the instance that sent it.
+  // request id (from the pinned instance, if one is set). With expected_instance
+  // set, a server of another instance answers conflict without running the
+  // request; that reply is returned as status Conflict with OutcomeUnknown,
+  // because the pinned instance may have run the request before it went away,
+  // and with the instance that answered so the caller can look at it again.
+  // Other replies of a foreign instance are ignored.
   Response call(std::string_view endpoint, std::uint32_t key_id,
                 std::string_view method, std::string_view body,
                 std::chrono::steady_clock::time_point deadline,

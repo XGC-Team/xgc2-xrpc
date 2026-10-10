@@ -260,7 +260,8 @@ void configured_instance() {
   InstanceId stale = domain;
   stale[15] ^= 1;
   const auto refused = env.call("test/Echo", "{}", seconds(2), stale);
-  assert(refused.status == Status::Conflict && refused.instance == domain);
+  assert(refused.delivery == Delivery::OutcomeUnknown && refused.status == Status::Conflict);
+  assert(refused.instance == domain);
   // Two servers may deliberately share an identity; zero is not an identity.
   Env twin([&](ServerOptions &options) { options.instance = domain; });
   assert(twin.server->instance() == env.server->instance());
@@ -513,9 +514,10 @@ void instance_pinning() {
   InstanceId stale = env.server->instance();
   stale[0] ^= 0xff;
   const auto refused = env.call("test/Count", "", seconds(2), stale);
-  // The fence answers conflict, naming the instance that is really there.
-  assert(refused.delivery == Delivery::ResponseReceived && refused.status == Status::Conflict);
-  assert(refused.instance == env.server->instance() && refused.attempts >= 1);
+  // The fence answers conflict, naming the instance that is really there. The
+  // outcome stays unknown for the caller: the pinned instance may have run it.
+  assert(refused.delivery == Delivery::OutcomeUnknown && refused.status == Status::Conflict);
+  assert(refused.instance == env.server->instance() && refused.attempts >= 1 && !refused.message.empty());
   assert(refused.body.find("\"code\":\"conflict\"") != std::string::npos);
   assert(env.probe.counter == 1); // the fenced call never ran
   assert(env.call("test/Count", "", seconds(2), InstanceId{}).status == Status::Conflict); // zero is a pin
@@ -593,12 +595,15 @@ void client_input_validation() {
                                "127.0.0.1:65536", "127.0.0.1:99999", "127.0.0.1:12ab", "::1:80",
                                "[::1]", "[::1]80", "[::1", "::1", "127.0.0.1:80:80", "example.org:80"})
     expect_not_sent(call(endpoint, 7, "test/Echo", now + seconds(1)), Status::InvalidArgument);
-  expect_not_sent(call(good, 7, "", now + seconds(1)), Status::InvalidArgument);
-  expect_not_sent(call(good, 7, std::string(129, 'm'), now + seconds(1)), Status::InvalidArgument);
+  for (const std::string &method : {std::string(""), std::string(129, 'm'), std::string("has space"),
+                                   std::string("tab\there"), std::string("nul\0byte", 8), std::string("del\x7f"),
+                                   std::string("bad\xff" "utf8"), std::string("\xc0\xaf")})
+    expect_not_sent(call(good, 7, method, now + seconds(1)), Status::InvalidArgument);
   expect_not_sent(call(good, 7, "test/Echo", steady_clock::time_point::max()), Status::InvalidArgument);
   expect_not_sent(call(good, 7, "test/Echo", now - seconds(1)), Status::DeadlineExceeded);
   assert(env.server->stats().received == 0);
   assert(env.call(std::string(128, 'm'), "{}").status == Status::NotFound); // the longest method
+  assert(env.call("xgc2.chassis.hold.v2/\xc3\xa9\xe2\x82\xac", "{}").status == Status::NotFound); // UTF-8 is fine
   ClientOptions bad;
   bad.steady_interval = milliseconds(0);
   throws<std::invalid_argument>([&] { Client client(keys(), bad); });
@@ -696,9 +701,6 @@ void client_ignores_what_is_not_its_reply() {
     replies.push_back(bad_tag);
     replies.push_back(encode_request(key7, 7, d.request_id, std::nullopt, 1000, "test/Echo", "request type"));
     replies.push_back(reply(key7, 7, d.request_id, instance, 99, "unknown status"));
-    auto flags = reply(key7, 7, d.request_id, instance, 0, "reply flags");
-    flags[7] = 1;
-    replies.push_back(resign(flags, key7));
     replies.push_back(Bytes(40, 7));
     replies.push_back(reply(key7, 7, d.request_id, instance, 0, "real reply"));
     return replies;
@@ -715,8 +717,16 @@ void client_ignores_what_is_not_its_reply() {
   const auto fenced = run(instance, seconds(3), [&](const Datagram &d) {
     return std::vector<Bytes>{reply(key7, 7, d.request_id, other_instance, 3, "{\"code\":\"conflict\"}")};
   });
-  assert(fenced.delivery == Delivery::ResponseReceived && fenced.status == Status::Conflict);
-  assert(fenced.instance == other_instance);
+  assert(fenced.delivery == Delivery::OutcomeUnknown && fenced.status == Status::Conflict);
+  assert(fenced.instance == other_instance && fenced.body == "{\"code\":\"conflict\"}" && !fenced.message.empty());
+  // Flag bits of a reply are not interpreted (bit 0 means something only in a request).
+  const auto flagged = run(std::nullopt, seconds(3), [&](const Datagram &d) {
+    auto datagram = reply(key7, 7, d.request_id, instance, 0, "flagged reply");
+    datagram[6] = 0x80;
+    datagram[7] = 0x01;
+    return std::vector<Bytes>{resign(datagram, key7)};
+  });
+  assert(flagged.delivery == Delivery::ResponseReceived && flagged.body == "flagged reply");
   // A deadline further away than udp.v1's 60 s is shortened on the wire.
   std::uint32_t advertised = 0;
   run(std::nullopt, hours(1), [&](const Datagram &d) {
@@ -901,6 +911,8 @@ void construction_and_registration_rules() {
   const Server::Handler handler = [](Request, Reply) {};
   throws<std::logic_error>([&] { server.add_method("", handler); });
   throws<std::logic_error>([&] { server.add_method(std::string(129, 'm'), handler); });
+  for (const char *name : {"has space", "tab\t", "bad\xff", "\x7f"})
+    throws<std::logic_error>([&] { server.add_method(name, handler); });
   throws<std::logic_error>([&] { server.add_method("test/Null", nullptr); });
   server.add_method(std::string(128, 'm'), handler);
   server.add_method("test/Once", handler);
