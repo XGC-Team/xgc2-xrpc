@@ -99,11 +99,18 @@ func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 	return s.out, nil
 }
 
+// defaultEventClient derives a client from ref. Its timeouts bound connection
+// setup and the wait for response headers, never the stream itself.
 func defaultEventClient(ref xrpc.ServiceRef) *http.Client {
-	transport := &http.Transport{Proxy: nil, DisableCompression: true, ForceAttemptHTTP2: false, IdleConnTimeout: 30 * time.Second, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+	dialer := &net.Dialer{Timeout: xrpc.DefaultCallTimeout}
+	transport := &http.Transport{
+		Proxy: nil, DisableCompression: true, ForceAttemptHTTP2: false, IdleConnTimeout: 30 * time.Second,
+		DialContext: dialer.DialContext, TLSHandshakeTimeout: xrpc.DefaultHeaderTimeout, ResponseHeaderTimeout: xrpc.DefaultCallTimeout,
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
 	if ref.Endpoint.Kind == "unix" {
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", ref.Endpoint.Address)
+			return dialer.DialContext(ctx, "unix", ref.Endpoint.Address)
 		}
 	}
 	return &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
