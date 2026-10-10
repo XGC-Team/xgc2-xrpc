@@ -194,10 +194,7 @@ type HostOptions struct {
 	IdleTimeout time.Duration
 	// HandshakeTimeout bounds connection setup (default xrpc.DefaultHeaderTimeout).
 	HandshakeTimeout time.Duration
-	// ShutdownTimeout is the drain budget of owners that call Shutdown with it
-	// (default xrpc.DefaultShutdownTimeout).
-	ShutdownTimeout time.Duration
-	InstanceID      string
+	InstanceID       string
 	// DiscoveryMethods names exact unary description methods. Only an absent
 	// instance is unbound; supplied empty or mismatched instances stay rejected.
 	DiscoveryMethods []string
@@ -242,9 +239,6 @@ func (o HostOptions) defaults() HostOptions {
 	}
 	if o.HandshakeTimeout <= 0 {
 		o.HandshakeTimeout = xrpc.DefaultHeaderTimeout
-	}
-	if o.ShutdownTimeout <= 0 {
-		o.ShutdownTimeout = xrpc.DefaultShutdownTimeout
 	}
 	return o
 }
