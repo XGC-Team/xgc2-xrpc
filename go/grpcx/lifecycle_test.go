@@ -148,7 +148,7 @@ func TestStreamHeadersPrecedeFirstDomainReceive(t *testing.T) {
 			}
 			return stream.SendMsg(&emptypb.Empty{})
 		}}}}, struct{}{})
-	}, HostOptions{InstanceID: "boot"}, BoundService("boot", time.Second, 1)...)
+	}, HostOptions{InstanceID: "boot", MaxCallTime: time.Second, MaxInFlight: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

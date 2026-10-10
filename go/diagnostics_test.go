@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,7 +12,6 @@ import (
 	"time"
 
 	"github.com/XGC-Team/xgc2-xrpc/go"
-	"golang.org/x/sys/unix"
 )
 
 type blockingSink struct {
@@ -22,31 +19,6 @@ type blockingSink struct {
 	release chan struct{}
 	once    sync.Once
 	written bytes.Buffer
-}
-
-func TestFileDiagnosticRejectsFIFOAndSmallerArchiveGrant(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Mkfifo(filepath.Join(directory, "fifo.log"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	if sink, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "fifo.log", MaxBytes: 256, Files: 1}); err == nil {
-		sink.Close()
-		t.Fatal("FIFO log accepted")
-	}
-	if time.Since(start) > time.Second {
-		t.Fatal("FIFO constructor blocked")
-	}
-	if err := os.WriteFile(filepath.Join(directory, "small.log.1"), []byte("previous archive"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if sink, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "small.log", MaxBytes: 256, Files: 1}); err == nil {
-		sink.Close()
-		t.Fatal("old archive escaped smaller grant")
-	}
 }
 
 func (w *blockingSink) Write(body []byte) (int, error) {
@@ -151,63 +123,5 @@ func TestDiagnosticSinkFailureAndRepeatedEventRateLimit(t *testing.T) {
 	status := diagnostics.Status()
 	if status.Written != 0 || status.SinkErrors == 0 || status.SinkErrors > 8 || status.Dropped != 100 {
 		t.Fatalf("sink/rate counts %+v", status)
-	}
-}
-
-func TestFileDiagnosticGrantRotationAndNamespaceReplacement(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0700); err != nil {
-		t.Fatal(err)
-	}
-	sink, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "xrpc.log", MaxBytes: 256, Files: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 20; i++ {
-		if _, err = sink.Write([]byte(strings.Repeat("x", 200) + "\n")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err = sink.Write([]byte(strings.Repeat("y", 257))); err == nil {
-		t.Fatal("unbounded record accepted")
-	}
-	files, err := os.ReadDir(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != 4 {
-		t.Fatalf("rotation files=%d", len(files))
-	}
-	for _, file := range files {
-		info, err := file.Info()
-		if err != nil || info.Size() > 256 || info.Mode().Perm() != 0600 {
-			t.Fatalf("unsafe archive %+v %v", info, err)
-		}
-	}
-	if other, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "xrpc.log", MaxBytes: 256, Files: 3}); err == nil {
-		other.Close()
-		t.Fatal("second independent writer accepted")
-	}
-	active := filepath.Join(directory, "xrpc.log")
-	if err = os.Rename(active, filepath.Join(directory, "old-owner")); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(active, []byte("replacement"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = sink.Write([]byte("late-owner")); err == nil {
-		t.Fatal("writer followed replacement inode")
-	}
-	sink.Close()
-	if body, err := os.ReadFile(active); err != nil || string(body) != "replacement" {
-		t.Fatal("replacement changed", err)
-	}
-	alias := filepath.Join(t.TempDir(), "alias")
-	if err = os.Symlink(directory, alias); err != nil {
-		t.Fatal(err)
-	}
-	if rejected, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: alias, Name: "log", MaxBytes: 256, Files: 1}); err == nil {
-		rejected.Close()
-		t.Fatal("symlink grant accepted")
 	}
 }

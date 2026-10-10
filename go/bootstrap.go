@@ -2,11 +2,8 @@ package xrpc
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -72,7 +69,7 @@ func (b BootstrapBinding) Validate() error {
 	if b.Profile != HTTP && b.Profile != GRPC {
 		return bootstrapError()
 	}
-	if err := b.Endpoint.Validate(); err != nil || len(b.Endpoint.Address) > 2048 {
+	if err := b.Endpoint.Validate(); err != nil || len(b.Endpoint.Address) > 2048 || b.Endpoint.Kind == "udp" {
 		return bootstrapError()
 	}
 	for _, c := range b.Endpoint.Address {
@@ -320,7 +317,7 @@ func requiredJSON(data []byte, names ...string) bool {
 	}
 	return true
 }
-func ParseBootstrapBinding(data []byte) (BootstrapBinding, error) {
+func parseBootstrapBinding(data []byte) (BootstrapBinding, error) {
 	var b BootstrapBinding
 	if !requiredJSON(data, "schema_version", "target_id", "service", "api_version", "profile", "endpoint", "runtime_grant", "authentication", "secret_handles", "storage_grants") {
 		return b, bootstrapError()
@@ -344,96 +341,79 @@ func ParseBootstrapBinding(data []byte) (BootstrapBinding, error) {
 	return cloneBinding(b), nil
 }
 
-// Authorization receives exactly the native caller header values. A grant
-// owner may implement existing peer policy; authorization cannot extend ctx.
-type Authorization func(context.Context, []string) bool
-type CredentialGrant struct {
-	kind      string
-	identity  tls.Certificate
-	trust     *x509.CertPool
-	authorize Authorization
-	headers   map[string]string
+// credentialGrant is one resolved startup credential: a TLS identity, a TLS
+// trust pool or the single Authorization header of a bearer token.
+type credentialGrant struct {
+	kind     string
+	identity tls.Certificate
+	trust    *x509.CertPool
+	headers  map[string]string
 }
-type GrantResolver func(string) (CredentialGrant, error)
 
-func (g CredentialGrant) Kind() string { return g.kind }
-func NewTLSIdentityGrant(certPEM, keyPEM []byte) (CredentialGrant, error) {
+func newTLSIdentityGrant(certPEM, keyPEM []byte) (credentialGrant, error) {
 	if len(certPEM) == 0 || len(certPEM) > 128<<10 || len(keyPEM) == 0 || len(keyPEM) > 64<<10 {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil || len(cert.Certificate) == 0 {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	for _, der := range cert.Certificate {
 		if _, err := x509.ParseCertificate(der); err != nil {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 	}
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	signer, ok := cert.PrivateKey.(crypto.Signer)
 	if !ok {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	expected, _ := x509.MarshalPKIXPublicKey(leaf.PublicKey)
 	actual, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err != nil || !bytes.Equal(expected, actual) {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	cert.Leaf = leaf
-	return CredentialGrant{kind: "tls_identity", identity: cert}, nil
+	return credentialGrant{kind: "tls_identity", identity: cert}, nil
 }
-func NewTLSTrustGrant(caPEM []byte) (CredentialGrant, error) {
+func newTLSTrustGrant(caPEM []byte) (credentialGrant, error) {
 	if len(caPEM) == 0 || len(caPEM) > 128<<10 {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	pool := x509.NewCertPool()
 	count := 0
 	for len(bytes.TrimSpace(caPEM)) > 0 {
 		caPEM = bytes.TrimSpace(caPEM)
 		if !bytes.HasPrefix(caPEM, []byte("-----BEGIN CERTIFICATE-----")) {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		block, rest := pem.Decode(caPEM)
 		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		consumed := caPEM[:len(caPEM)-len(rest)]
 		if bytes.Count(consumed, []byte("-----BEGIN CERTIFICATE-----")) != 1 || bytes.Count(consumed, []byte("-----END CERTIFICATE-----")) != 1 {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		pool.AddCert(cert)
 		count++
 		caPEM = rest
 	}
 	if count == 0 {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
-	return CredentialGrant{kind: "tls_trust", trust: pool}, nil
+	return credentialGrant{kind: "tls_trust", trust: pool}, nil
 }
-func NewAuthorizationGrant(authorize Authorization, headers map[string]string) (CredentialGrant, error) {
-	if authorize == nil || len(headers) > 1 {
-		return CredentialGrant{}, bootstrapError()
-	}
-	copy := map[string]string{}
-	for name, value := range headers {
-		if strings.ToLower(name) != "authorization" || value == "" || len(value) > 1031 || strings.ContainsAny(value, "\r\n\x00") {
-			return CredentialGrant{}, bootstrapError()
-		}
-		copy["Authorization"] = value
-	}
-	return CredentialGrant{kind: "authorization", authorize: authorize, headers: copy}, nil
-}
-func NewBearerGrant(token string) (CredentialGrant, error) {
+func newBearerGrant(token string) (credentialGrant, error) {
 	if len(token) == 0 || len(token) > 1024 {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 	base, ending := false, false
 	for _, c := range token {
@@ -442,32 +422,26 @@ func NewBearerGrant(token string) (CredentialGrant, error) {
 			continue
 		}
 		if ending || !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._~+/-", c)) {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		base = true
 	}
 	if !base {
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
-	expected := sha256.Sum256([]byte("Bearer " + token))
-	return NewAuthorizationGrant(func(ctx context.Context, values []string) bool {
-		if ctx == nil || ctx.Err() != nil || len(values) != 1 || len(values[0]) > 1031 {
-			return false
-		}
-		actual := sha256.Sum256([]byte(values[0]))
-		return subtle.ConstantTimeCompare(actual[:], expected[:]) == 1
-	}, map[string]string{"Authorization": "Bearer " + token})
+	return credentialGrant{kind: "authorization", headers: map[string]string{"Authorization": "Bearer " + token}}, nil
 }
 
+// BootstrapCredentials are the native credentials of one loaded binding. They
+// are an immutable startup snapshot; every getter returns a copy.
 type BootstrapCredentials struct {
-	binding       BootstrapBinding
-	role          BootstrapRole
-	tls           *tls.Config
-	authorization Authorization
-	headers       map[string]string
+	binding BootstrapBinding
+	role    BootstrapRole
+	tls     *tls.Config
+	headers map[string]string
 }
 
-func (b BootstrapBinding) ResolveCredentials(resolve GrantResolver, role BootstrapRole) (*BootstrapCredentials, error) {
+func (b BootstrapBinding) resolveCredentials(resolve func(string) (credentialGrant, error), role BootstrapRole) (*BootstrapCredentials, error) {
 	if err := b.Validate(); err != nil {
 		return nil, err
 	}
@@ -476,11 +450,6 @@ func (b BootstrapBinding) ResolveCredentials(resolve GrantResolver, role Bootstr
 	}
 	result := &BootstrapCredentials{binding: cloneBinding(b), role: role, headers: map[string]string{}}
 	handles := b.SecretHandles
-	if b.Endpoint.Kind != "unix" || handles.TLSIdentity != "" || handles.TLSTrust != "" || handles.Authorization != "" {
-		if resolve == nil {
-			return nil, bootstrapError()
-		}
-	}
 	if b.Endpoint.Kind == "unix" {
 		for _, field := range []struct{ handle, kind string }{{handles.TLSIdentity, "tls_identity"}, {handles.TLSTrust, "tls_trust"}} {
 			if field.handle != "" {
@@ -519,13 +488,9 @@ func (b BootstrapBinding) ResolveCredentials(resolve GrantResolver, role Bootstr
 	}
 	if handles.Authorization != "" {
 		auth, err := resolve(handles.Authorization)
-		if err != nil || auth.kind != "authorization" || auth.authorize == nil {
+		if err != nil || auth.kind != "authorization" || len(auth.headers) != 1 {
 			return nil, bootstrapError()
 		}
-		if role == BootstrapClient && len(auth.headers) != 1 {
-			return nil, bootstrapError()
-		}
-		result.authorization = auth.authorize
 		for key, value := range auth.headers {
 			result.headers[key] = value
 		}
@@ -592,13 +557,6 @@ func (c *BootstrapCredentials) Headers() map[string]string {
 		}
 	}
 	return headers
-}
-func (c *BootstrapCredentials) Authorize(ctx context.Context, values []string) bool {
-	if c == nil || ctx == nil || ctx.Err() != nil {
-		return false
-	}
-	allowed := c.authorization == nil && c.binding.Authentication == LocalPrivate || c.authorization != nil && c.authorization(ctx, values)
-	return allowed && ctx.Err() == nil
 }
 func (c *BootstrapCredentials) CheckReference(ref ServiceRef) error {
 	if c == nil {

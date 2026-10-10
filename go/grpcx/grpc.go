@@ -33,10 +33,9 @@ import (
 // DialOptions are plain limits. A zero field selects the default named in its
 // comment; nothing is read from the process environment.
 type DialOptions struct {
-	boundAuthorization bool
-	LocalTargetID      string
-	DialContext        xrpc.DialContext
-	TLSConfig          *tls.Config
+	LocalTargetID string
+	DialContext   xrpc.DialContext
+	TLSConfig     *tls.Config
 	// MaxMessageBytes sets both message limits when MaxRequestBytes or
 	// MaxResponseBytes is zero (default xrpc.DefaultMaxMessageBytes).
 	MaxMessageBytes  int
@@ -176,9 +175,6 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 // HostOptions are plain limits. A zero field selects the default named in its
 // comment; nothing is read from the process environment.
 type HostOptions struct {
-	// Authorize establishes the injected transport caller grant. Product
-	// method/scope checks remain in its native interceptors.
-	Authorize func(context.Context) bool
 	// MaxConnections bounds accepted connections (default xrpc.DefaultMaxConnections).
 	MaxConnections int
 	// MaxConcurrentStreams bounds streams per connection (default xrpc.DefaultStreamsPerConnection).
@@ -270,11 +266,10 @@ type Host struct {
 	options         HostOptions
 }
 
-// Serve uses finite native transport defaults; ServeWithOptions lets the owner
-// configure those limits. Product registration remains generated native gRPC.
-func Serve(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), options ...grpc.ServerOption) (*Host, error) {
-	return ServeWithOptions(listener, lease, register, HostOptions{}, options...)
-}
+// ServeWithOptions hosts product-registered native gRPC services on a Unix
+// listener with finite admission, instance fencing and call budgets. Product
+// registration remains generated native gRPC; remote or long-lived sessions
+// use ServeSession.
 func ServeWithOptions(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), limits HostOptions, options ...grpc.ServerOption) (*Host, error) {
 	return serveOwned(listener, lease, register, limits, nil, options...)
 }
@@ -332,9 +327,7 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 		return nil, errors.New("xrpc: invalid host instance identity")
 	}
 	if edge == nil && listener.Addr().Network() != "unix" {
-		if _, ok := listener.(*tlsListener); !ok {
-			return nil, errors.New("xrpc: remote gRPC listener requires TLS")
-		}
+		return nil, errors.New("xrpc: internal gRPC hosts serve Unix listeners; use ServeSession for remote listeners")
 	}
 	limits = limits.defaults()
 	limits.DiscoveryMethods = append([]string(nil), limits.DiscoveryMethods...)
@@ -411,15 +404,6 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 			if edge == nil {
 				ctx = admittedContext(ctx, limits.InstanceID)
 			}
-			if limits.Authorize != nil {
-				allowed := limits.Authorize(ctx)
-				if ctx.Err() != nil {
-					return nil, status.FromContextError(ctx.Err()).Err()
-				}
-				if !allowed {
-					return nil, status.Error(codes.PermissionDenied, "caller authorization rejected")
-				}
-			}
 			result, err := next(ctx, request)
 			if err == nil && ctx.Err() != nil {
 				return nil, status.FromContextError(ctx.Err()).Err()
@@ -434,15 +418,6 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 			defer release()
 			if edge == nil {
 				stream = &boundedStream{ServerStream: stream, ctx: admittedContext(stream.Context(), limits.InstanceID)}
-			}
-			if limits.Authorize != nil {
-				allowed := limits.Authorize(stream.Context())
-				if stream.Context().Err() != nil {
-					return status.FromContextError(stream.Context().Err()).Err()
-				}
-				if !allowed {
-					return status.Error(codes.PermissionDenied, "caller authorization rejected")
-				}
 			}
 			err = next(server, &readyStream{ServerStream: stream})
 			if err == nil && stream.Context().Err() != nil {
@@ -482,17 +457,6 @@ func newOwnedServer(options ...grpc.ServerOption) (server *grpc.Server, err erro
 		}
 	}()
 	return grpc.NewServer(options...), nil
-}
-
-type tlsListener struct{ net.Listener }
-
-func ServeTLS(listener net.Listener, register func(grpc.ServiceRegistrar), config *tls.Config, options ...grpc.ServerOption) (*Host, error) {
-	if config == nil || len(config.Certificates) == 0 && config.GetCertificate == nil {
-		return nil, errors.New("xrpc: server TLS identity required")
-	}
-	config = config.Clone()
-	config.MinVersion = max(config.MinVersion, tls.VersionTLS12)
-	return Serve(&tlsListener{listener}, nil, register, append(options, grpc.Creds(credentials.NewTLS(config)))...)
 }
 
 func ServeEdgeTLS(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), config *tls.Config, edge EdgeOptions, options ...grpc.ServerOption) (*Host, error) {
@@ -569,37 +533,6 @@ func (h *Host) Status() xrpc.TransportStatus {
 		status.Diagnostics = &d
 	}
 	return status
-}
-
-// FiniteUnary rejects missing budgets and bounds admitted handlers. It does
-// not synthesize success when cancellation wins after a domain side effect.
-func FiniteUnary(maximum time.Duration, inFlight int) grpc.UnaryServerInterceptor {
-	if maximum <= 0 {
-		maximum = 30 * time.Second
-	}
-	if inFlight <= 0 {
-		inFlight = 64
-	}
-	slots := make(chan struct{}, inFlight)
-	return func(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		_, err := xrpc.Remaining(ctx)
-		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, "finite caller deadline required")
-		}
-		ctx, cancel := context.WithTimeout(ctx, maximum)
-		defer cancel()
-		select {
-		case slots <- struct{}{}:
-			defer func() { <-slots }()
-		default:
-			return nil, status.Error(codes.ResourceExhausted, "host concurrency exhausted")
-		}
-		result, err := handler(ctx, request)
-		if err == nil && ctx.Err() != nil {
-			return nil, status.FromContextError(ctx.Err()).Err()
-		}
-		return result, err
-	}
 }
 
 // Profile consumes a product-supplied closed protobuf descriptor set. This is

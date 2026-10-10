@@ -33,12 +33,11 @@ var ErrResponseTooLarge = errors.New("xrpc: HTTP response exceeds byte limit")
 // Config is a plain limits struct. A zero limit selects the default named in
 // its comment; nothing is read from the process environment.
 type Config struct {
-	boundAuthorization bool
-	LocalTargetID      string
-	Service            xrpc.ServiceRef
-	DialContext        xrpc.DialContext
-	TLSConfig          *tls.Config
-	TLSForService      func(xrpc.ServiceRef) (*tls.Config, error)
+	LocalTargetID string
+	Service       xrpc.ServiceRef
+	DialContext   xrpc.DialContext
+	TLSConfig     *tls.Config
+	TLSForService func(xrpc.ServiceRef) (*tls.Config, error)
 	// Headers are copied at construction. Wire-owned identity/budget headers
 	// are rejected; authentication remains an explicitly supplied capability.
 	Headers map[string]string
@@ -237,13 +236,6 @@ func (c *Client) DoStream(ctx context.Context, method, path, requestID, contentT
 }
 
 func (c *Client) doStream(ctx context.Context, method, path, requestID, contentType string, body []byte, headers map[string]string) (*http.Response, error) {
-	if c.config.boundAuthorization {
-		for name := range headers {
-			if strings.EqualFold(name, "Authorization") {
-				return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: caller authorization belongs to bootstrap owner"))
-			}
-		}
-	}
 	if err := validateHeaders(headers); err != nil {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
 	}

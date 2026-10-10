@@ -2,10 +2,6 @@ package audit
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
 	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
 	"github.com/XGC-Team/xgc2-xrpc/go/grpcx"
 	"github.com/XGC-Team/xgc2-xrpc/go/httpx"
@@ -16,7 +12,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -25,47 +20,16 @@ import (
 	"time"
 )
 
-func TestTLSRequestIdentity(t *testing.T) {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-	der, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	listener, _ := net.Listen("tcp", "127.0.0.1:0")
-	seen := make(chan bool, 1)
-	host, err := httpx.ServeTLS(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen <- r.TLS != nil; w.Write([]byte("ok")) }), &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}, httpx.HostOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		host.Shutdown(ctx)
-	}()
-	cert, _ := x509.ParseCertificate(der)
-	roots := x509.NewCertPool()
-	roots.AddCert(cert)
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}, Timeout: time.Second}
-	request, _ := http.NewRequest("GET", "https://"+listener.Addr().String()+"/", nil)
-	request.Header.Set("X-Xrpc-Timeout-Ms", "500")
-	request.Header.Set("X-Request-ID", "audit")
-	reply, err := client.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reply.Body.Close()
-	if !<-seen {
-		t.Fatal("authenticated TLS connection reached handler with Request.TLS=nil")
-	}
-}
 func TestStreamServerMaximum(t *testing.T) {
 	socket := filepath.Join(privateTempDir(t), "grpc.sock")
 	listener, _ := net.Listen("unix", socket)
 	entered := make(chan struct{}, 1)
-	host, err := grpcx.Serve(listener, nil, func(registrar grpc.ServiceRegistrar) {
+	host, err := grpcx.ServeWithOptions(listener, nil, func(registrar grpc.ServiceRegistrar) {
 		registrar.RegisterService(&grpc.ServiceDesc{ServiceName: "audit.Service", HandlerType: (*interface{})(nil), Streams: []grpc.StreamDesc{{StreamName: "Wait", ClientStreams: true, ServerStreams: true, Handler: func(_ any, stream grpc.ServerStream) error {
 			entered <- struct{}{}
 			return stream.RecvMsg(&emptypb.Empty{})
 		}}}}, struct{}{})
-	}, grpcx.BoundService("boot", 30*time.Millisecond, 1)...)
+	}, grpcx.HostOptions{InstanceID: "boot", MaxCallTime: 30 * time.Millisecond, MaxInFlight: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,11 +107,11 @@ func TestLeaseRetainedUntilDrained(t *testing.T) {
 func TestEmptyStreamStillChecksInstance(t *testing.T) {
 	socket := filepath.Join(privateTempDir(t), "grpc.sock")
 	listener, _ := net.Listen("unix", socket)
-	host, err := grpcx.Serve(listener, nil, func(registrar grpc.ServiceRegistrar) {
+	host, err := grpcx.ServeWithOptions(listener, nil, func(registrar grpc.ServiceRegistrar) {
 		registrar.RegisterService(&grpc.ServiceDesc{ServiceName: "audit.Empty", HandlerType: (*interface{})(nil), Streams: []grpc.StreamDesc{{StreamName: "Watch", ServerStreams: true, Handler: func(_ any, stream grpc.ServerStream) error {
 			return stream.SendHeader(metadata.Pairs("x-xrpc-instance-id", "wrong-epoch"))
 		}}}}, struct{}{})
-	})
+	}, grpcx.HostOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
