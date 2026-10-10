@@ -1,4 +1,5 @@
 #pragma once
+#include "stop.hpp"
 #include "unix.hpp"
 #include <atomic>
 #include <chrono>
@@ -6,7 +7,6 @@
 #include <functional>
 #include <memory>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -132,7 +132,7 @@ public:
   HttpClient(const HttpClient &) = delete;
   HttpClient &operator=(const HttpClient &) = delete;
   HttpResponse call(HttpRequest request, Clock::time_point deadline,
-                    std::stop_token cancellation = {});
+                    StopToken cancellation = {});
   // Terminal: cancel the active call and reject queued/future calls. Join all
   // calling threads before destruction; close itself does not wait for them.
   void close() noexcept;

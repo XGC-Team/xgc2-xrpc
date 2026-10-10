@@ -188,7 +188,7 @@ void multi_service_server_first_reverse_streams() {
   auto unary_stub = Fixture::NewStub(channel);
   auto first_stub = xgc2::xrpc::test::ReverseOne::NewStub(channel);
   auto second_stub = xgc2::xrpc::test::ReverseTwo::NewStub(channel);
-  std::stop_source cancel_first;
+  StopSource cancel_first;
   grpc::ClientContext first_context, second_context;
   GrpcClientCall first_call(first_context, admission.instance_id(),
       grpc_stream_deadline(limits, GrpcClock::now() + 2s), cancel_first.get_token(), "reverse.first");
@@ -463,7 +463,7 @@ void unary_metadata_and_limits() {
   GrpcClientCall a(c1, "instance-one", GrpcClock::now() + 1s);
   GrpcClientCall b(c2, "instance-one", GrpcClock::now() + 1s);
   assert(a.request_id() != b.request_id());
-  std::stop_source stop; stop.request_stop();
+  StopSource stop; stop.request_stop();
   grpc::ClientContext cancelled_context;
   GrpcClientCall cancelled(cancelled_context, "instance-one", GrpcClock::now() + 1s, stop.get_token());
   bool invoked = false;
@@ -563,7 +563,7 @@ void native_stream_deadline_and_cancel() {
   }
   await([&] { return host.admission.stats().inflight_calls == 0; });
   {
-    std::stop_source stop;
+    StopSource stop;
     grpc::ClientContext context;
     GrpcClientCall call(context, "instance-one", GrpcClock::now() + 800ms, stop.get_token());
     assert(call.mark_dispatched().ok());
@@ -582,7 +582,7 @@ void native_stream_deadline_and_cancel() {
 void admission_and_failed_quiescence() {
   GrpcLimits l; l.inflight = 1; l.native_threads = 4;
   Host host(l);
-  std::stop_source stop;
+  StopSource stop;
   grpc::Status held_status;
   std::thread client([&] {
     grpc::ClientContext context;

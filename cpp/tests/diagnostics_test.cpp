@@ -11,23 +11,29 @@
 #include <new>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 
 using namespace xgc2::xrpc;
 namespace {
 std::atomic<bool> reject_allocations{false};
 std::atomic<std::uint64_t> allocations{0};
-template <typename T>
-concept HasBody = requires(T record) { record.body; };
-template <typename T>
-concept HasHeaders = requires(T record) { record.headers; };
-template <typename T>
-concept HasMessage = requires(T record) { record.message; };
-template <typename T>
-concept HasPayload = requires(T record) { record.payload; };
-static_assert(!HasBody<DiagnosticRecord> && !HasHeaders<DiagnosticRecord> &&
-              !HasMessage<DiagnosticRecord> && !HasPayload<DiagnosticRecord>);
-static_assert(!HasBody<DiagnosticContext> && !HasHeaders<DiagnosticContext> &&
-              !HasMessage<DiagnosticContext> && !HasPayload<DiagnosticContext>);
+#define XRPC_HAS_FIELD(name)                                                   \
+  template <typename T, typename = void> struct Has_##name : std::false_type {}; \
+  template <typename T>                                                        \
+  struct Has_##name<T, std::void_t<decltype(std::declval<T &>().name)>>        \
+      : std::true_type {}
+XRPC_HAS_FIELD(body);
+XRPC_HAS_FIELD(headers);
+XRPC_HAS_FIELD(message);
+XRPC_HAS_FIELD(payload);
+static_assert(!Has_body<DiagnosticRecord>::value && !Has_headers<DiagnosticRecord>::value &&
+              !Has_message<DiagnosticRecord>::value && !Has_payload<DiagnosticRecord>::value);
+static_assert(!Has_body<DiagnosticContext>::value && !Has_headers<DiagnosticContext>::value &&
+              !Has_message<DiagnosticContext>::value && !Has_payload<DiagnosticContext>::value);
+// Sanity check of the detection itself.
+struct HasAll { int body, headers, message, payload; };
+static_assert(Has_body<HasAll>::value && Has_headers<HasAll>::value &&
+              Has_message<HasAll>::value && Has_payload<HasAll>::value);
 
 DiagnosticsOptions settings(std::size_t capacity = 256,
                             std::uint32_t per_event_per_second = 64,
@@ -239,8 +245,8 @@ void revision_and_format_settings() {
   assert(diagnostics.try_emit(DiagnosticCode::PeerError, LogSeverity::Error));
   Capture output;
   diagnostics.drain(1, capture, &output);
-  assert(std::string_view(output.bytes.data(), output.size).starts_with(
-      "monotonic_ns="));
+  assert(std::string_view(output.bytes.data(), output.size).substr(0, 13) ==
+         "monotonic_ns=");
 
   std::atomic<unsigned> winners{0}, conflicts{0};
   std::array<std::thread, 4> updaters;

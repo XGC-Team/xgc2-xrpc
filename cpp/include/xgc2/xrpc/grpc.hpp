@@ -1,10 +1,10 @@
 #pragma once
+#include "stop.hpp"
 #include "unix.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <stop_token>
 #include <string>
 #include <vector>
 #include <grpcpp/grpcpp.h>
@@ -159,7 +159,7 @@ public:
   // The caller must use a fresh context without manually adding XRPC keys.
   GrpcClientCall(grpc::ClientContext&, std::string instance_id,
                  GrpcClock::time_point deadline,
-                 std::stop_token cancellation = {}, std::string request_id = {},
+                 StopToken cancellation = {}, std::string request_id = {},
                  bool discovery = false);
   ~GrpcClientCall();
   GrpcClientCall(const GrpcClientCall&) = delete;

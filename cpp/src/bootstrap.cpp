@@ -25,6 +25,9 @@ constexpr std::size_t document_limit = 16 * 1024;
 [[noreturn]] void fail(BootstrapErrorCode code = BootstrapErrorCode::InvalidInput) {
   throw BootstrapError(code);
 }
+bool starts_with(std::string_view value, std::string_view prefix) {
+  return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
 bool identifier(std::string_view value) {
   if (value.empty() || value.size() > 128) return false;
   for (unsigned char c : value)
@@ -322,7 +325,7 @@ void validate_endpoint(const Endpoint &value) {
   if (value.kind == "unix") {
     if (!canonical_path(value.address, 107)) fail();
   } else if (value.kind == "https") {
-    if (!value.address.starts_with("https://") ||
+    if (!starts_with(value.address, "https://") ||
         !authority(std::string_view(value.address).substr(8), false)) fail();
   } else if (value.kind == "tls") {
     if (!authority(value.address, true)) fail();
@@ -425,7 +428,7 @@ std::vector<X509Ptr> certificates(std::string_view value) {
   constexpr std::string_view begin = "-----BEGIN CERTIFICATE-----", end = "-----END CERTIFICATE-----";
   value = trim(value);
   while (!value.empty()) {
-    if (!value.starts_with(begin)) fail(BootstrapErrorCode::InvalidCredentials);
+    if (!starts_with(value, begin)) fail(BootstrapErrorCode::InvalidCredentials);
     auto finish = value.find(end, begin.size());
     if (finish == value.npos || !pem_body(value.substr(begin.size(), finish - begin.size())))
       fail(BootstrapErrorCode::InvalidCredentials);
@@ -447,7 +450,7 @@ void identity(std::string_view cert_pem, std::string_view key_pem) {
   for (auto candidate : {std::string_view("PRIVATE KEY"), std::string_view("RSA PRIVATE KEY"),
                          std::string_view("EC PRIVATE KEY"), std::string_view("DSA PRIVATE KEY")}) {
     auto prefix = "-----BEGIN " + std::string(candidate) + "-----";
-    if (key_text.starts_with(prefix)) { label = candidate; break; }
+    if (starts_with(key_text, prefix)) { label = candidate; break; }
   }
   if (label.empty()) fail(BootstrapErrorCode::InvalidCredentials);
   auto prefix = "-----BEGIN " + std::string(label) + "-----";
@@ -754,7 +757,7 @@ void BootstrapInput::apply_authorization(std::vector<std::pair<std::string, std:
   }
   headers.emplace_back("Authorization", impl_->authorization->authorization.value);
 }
-bool BootstrapInput::authorize(std::span<const std::string_view> values,
+bool BootstrapInput::authorize(const std::vector<std::string_view> &values,
                               std::chrono::steady_clock::time_point deadline) const noexcept {
   if (!impl_ || impl_->role != BootstrapRole::Server ||
       deadline == std::chrono::steady_clock::time_point::max() ||

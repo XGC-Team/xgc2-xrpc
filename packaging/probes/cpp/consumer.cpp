@@ -3,8 +3,6 @@
 #include <xgc2/xrpc/diagnostics.hpp>
 #include <condition_variable>
 #include <mutex>
-#include <span>
-#include <stop_token>
 #ifdef XRPC_CHECK_GRPC
 #include <xgc2/xrpc/grpc.hpp>
 #endif
@@ -24,14 +22,15 @@ int main() {
   xgc2::xrpc::HttpClient client("/unused-installed-sdk-probe.sock", limits, instance);
   client.close();
   if (xgc2::xrpc::diagnostic_code_name(xgc2::xrpc::DiagnosticCode::CallCompleted).empty()) return 6;
-  std::stop_source stop;
+  xgc2::xrpc::StopSource stop;
   stop.request_stop();
   std::mutex mutex;
-  std::unique_lock lock(mutex);
-  std::condition_variable_any condition;
-  if (condition.wait_until(lock, stop.get_token(), std::chrono::steady_clock::now(), [] { return false; })) return 2;
-  const int values[] = {1, 2};
-  if (std::span(values).size() != 2 || limits.connections == 0) return 3;
+  std::unique_lock<std::mutex> lock(mutex);
+  std::condition_variable condition;
+  if (xgc2::xrpc::wait_until(condition, lock, stop.get_token(),
+                             std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                             [] { return false; })) return 2;
+  if (!stop.get_token().stop_requested() || limits.connections == 0) return 3;
 #ifdef XRPC_CHECK_GRPC
   const xgc2::xrpc::GrpcLimits grpc_limits;
   if (grpc_limits.inflight == 0) return 4;

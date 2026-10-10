@@ -1,40 +1,12 @@
-# C++20 standard-library baseline, also used by binary-safe bounded output.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
-  message(FATAL_ERROR "XgcXrpc C++20 requires GCC >= 11 (including its libstdc++ runtime)")
-endif()
+# C++17 throughout: GNU 7.5 (Bionic) and clang 10 or newer.
 find_package(Threads REQUIRED)
 find_package(Boost 1.70 REQUIRED)
 find_package(OpenSSL 1.1.1 REQUIRED COMPONENTS Crypto)
 find_package(nlohmann_json 3.7 CONFIG REQUIRED)
 include(CMakePackageConfigHelpers)
-include(CheckCXXSourceCompiles)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(_xrpc_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
-list(APPEND CMAKE_REQUIRED_LIBRARIES Threads::Threads)
-check_cxx_source_compiles("#include <stop_token>
-#include <condition_variable>
-#include <chrono>
-#include <mutex>
-#include <span>
-#include <map>
-#include <string_view>
-int main() {
-  std::stop_source stop;
-  std::stop_callback callback(stop.get_token(), [] {});
-  std::mutex mutex;
-  std::unique_lock<std::mutex> lock(mutex);
-  std::condition_variable_any changed;
-  changed.wait_until(lock, stop.get_token(), std::chrono::steady_clock::now(), [] { return true; });
-  int data[1] = {0}; std::span<int> view(data);
-  std::map<int, int> table;
-  return view.size() != 1 || table.contains(0) || !std::string_view(\"xrpc\").starts_with(\"x\");
-}" XGC2_XRPC_CXX20_RUNTIME)
-set(CMAKE_REQUIRED_LIBRARIES "${_xrpc_required_libraries}")
-unset(_xrpc_required_libraries)
-if(NOT XGC2_XRPC_CXX20_RUNTIME)
-  message(FATAL_ERROR "XgcXrpc needs C++20 stop_callback, cancellable condition-variable waits, span and matching standard-library headers/runtime")
-endif()
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(xgc2_xrpc_unix SHARED src/unix.cpp)
 add_library(xgc2_xrpc_diagnostics SHARED src/diagnostics.cpp)
@@ -52,7 +24,7 @@ set_target_properties(xgc2_xrpc_http PROPERTIES EXPORT_NAME http INSTALL_RPATH "
 set_target_properties(xgc2_xrpc_bootstrap PROPERTIES EXPORT_NAME bootstrap INSTALL_RPATH "$ORIGIN")
 set_target_properties(xgc2_xrpc_json_http PROPERTIES EXPORT_NAME json_http INSTALL_RPATH "$ORIGIN")
 foreach(target xgc2_xrpc_unix xgc2_xrpc_diagnostics xgc2_xrpc_http xgc2_xrpc_bootstrap xgc2_xrpc_json_http)
-  target_compile_features(${target} PUBLIC cxx_std_20)
+  target_compile_features(${target} PUBLIC cxx_std_17)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   target_include_directories(${target} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -75,7 +47,7 @@ if(XGC2_XRPC_ENABLE_GRPC)
   add_library(XgcXrpc::grpc ALIAS xgc2_xrpc_grpc)
   set_target_properties(xgc2_xrpc_grpc PROPERTIES EXPORT_NAME grpc
     VERSION ${PROJECT_VERSION} SOVERSION 1 INSTALL_RPATH "$ORIGIN")
-  target_compile_features(xgc2_xrpc_grpc PUBLIC cxx_std_20)
+  target_compile_features(xgc2_xrpc_grpc PUBLIC cxx_std_17)
   target_compile_options(xgc2_xrpc_grpc PRIVATE -Wall -Wextra -Wpedantic)
   target_include_directories(xgc2_xrpc_grpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -119,7 +91,7 @@ if(BUILD_TESTING)
   add_test(NAME xrpc_cpp_json COMMAND xrpc_cpp_json_test)
   set_tests_properties(xrpc_cpp_json PROPERTIES TIMEOUT 30)
   add_executable(xrpc_cpp_bootstrap_test tests/bootstrap_test.cpp)
-  target_compile_features(xrpc_cpp_bootstrap_test PRIVATE cxx_std_20)
+  target_compile_features(xrpc_cpp_bootstrap_test PRIVATE cxx_std_17)
   target_compile_options(xrpc_cpp_bootstrap_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
   target_include_directories(xrpc_cpp_bootstrap_test SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
   target_compile_definitions(xrpc_cpp_bootstrap_test PRIVATE
@@ -127,14 +99,14 @@ if(BUILD_TESTING)
   target_link_libraries(xrpc_cpp_bootstrap_test PRIVATE XgcXrpc::bootstrap OpenSSL::Crypto)
   add_test(NAME xrpc_cpp_bootstrap COMMAND xrpc_cpp_bootstrap_test)
   set_tests_properties(xrpc_cpp_bootstrap PROPERTIES TIMEOUT 30)
-  foreach(case runtime http_host resources wire fault diagnostics diagnostic_transport)
+  foreach(case runtime http_host resources wire fault diagnostics diagnostic_transport stop)
     if(case STREQUAL "runtime")
       set(test_source tests/runtime_test.cpp)
     else()
       set(test_source tests/${case}_test.cpp)
     endif()
     add_executable(xrpc_cpp_${case}_test ${test_source})
-    target_compile_features(xrpc_cpp_${case}_test PRIVATE cxx_std_20)
+    target_compile_features(xrpc_cpp_${case}_test PRIVATE cxx_std_17)
     target_compile_options(xrpc_cpp_${case}_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
     target_link_libraries(xrpc_cpp_${case}_test PRIVATE XgcXrpc::http Threads::Threads)
     if(case STREQUAL "wire" OR case STREQUAL "diagnostics")
@@ -162,7 +134,7 @@ if(BUILD_TESTING)
       DEPENDS tests/grpc_fixture.proto VERBATIM)
     add_executable(xrpc_cpp_grpc_test tests/grpc_test.cpp
       "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc")
-    target_compile_features(xrpc_cpp_grpc_test PRIVATE cxx_std_20)
+    target_compile_features(xrpc_cpp_grpc_test PRIVATE cxx_std_17)
     target_compile_options(xrpc_cpp_grpc_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
     target_include_directories(xrpc_cpp_grpc_test PRIVATE "${grpc_fixture_dir}")
     target_link_libraries(xrpc_cpp_grpc_test PRIVATE XgcXrpc::grpc protobuf::libprotobuf)

@@ -366,7 +366,7 @@ void http_tests() {
   assert(server.stats().active_connections == 0);
   ::close(raw);
   assert(::access(o.path.c_str(), F_OK) != 0);
-  std::stop_source cancellation;
+  StopSource cancellation;
   cancellation.request_stop();
   try {
     client.call(request, Clock::now() + seconds(1), cancellation.get_token());
@@ -420,7 +420,7 @@ void admission_and_identity_tests() {
   assert(handled == 1);
   HttpClient first(o.path, limits, identity.instance_id),
       second(o.path, limits, identity.instance_id);
-  std::stop_source cancellation;
+  StopSource cancellation;
   std::atomic<bool> cancelled{false};
   request.target = "/wait";
   std::thread caller([&] {

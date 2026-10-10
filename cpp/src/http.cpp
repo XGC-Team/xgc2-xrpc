@@ -803,15 +803,15 @@ public:
     available.notify_all();
   }
   HttpResponse call(HttpRequest request, Clock::time_point deadline,
-                    std::stop_token cancellation) {
-    std::stop_source stop;
+                    StopToken cancellation) {
+    StopSource stop;
     {
       std::unique_lock<std::mutex> guard(admission);
       if (deadline == Clock::time_point::max())
         throw HttpCallError("invalid_argument", Delivery::NotSent,
                             "finite deadline required");
-      if (!available.wait_until(guard, cancellation, deadline,
-                                [this] { return closed || !busy; }) ||
+      if (!wait_until(available, guard, cancellation, deadline,
+                      [this] { return closed || !busy; }) ||
           Clock::now() >= deadline || cancellation.stop_requested())
         throw HttpCallError(cancellation.stop_requested() ? "cancelled"
                                                           : "deadline_exceeded",
@@ -832,11 +832,11 @@ public:
         owner.available.notify_all();
       }
     } release{*this};
-    // std::stop_callback deregistration joins an executing callback before the
-    // next call may use this descriptor. No per-call polling or worker thread.
-    std::stop_callback external_stop(cancellation,
-                                     [stop]() mutable { stop.request_stop(); });
-    std::stop_callback interrupted(stop.get_token(), [this] {
+    // StopCallback deregistration joins an executing callback before the next
+    // call may use this descriptor. No per-call polling or worker thread.
+    StopCallback external_stop(cancellation,
+                               [stop]() mutable { stop.request_stop(); });
+    StopCallback interrupted(stop.get_token(), [this] {
       signal_fd(cancellation_io.native_handle());
     });
     if (request.body.size() > limits.request_bytes ||
@@ -1022,9 +1022,9 @@ public:
   net::posix::stream_descriptor cancellation_io;
   beast::flat_buffer buffer;
   std::mutex admission;
-  std::condition_variable_any available;
+  std::condition_variable available;
   bool busy = false, closed = false;
-  std::stop_source active_stop;
+  StopSource active_stop;
   Clock::time_point last_used{};
 };
 HttpClient::HttpClient(std::string path, HttpLimits limits,
@@ -1032,7 +1032,7 @@ HttpClient::HttpClient(std::string path, HttpLimits limits,
     : impl_(new Impl(std::move(path), limits, std::move(instance_id))) {}
 HttpClient::~HttpClient() = default;
 HttpResponse HttpClient::call(HttpRequest request, Clock::time_point deadline,
-                              std::stop_token cancellation) {
+                              StopToken cancellation) {
   return impl_->call(std::move(request), deadline, cancellation);
 }
 void HttpClient::close() noexcept { impl_->close(); }

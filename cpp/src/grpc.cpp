@@ -460,12 +460,12 @@ public:
   grpc::ClientContext& context;
   std::string instance, request, response_instance;
   GrpcClock::time_point deadline;
-  std::stop_token cancellation;
+  StopToken cancellation;
   bool dispatched = false, discovery = false, stream_mode_rejected = false;
   // Destruction unregisters/synchronizes callback before context may die.
-  std::unique_ptr<std::stop_callback<Cancel>> callback;
+  std::unique_ptr<StopCallback<Cancel>> callback;
   Impl(grpc::ClientContext& c, std::string i, GrpcClock::time_point deadline,
-       std::stop_token cancellation, std::string id, bool discover)
+       StopToken cancellation, std::string id, bool discover)
       : context(c), instance(std::move(i)), request(std::move(id)),
         deadline(deadline), cancellation(cancellation), discovery(discover) {
     if (request.empty()) request = new_instance_id();
@@ -479,11 +479,11 @@ public:
     context.set_deadline(std::chrono::system_clock::now() + (deadline - now));
     if (!instance.empty()) context.AddMetadata("x-xrpc-instance-id", instance);
     context.AddMetadata("x-request-id", request);
-    callback = std::make_unique<std::stop_callback<Cancel>>(cancellation, Cancel{&context});
+    callback = std::make_unique<StopCallback<Cancel>>(cancellation, Cancel{&context});
   }
 };
 GrpcClientCall::GrpcClientCall(grpc::ClientContext& context, std::string instance,
-    GrpcClock::time_point deadline, std::stop_token cancellation, std::string request,
+    GrpcClock::time_point deadline, StopToken cancellation, std::string request,
     bool discovery)
     : impl_(std::make_unique<Impl>(context, std::move(instance), deadline, cancellation,
                                  std::move(request), discovery)) {}
