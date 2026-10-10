@@ -1,4 +1,5 @@
 #pragma once
+#include "delivery.hpp"
 #include "stop.hpp"
 #include "unix.hpp"
 #include <chrono>
@@ -74,6 +75,17 @@ public:
   const std::string& request_id() const noexcept { return request_id_; }
   GrpcClock::time_point deadline() const noexcept { return deadline_; }
   bool cancelled() const noexcept;
+  // Marks a known application failure of this admitted call, as contracts/
+  // runtime.md describes: returns `status` with one google.rpc.ErrorInfo detail
+  // (domain "xgc2.xrpc", reason "APPLICATION_ERROR", metadata request_id and
+  // instance_id of this call) added to its error details. The code, message and
+  // any existing details are preserved. A client reports response-received for
+  // an unsuccessful call only when it finds this single valid marker. Use it
+  // for the domain's declared refusals, not for transport, cancellation or
+  // unexpected handler failures. An OK status, a rejected scope, malformed
+  // existing details or details too large for the metadata limit leave
+  // `status` unchanged. The marker does not imply rollback or safe replay.
+  grpc::Status application_error(const grpc::Status& status) const;
   // Exactly one handoff per admission; throws on a rejected call or a second
   // handoff. The domain must also bound its own queue before accepting work.
   GrpcWorkPermit retain_work();
@@ -151,7 +163,6 @@ std::shared_ptr<grpc::Channel> make_grpc_unix_channel(
 
 // Fresh, caller-owned native context. The scope must outlive native RPC/stream
 // completion, then be destroyed before ClientContext. No automatic replay.
-enum class GrpcDelivery { NotSent, OutcomeUnknown };
 class GrpcClientCall {
 public:
   // Explicit unary discovery alone permits an empty instance_id, meaning the
@@ -172,7 +183,11 @@ public:
   // cannot report exact bytes dispatched, so all subsequent failures have
   // conservatively unknown outcome. Validation/pre-cancel remain NotSent.
   grpc::Status mark_dispatched();
-  GrpcDelivery delivery() const noexcept;
+  // NotSent until mark_dispatched succeeds; then OutcomeUnknown until verify()
+  // sees a response of this call from the expected instance: an OK status, or a
+  // failure carrying the single matching APPLICATION_ERROR marker (see
+  // GrpcCallScope::application_error). Any other failure stays OutcomeUnknown.
+  Delivery delivery() const noexcept;
   template<class NativeUnary> grpc::Status invoke(NativeUnary&& operation) {
     const auto ready = mark_dispatched();
     if (!ready.ok()) return ready;

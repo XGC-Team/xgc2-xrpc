@@ -1,4 +1,5 @@
 #pragma once
+#include "delivery.hpp"
 #include "stop.hpp"
 #include "unix.hpp"
 #include <atomic>
@@ -115,7 +116,13 @@ private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
-enum class Delivery { NotSent, OutcomeUnknown };
+// A call that produced no usable HTTP response. `delivery` is NotSent when no
+// request bytes were written, OutcomeUnknown when they may have reached the
+// server (timeout, reset, a response that is not from the pinned instance or
+// not for this request), and ResponseReceived when a response arrived but the
+// client cannot hand it over (its body exceeds the client's response limit).
+// A response with any HTTP status, including 4xx and 5xx, is not an error: call
+// returns it, and such a result is a received response by definition.
 class HttpCallError : public std::runtime_error {
 public:
   HttpCallError(std::string code, Delivery delivery, const std::string &detail);

@@ -422,6 +422,57 @@ void noncooperative_worker_outlives_host(bool expired) {
   assert(fd >= 0);
   ::close(fd);
 }
+void client_dispositions() {
+  Directory dir;
+  UnixOptions options;
+  options.path = dir.path + "/dispositions.sock";
+  HttpServer server(options, [](HttpRequest req, HttpReply reply) {
+    if (req.target == "/hold") return; // never answered: the caller's deadline ends it
+    HttpResponse response;
+    response.status = req.target == "/missing" ? 404 : 200;
+    response.body = req.target == "/big" ? std::string(4096, 'x') : "ok";
+    reply.complete(std::move(response));
+  });
+  std::thread owner([&] { server.run(); });
+  HttpLimits small;
+  small.response_bytes = 1024;
+  HttpClient client(options.path, small);
+  // A response with any status is returned, never thrown: it was received.
+  assert(client.call(request("/missing"), Clock::now() + seconds(1)).status == 404);
+  assert(client.call(request("/ok"), Clock::now() + seconds(1)).body == "ok");
+  // NotSent: refused before any byte was written.
+  try {
+    client.call(request("relative"), Clock::now() + seconds(1));
+    assert(false);
+  } catch (const HttpCallError &error) {
+    assert(error.delivery == Delivery::NotSent && error.code == "invalid_argument");
+  }
+  // ResponseReceived: a complete header block arrived, but the body exceeds
+  // this client's limit, so the response cannot be handed over.
+  try {
+    client.call(request("/big"), Clock::now() + seconds(1));
+    assert(false);
+  } catch (const HttpCallError &error) {
+    assert(error.delivery == Delivery::ResponseReceived && error.code == "resource_exhausted");
+  }
+  // The connection is unusable after that, but the next call starts clean.
+  assert(client.call(request("/ok"), Clock::now() + seconds(1)).body == "ok");
+  // OutcomeUnknown: sent, never answered.
+  try {
+    client.call(request("/hold"), Clock::now() + milliseconds(60));
+    assert(false);
+  } catch (const HttpCallError &error) {
+    // The host's own deadline can close the connection before the local timer.
+    assert(error.delivery == Delivery::OutcomeUnknown &&
+           (error.code == "deadline_exceeded" || error.code == "unavailable"));
+  }
+  assert(std::string(delivery_name(Delivery::NotSent)) == "not_sent");
+  assert(std::string(delivery_name(Delivery::OutcomeUnknown)) == "outcome_unknown");
+  assert(std::string(delivery_name(Delivery::ResponseReceived)) == "response_received");
+  client.close();
+  server.request_stop();
+  owner.join();
+}
 } // namespace
 void *operator new(std::size_t size) {
   if (reject_allocations.load())
@@ -436,6 +487,7 @@ void operator delete(void *pointer, std::size_t) noexcept {
 }
 int main() {
   request_validation_and_deadlines();
+  client_dispositions();
   graceful_shutdown(true);
   graceful_shutdown(false);
   allocation_free_stop();
@@ -445,5 +497,5 @@ int main() {
   noncooperative_worker_outlives_host(true);
   std::cout
       << "HTTP host regressions: admission/idle budgets, framing input, HEAD, "
-         "metadata, IDs, cancellation and graceful shutdown passed\n";
+         "metadata, IDs, cancellation, client dispositions and graceful shutdown passed\n";
 }

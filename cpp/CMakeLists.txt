@@ -132,8 +132,21 @@ if(BUILD_TESTING)
         --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/grpc_fixture.proto
       DEPENDS tests/grpc_fixture.proto VERBATIM)
+    # Vendored googleapis messages: the test decodes the hand-written
+    # application-error marker with generated code. Never part of the SDK.
+    file(MAKE_DIRECTORY "${grpc_fixture_dir}/google/rpc")
+    add_custom_command(OUTPUT
+      "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/status.pb.h"
+      "${grpc_fixture_dir}/google/rpc/error_details.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.h"
+      COMMAND protobuf::protoc --cpp_out=${grpc_fixture_dir}
+        --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/tests/proto
+        --proto_path=${Protobuf_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/google/rpc/status.proto
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/google/rpc/error_details.proto
+      DEPENDS tests/proto/google/rpc/status.proto tests/proto/google/rpc/error_details.proto VERBATIM)
     add_executable(xrpc_cpp_grpc_test tests/grpc_test.cpp
-      "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc")
+      "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc"
+      "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.cc")
     target_compile_features(xrpc_cpp_grpc_test PRIVATE cxx_std_17)
     target_compile_options(xrpc_cpp_grpc_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
     target_include_directories(xrpc_cpp_grpc_test PRIVATE "${grpc_fixture_dir}")

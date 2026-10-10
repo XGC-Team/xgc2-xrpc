@@ -893,7 +893,7 @@ public:
     parser.body_limit(limits.response_bytes);
     if (verb == http::verb::head)
       parser.skip(true);
-    bool done = false, sent = false;
+    bool done = false, sent = false, oversize = false;
     std::string code, detail;
     auto finish = [&](const std::string &c, const std::string &d) {
       if (done)
@@ -927,15 +927,43 @@ public:
           finish("unavailable", e.message());
           return;
         }
-        http::async_read(socket, buffer, parser,
-                         [&](Error read_error, std::size_t) {
-                           if (done)
-                             return;
-                           if (read_error)
-                             finish("unavailable", read_error.message());
-                           else
-                             finish({}, {});
-                         });
+        // Header first: Beast 1.71 loses its body_limit error for a
+        // Content-Length body when one eager read covers header and body, so
+        // the non-eager header read must be the one to enforce the limit.
+        http::async_read_header(socket, buffer, parser, [&](Error header_error,
+                                                            std::size_t) {
+          if (done)
+            return;
+          if (header_error == http::error::body_limit) {
+            // A complete header block announces a body above the limit.
+            oversize = true;
+            finish("resource_exhausted", "response body exceeds the client limit");
+            return;
+          }
+          if (header_error) {
+            finish("unavailable", header_error.message());
+            return;
+          }
+          if (parser.is_done()) {
+            finish({}, {});
+            return;
+          }
+          http::async_read(socket, buffer, parser,
+                           [&](Error read_error, std::size_t) {
+                             if (done)
+                               return;
+                             if (read_error == http::error::body_limit) {
+                               // A chunked or close-delimited body outgrew the
+                               // limit after a complete header block arrived.
+                               oversize = true;
+                               finish("resource_exhausted",
+                                      "response body exceeds the client limit");
+                             } else if (read_error)
+                               finish("unavailable", read_error.message());
+                             else
+                               finish({}, {});
+                           });
+        });
       });
     };
     if (socket.is_open() && Clock::now() - last_used >= limits.idle_timeout)
@@ -986,8 +1014,11 @@ public:
       throw;
     }
     if (!code.empty())
-      throw HttpCallError(
-          code, sent ? Delivery::OutcomeUnknown : Delivery::NotSent, detail);
+      throw HttpCallError(code,
+                          oversize ? Delivery::ResponseReceived
+                          : sent   ? Delivery::OutcomeUnknown
+                                   : Delivery::NotSent,
+                          detail);
     auto &received = parser.get();
     if (!instance_id.empty() &&
         (received.count("X-Xrpc-Instance-ID") != 1 ||

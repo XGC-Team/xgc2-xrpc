@@ -9,9 +9,11 @@
 #include <cerrno>
 #include <condition_variable>
 #include <fcntl.h>
+#include <map>
 #include <mutex>
 #include <poll.h>
 #include <stdexcept>
+#include <string_view>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <thread>
@@ -57,6 +59,222 @@ grpc::Status error(grpc::StatusCode code, const char* reason) {
   return {code, reason};
 }
 void close_fd(int& fd) noexcept { if (fd >= 0) { ::close(fd); fd = -1; } }
+
+// The application-error marker (contracts/runtime.md) is a google.rpc.ErrorInfo
+// inside the details of a google.rpc.Status, carried in the grpc-status-details-bin
+// trailer. Only these messages are handled, as protobuf wire format:
+//   Status{int32 code=1; string message=2; repeated Any details=3}
+//   Any{string type_url=1; bytes value=2}
+//   ErrorInfo{string reason=1; string domain=2; map<string,string> metadata=3}
+// This is hand-written instead of generated because libgrpc++_error_details
+// and other googleapis code register google.rpc.Status in the process-wide
+// protobuf descriptor pool: a second copy inside this library would abort any
+// process that loads both. The tests check every byte against generated code.
+namespace marker {
+constexpr std::string_view error_info_type = "type.googleapis.com/google.rpc.ErrorInfo";
+constexpr std::string_view marker_domain = "xgc2.xrpc";
+constexpr std::string_view marker_reason = "APPLICATION_ERROR";
+
+void put_varint(std::string& out, std::uint64_t value) {
+  while (value >= 0x80) {
+    out.push_back(static_cast<char>((value & 0x7f) | 0x80));
+    value >>= 7;
+  }
+  out.push_back(static_cast<char>(value));
+}
+void put_bytes(std::string& out, unsigned field, std::string_view bytes) {
+  put_varint(out, (static_cast<std::uint64_t>(field) << 3) | 2);
+  put_varint(out, bytes.size());
+  out.append(bytes.data(), bytes.size());
+}
+std::string encode_any(std::string_view request_id, std::string_view instance_id) {
+  const auto entry = [](std::string_view key, std::string_view value) {
+    std::string item;
+    put_bytes(item, 1, key);
+    put_bytes(item, 2, value);
+    return item;
+  };
+  std::string info;
+  put_bytes(info, 1, marker_reason);
+  put_bytes(info, 2, marker_domain);
+  put_bytes(info, 3, entry("request_id", request_id));
+  put_bytes(info, 3, entry("instance_id", instance_id));
+  std::string any;
+  put_bytes(any, 1, error_info_type);
+  put_bytes(any, 2, info);
+  return any;
+}
+std::string encode_status(int code, std::string_view message,
+                          const std::vector<std::string_view>& details) {
+  std::string status;
+  put_varint(status, 1 << 3);
+  put_varint(status, static_cast<std::uint64_t>(code));
+  if (!message.empty()) put_bytes(status, 2, message);
+  for (const auto detail : details) put_bytes(status, 3, detail);
+  return status;
+}
+
+// Bounds-checked wire reader; every method fails on malformed input.
+class Reader {
+public:
+  explicit Reader(std::string_view data) : data_(data) {}
+  bool done() const { return data_.empty(); }
+  bool varint(std::uint64_t& value) {
+    value = 0;
+    for (unsigned shift = 0; shift < 64 && !data_.empty(); shift += 7) {
+      const auto byte = static_cast<unsigned char>(data_.front());
+      data_.remove_prefix(1);
+      value |= static_cast<std::uint64_t>(byte & 0x7f) << shift;
+      if (!(byte & 0x80)) return true;
+    }
+    return false;
+  }
+  bool field(unsigned& number, unsigned& wire) {
+    std::uint64_t key = 0;
+    if (!varint(key) || (key >> 3) == 0 || (key >> 3) > 0x1fffffff) return false;
+    number = static_cast<unsigned>(key >> 3);
+    wire = static_cast<unsigned>(key & 7);
+    return true;
+  }
+  bool bytes(std::string_view& value) {
+    std::uint64_t size = 0;
+    if (!varint(size) || size > data_.size()) return false;
+    value = data_.substr(0, static_cast<std::size_t>(size));
+    data_.remove_prefix(static_cast<std::size_t>(size));
+    return true;
+  }
+  // Skips a field of an unknown number; groups are not valid proto3.
+  bool skip(unsigned wire) {
+    std::uint64_t ignored = 0;
+    std::string_view ignored_bytes;
+    switch (wire) {
+    case 0: return varint(ignored);
+    case 1: return skip_fixed(8);
+    case 2: return bytes(ignored_bytes);
+    case 5: return skip_fixed(4);
+    default: return false;
+    }
+  }
+
+private:
+  bool skip_fixed(std::size_t size) {
+    if (data_.size() < size) return false;
+    data_.remove_prefix(size);
+    return true;
+  }
+  std::string_view data_;
+};
+
+// Collects the serialized Any entries of a google.rpc.Status.
+bool status_details(std::string_view wire, std::vector<std::string_view>& details) {
+  Reader reader(wire);
+  while (!reader.done()) {
+    unsigned number = 0, type = 0;
+    if (!reader.field(number, type)) return false;
+    std::uint64_t code = 0;
+    std::string_view bytes;
+    if (number == 1 && type == 0) {
+      if (!reader.varint(code)) return false;
+    } else if (number == 2 && type == 2) {
+      if (!reader.bytes(bytes)) return false;
+    } else if (number == 3 && type == 2) {
+      if (!reader.bytes(bytes)) return false;
+      details.push_back(bytes);
+    } else if (number <= 3 || !reader.skip(type)) {
+      return false; // known field with the wrong wire type, or bad skip
+    }
+  }
+  return true;
+}
+bool any_fields(std::string_view wire, std::string_view& type_url, std::string_view& value) {
+  Reader reader(wire);
+  while (!reader.done()) {
+    unsigned number = 0, type = 0;
+    if (!reader.field(number, type)) return false;
+    if (number == 1 && type == 2) {
+      if (!reader.bytes(type_url)) return false;
+    } else if (number == 2 && type == 2) {
+      if (!reader.bytes(value)) return false;
+    } else if (number <= 2 || !reader.skip(type)) {
+      return false;
+    }
+  }
+  return true;
+}
+struct ErrorInfo {
+  std::string_view reason, domain;
+  std::map<std::string_view, std::string_view> metadata; // map semantics: last wins
+};
+bool error_info(std::string_view wire, ErrorInfo& info) {
+  Reader reader(wire);
+  while (!reader.done()) {
+    unsigned number = 0, type = 0;
+    if (!reader.field(number, type)) return false;
+    std::string_view bytes;
+    if (number == 1 && type == 2) {
+      if (!reader.bytes(info.reason)) return false;
+    } else if (number == 2 && type == 2) {
+      if (!reader.bytes(info.domain)) return false;
+    } else if (number == 3 && type == 2) {
+      if (!reader.bytes(bytes)) return false;
+      Reader entry(bytes);
+      std::string_view key, value;
+      while (!entry.done()) {
+        unsigned entry_number = 0, entry_type = 0;
+        if (!entry.field(entry_number, entry_type)) return false;
+        if (entry_number == 1 && entry_type == 2) {
+          if (!entry.bytes(key)) return false;
+        } else if (entry_number == 2 && entry_type == 2) {
+          if (!entry.bytes(value)) return false;
+        } else if (entry_number <= 2 || !entry.skip(entry_type)) {
+          return false;
+        }
+      }
+      info.metadata[key] = value;
+    } else if (number <= 3 || !reader.skip(type)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+enum class Found { None, Valid, Invalid };
+// Mirrors the Go client: details of other types are not ours, an ErrorInfo
+// that claims our domain or reason must be exactly our marker for this call,
+// and exactly one such marker is required. Malformed details are invalid.
+Found classify(const std::vector<std::string_view>& details,
+               std::string_view request_id, std::string_view instance_id) {
+  unsigned count = 0;
+  for (const auto detail : details) {
+    std::string_view type_url, value;
+    if (!any_fields(detail, type_url, value)) return Found::Invalid;
+    if (type_url != error_info_type) continue;
+    ErrorInfo info;
+    if (!error_info(value, info)) return Found::Invalid;
+    if (info.domain != marker_domain && info.reason != marker_reason) continue;
+    const auto request = info.metadata.find("request_id");
+    const auto instance = info.metadata.find("instance_id");
+    if (info.domain != marker_domain || info.reason != marker_reason ||
+        info.metadata.size() != 2 || request == info.metadata.end() ||
+        instance == info.metadata.end() || request->second != request_id ||
+        instance->second != instance_id)
+      return Found::Invalid;
+    ++count;
+  }
+  return count == 0 ? Found::None : count == 1 ? Found::Valid : Found::Invalid;
+}
+// True when a failed native status carries this call's single valid marker.
+bool marked(const grpc::Status& status, std::string_view request_id,
+            std::string_view instance_id) {
+  if (status.ok() || status.error_code() == grpc::StatusCode::CANCELLED ||
+      status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED)
+    return false;
+  const std::string wire = status.error_details();
+  std::vector<std::string_view> details;
+  return !wire.empty() && status_details(wire, details) &&
+         classify(details, request_id, instance_id) == Found::Valid;
+}
+} // namespace marker
 }
 GrpcClock::time_point grpc_stream_deadline(const GrpcLimits& limits,
                                           GrpcClock::time_point caller_deadline) {
@@ -203,6 +421,22 @@ GrpcWorkPermit GrpcCallScope::retain_work() {
   if (slot.retained) throw std::logic_error("gRPC work already retained");
   slot.retained = true; ++slot.refs;
   return GrpcWorkPermit(state_, slot_);
+}
+grpc::Status GrpcCallScope::application_error(const grpc::Status& status) const {
+  if (!state_ || status.ok()) return status;
+  const std::string existing = status.error_details();
+  std::vector<std::string_view> details;
+  if (!existing.empty() && !marker::status_details(existing, details)) return status;
+  if (marker::classify(details, request_id_, state_->instance) != marker::Found::None)
+    return status;
+  const std::string any = marker::encode_any(request_id_, state_->instance);
+  details.push_back(any);
+  auto wire = marker::encode_status(static_cast<int>(status.error_code()),
+                                    status.error_message(), details);
+  // Trailing metadata is bounded by the host's metadata limit; send no marker
+  // rather than a status that the peer would refuse as a whole.
+  if (wire.size() > state_->limits.header_bytes / 2) return status;
+  return grpc::Status(status.error_code(), status.error_message(), std::move(wire));
 }
 GrpcAdmission::GrpcAdmission(std::string instance, GrpcLimits limits) {
   validate(limits);
@@ -462,6 +696,7 @@ public:
   GrpcClock::time_point deadline;
   StopToken cancellation;
   bool dispatched = false, discovery = false, stream_mode_rejected = false;
+  mutable bool received = false; // set by verify(): a response of this call arrived
   // Destruction unregisters/synchronizes callback before context may die.
   std::unique_ptr<StopCallback<Cancel>> callback;
   Impl(grpc::ClientContext& c, std::string i, GrpcClock::time_point deadline,
@@ -501,8 +736,9 @@ grpc::Status GrpcClientCall::mark_dispatched() {
   impl_->dispatched = true;
   return grpc::Status::OK;
 }
-GrpcDelivery GrpcClientCall::delivery() const noexcept {
-  return impl_->dispatched ? GrpcDelivery::OutcomeUnknown : GrpcDelivery::NotSent;
+Delivery GrpcClientCall::delivery() const noexcept {
+  if (!impl_->dispatched) return Delivery::NotSent;
+  return impl_->received ? Delivery::ResponseReceived : Delivery::OutcomeUnknown;
 }
 grpc::Status GrpcClientCall::check_stream_mode() const {
   if (!impl_->discovery) return grpc::Status::OK;
@@ -527,6 +763,7 @@ grpc::Status GrpcClientCall::verify_initial_metadata() const {
 }
 grpc::Status GrpcClientCall::verify(grpc::Status status) const {
   impl_->response_instance.clear();
+  impl_->received = false;
   if (impl_->stream_mode_rejected)
     return error(grpc::StatusCode::INVALID_ARGUMENT, "discovery requires a unary method");
   const auto& metadata = impl_->context.GetServerInitialMetadata();
@@ -538,6 +775,9 @@ grpc::Status GrpcClientCall::verify(grpc::Status status) const {
   // A rejected call may lack valid request metadata. Preserve its native error.
   if (!one_metadata(metadata, "x-request-id", request) || request != impl_->request)
     return status.ok() ? error(grpc::StatusCode::FAILED_PRECONDITION, "response request ID mismatch") : status;
+  // The response is from the verified instance for this request. A failure
+  // is a received response only when the host marked it as its application's.
+  impl_->received = status.ok() || marker::marked(status, impl_->request, instance);
   if (status.ok()) impl_->response_instance = std::move(instance);
   return status;
 }
