@@ -6,10 +6,10 @@ discovery, or provider-activation dependencies.
 
 | Package | Provides |
 |---|---|
-| `xrpc` | `ServiceRef`, dispositions and `CallError`, `Dispatcher`, `Diagnostics`, `LoadBootstrapInput`, default limits |
+| `xrpc` | `ServiceRef`, dispositions and `CallError`, `Dispatcher` and method addressing, `Describe` and capability facts, `Diagnostics`, `LoadBootstrapInput`, default limits |
 | `xrpc/httpx` | `http.v1`: internal Unix hosts and clients, edge hosts, event streams |
 | `xrpc/grpcx` | `grpc.v1`: internal Unix hosts and clients, typed `Profile`, long-lived sessions |
-| `xrpc/udpx` | `udp.v1`: datagram client and server, key ring |
+| `xrpc/udpx` | `udp.v1`: datagram client and server, key ring, `Profile` for the `Dispatcher` |
 | `xrpc/udpx/udptest` | in-process UDP fault proxy for tests |
 | `xrpc/unix` | private Unix endpoint lease |
 
@@ -57,6 +57,55 @@ Every client result carries a disposition: `not_sent`, `outcome_unknown` or
 cancelled, unavailable, internal, unauthenticated, permission_denied`. No
 transport replays a mutation; `udp.v1` retransmission of the same request id
 inside one deadline is deduplicated by the server and is not a replay.
+
+## Method addressing and capabilities
+
+A callable domain operation is named `<service>/<Method>` (`xgc2.chassis.hold/Engage`),
+takes a JSON request and returns a JSON reply, and every profile carries the same
+name: the udp.v1 datagram's method field verbatim, `POST /v1/call/<service>/<Method>`
+on http.v1, the native full method `/<service>/<Method>` on grpc.v1.
+`xrpc.ParseMethod` validates a name (dotted identifiers, one identifier for the
+method, at most 128 bytes), `xrpc.MethodPath` gives the http.v1 route and
+`xrpc.MethodCall` maps a name to the `xrpc.Call` of ref's profile.
+
+`(*xrpc.Dispatcher).CallMethod(ctx, ref, "<service>/<Method>", body)` is the one
+call that dispatches by `ref.Profile`. It lives on the `Dispatcher` because the
+transports need their own configuration (local target, TLS, key ring,
+descriptors) and the `Dispatcher` is where a caller composes them:
+
+```go
+dispatcher, _ := xrpc.NewDispatcher(map[string]xrpc.Caller{
+	xrpc.HTTP: httpx.NewProfile(httpx.Config{LocalTargetID: "core"}),
+	xrpc.GRPC: grpcx.NewProfile(grpcx.DialOptions{LocalTargetID: "core"}, descriptors),
+	xrpc.UDP:  udpProfile, // udpx.NewProfile(udpClient)
+})
+ctx, cancel := context.WithTimeout(ctx, 2*time.Second) // a finite deadline is required
+defer cancel()
+result, err := dispatcher.CallMethod(ctx, ref, "xgc2.chassis.hold/Engage", json.RawMessage(`{"robot":"scout-1"}`))
+```
+
+The request identity is fresh (128 random bits, `xrpc.NewRequestID`); udp.v1 uses
+the bits themselves, so the reply cache deduplicates retransmissions. http.v1 and
+grpc.v1 references must pin an instance; a udp.v1 reference may leave it empty and
+learn it from `Result.InstanceID`. `ServiceRef.Service` names the host, not the
+capability (a world host serves `xgc2.chassis.hold` for all its chassis); only
+grpc.v1 needs it to be the protobuf service name, because the codec hook of grpc.v1
+is the composed `grpcx.Profile`, which converts JSON and protobuf with the
+descriptors the caller links. Any other `xrpc.Caller` can take that place.
+
+An answered error is a `*xrpc.CallError` with disposition `response_received` and,
+for http.v1 and udp.v1, a `Result` whose payload is the error envelope
+`{"error":{"code","message","details"?}}` and whose `Status` is the HTTP status
+(`xrpc.StatusForCode` maps a udp.v1 code to it). The http.v1 caller takes the code
+from the envelope when it has one, so domain codes pass through.
+
+`xrpc.Describe` is the readiness envelope every service answers
+(`service`, `api_version`, `instance_id`, `ready`, `facts`); the meaning of the
+facts belongs to the domain. By convention a service that serves a capability for
+several entities lists it as `{"capabilities":[{"name":"<service>","entities":["<id>",...]}]}`:
+`xrpc.CapabilitiesJSON` builds that value for a host, `Describe.Capabilities` and
+`Describe.Serves(capability, entity)` read it, so a caller resolves "entity X,
+capability C" to a service generically. `ParseDescribe` decodes the envelope strictly.
 
 ## http.v1 and grpc.v1 hosts and calls
 

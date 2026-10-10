@@ -583,14 +583,19 @@ func (p *Profile) Call(ctx context.Context, call xrpc.Call) (xrpc.Result, error)
 		return xrpc.Result{}, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: streaming method requires Observe"))
 	}
 	output := dynamicpb.NewMessage(method.Output())
-	if err = connection.Invoke(ctx, call.Method, input, output); err != nil {
+	var header metadata.MD
+	if err = connection.Invoke(ctx, call.Method, input, output, grpc.Header(&header)); err != nil {
 		return xrpc.Result{}, callError(err)
 	}
 	raw, err := protojson.Marshal(output)
 	if err == nil && len(raw) > p.options.MaxResponseJSONBytes {
 		return xrpc.Result{}, xrpc.Failure("resource_exhausted", xrpc.ResponseReceived, errors.New("xrpc: protobuf JSON output exceeds representation byte budget"))
 	}
-	return xrpc.Result{Payload: raw}, err
+	instance := ""
+	if values := header.Get(InstanceIDMetadata); len(values) == 1 {
+		instance = values[0]
+	}
+	return xrpc.Result{Payload: raw, InstanceID: instance}, err
 }
 func (p *Profile) Observe(ctx context.Context, call xrpc.Call, emit func(xrpc.Result) error) error {
 	ctx, connection, method, input, release, err := p.prepare(ctx, call)

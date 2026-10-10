@@ -441,12 +441,23 @@ func (c *Client) CallWithHeaders(ctx context.Context, call xrpc.Call, headers ma
 	if len(call.Payload) > 0 && !json.Valid(call.Payload) {
 		return xrpc.Result{}, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: JSON payload required"))
 	}
-	output, status, _, err := c.DoWithHeaders(ctx, call.Method, call.Path, call.RequestID, "application/json", call.Payload, headers)
+	output, status, header, err := c.DoWithHeaders(ctx, call.Method, call.Path, call.RequestID, "application/json", call.Payload, headers)
 	if err != nil {
 		return xrpc.Result{}, err
 	}
+	instance := header.Get(InstanceIDHeader)
 	if status < 200 || status >= 300 {
-		return xrpc.Result{}, xrpc.Failure(statusCode(status), xrpc.ResponseReceived, fmt.Errorf("HTTP status %d: %s", status, strings.TrimSpace(string(output))))
+		// The answer is delivered with the error: its body can carry the
+		// domain's details.
+		result := xrpc.Result{Status: status, InstanceID: instance}
+		if json.Valid(output) {
+			result.Payload = output
+		}
+		code := envelopeCode(output)
+		if code == "" {
+			code = statusCode(status)
+		}
+		return result, xrpc.Failure(code, xrpc.ResponseReceived, fmt.Errorf("HTTP status %d: %s", status, strings.TrimSpace(string(output))))
 	}
 	if len(output) == 0 {
 		output = []byte("null")
@@ -454,7 +465,32 @@ func (c *Client) CallWithHeaders(ctx context.Context, call xrpc.Call, headers ma
 	if !json.Valid(output) {
 		return xrpc.Result{}, xrpc.Failure("internal", xrpc.ResponseReceived, errors.New("xrpc: response is not JSON"))
 	}
-	return xrpc.Result{Status: status, Payload: output}, nil
+	return xrpc.Result{Status: status, Payload: output, InstanceID: instance}, nil
+}
+
+// envelopeCode returns the error code of a {"error":{"code":...}} envelope, or
+// "" when the body is not one or the code is not a token (lowercase letters,
+// digits and underscores, starting with a letter, at most 64 bytes). Domains may
+// add codes of their own beside the standard vocabulary.
+func envelopeCode(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return ""
+	}
+	code := envelope.Error.Code
+	if code == "" || len(code) > 64 || code[0] < 'a' || code[0] > 'z' {
+		return ""
+	}
+	for i := 1; i < len(code); i++ {
+		if c := code[i]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			return ""
+		}
+	}
+	return code
 }
 func statusCode(status int) string {
 	switch status {

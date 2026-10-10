@@ -192,9 +192,15 @@ type Call struct {
 	RequestID string          `json:"request_id"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
+
+// Result is what a Caller got back. Status is the HTTP status for http.v1, the
+// equivalent of the answer's code for udp.v1 and zero for grpc.v1; Payload is
+// the JSON body. InstanceID is the instance that answered, when the transport
+// reports it, so a caller that sent an unpinned call can pin the next one.
 type Result struct {
-	Status  int             `json:"status,omitempty"`
-	Payload json.RawMessage `json:"payload"`
+	Status     int             `json:"status,omitempty"`
+	Payload    json.RawMessage `json:"payload"`
+	InstanceID string          `json:"instance_id,omitempty"`
 }
 type Caller interface {
 	Call(context.Context, Call) (Result, error)
@@ -204,13 +210,14 @@ type Observer interface {
 }
 
 // Dispatcher is immutable local composition, not a registry or discovery API.
-// It composes the http.v1 and grpc.v1 profiles; udp.v1 callers use udpx.Client.
+// It composes one Caller per profile: httpx.Profile for http.v1,
+// grpcx.Profile for grpc.v1 and udpx.Profile for udp.v1.
 type Dispatcher struct{ profiles map[string]Caller }
 
 func NewDispatcher(profiles map[string]Caller) (*Dispatcher, error) {
 	copy := make(map[string]Caller, len(profiles))
 	for profile, caller := range profiles {
-		if (profile != HTTP && profile != GRPC) || caller == nil {
+		if (profile != HTTP && profile != GRPC && profile != UDP) || caller == nil {
 			return nil, errors.New("xrpc: invalid profile caller")
 		}
 		copy[profile] = caller
@@ -221,7 +228,14 @@ func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, error) {
 	if _, err := Remaining(ctx); err != nil {
 		return nil, Failure(Code(err), NotSent, err)
 	}
-	if err := call.Service.ValidateInternal(); err != nil {
+	// A udp.v1 reference comes from configuration and may leave the instance
+	// empty; the first answer reveals it. Internal http.v1 and grpc.v1
+	// references are always pinned.
+	check := call.Service.ValidateInternal
+	if call.Service.Profile == UDP {
+		check = call.Service.Validate
+	}
+	if err := check(); err != nil {
 		return nil, Failure("invalid_argument", NotSent, err)
 	}
 	if call.Method == "" || !ValidID(call.RequestID) {
