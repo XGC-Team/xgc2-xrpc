@@ -13,6 +13,7 @@ exist before application checks; these are not exact process/RSS bounds.
 import asyncio
 import concurrent.futures
 from contextvars import ContextVar
+from dataclasses import replace
 import inspect
 import math
 import os
@@ -25,7 +26,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 
-from .http import Fault, Limits, TransportError
+from .http import Fault, TransportError, _client_limits
 
 _CALL = ContextVar("xrpc_websocket_call", default=None)
 _TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z", re.ASCII)
@@ -349,8 +350,8 @@ class WebSocketClient:
     consumer must await every send/receive and finish all of its owned work.
     """
     def __init__(self, origin, *, runtime, limits=None, tls_context=None, uds=None):
-        self.limits = Limits.from_policy(runtime.policy, overrides=limits, client=True)
-        self.limits = Limits(**{**self.limits.__dict__, "connections": min(self.limits.connections, runtime.max_connections)})
+        self.limits = _client_limits(limits)
+        self.limits = replace(self.limits, connections=min(self.limits.connections, runtime.max_connections))
         if type(origin) is not str or len(origin) > self.limits.header_bytes:
             raise ValueError("WebSocket origin exceeds header byte limit")
         parsed = urlsplit(origin) if isinstance(origin, str) else None

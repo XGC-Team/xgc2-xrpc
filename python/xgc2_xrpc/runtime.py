@@ -8,7 +8,7 @@ import asyncio
 import concurrent.futures
 from contextvars import ContextVar
 import logging
-import os
+import math
 import ssl
 import threading
 import time
@@ -79,21 +79,26 @@ class _OwnedExecutor(concurrent.futures.ThreadPoolExecutor):
 
 
 class Runtime:
-    def __init__(self, *, blocking_workers=4, max_calls=None, max_connections=None, max_sessions=None, observer=None,policy=None):
-        from .policy import resolve_policy
-        self.policy=policy or resolve_policy({},capabilities=("diagnostics","host","http","rpc","transport","client_pool","client_registry"))
-        max_calls=self.policy.value("HOST_MAX_IN_FLIGHT") if max_calls is None else max_calls
-        max_connections=self.policy.value("HOST_MAX_CONNECTIONS") if max_connections is None else max_connections
-        max_sessions=self.policy.value("CLIENT_MAX_REFERENCES") if max_sessions is None else max_sessions
+    """Process-owned event loop, bounded worker pool and shared capacities.
+
+    Plain parameters with their defaults: blocking_workers=4, max_calls=32,
+    max_connections=32, max_sessions=64, shutdown_timeout=5.0 seconds,
+    log_level="info", log_format="json". The environment is never read.
+    """
+    def __init__(self, *, blocking_workers=4, max_calls=32, max_connections=32, max_sessions=64,
+                 shutdown_timeout=5.0, observer=None, log_level="info", log_format="json"):
         if any(type(v) is not int for v in (blocking_workers,max_calls,max_connections,max_sessions)):
             raise ValueError("integer runtime limits required")
-        if min(blocking_workers, max_calls, max_connections, max_sessions) <= 0:
+        if not all(0<v<=2147483647 for v in (blocking_workers,max_calls,max_connections,max_sessions)):
             raise ValueError("positive runtime limits required")
+        if isinstance(shutdown_timeout,bool) or not isinstance(shutdown_timeout,(int,float)) or not math.isfinite(shutdown_timeout) or shutdown_timeout<=0:
+            raise ValueError("finite positive shutdown_timeout required")
         self.blocking_workers = blocking_workers
         self.max_calls, self.max_connections, self.max_sessions = max_calls, max_connections, max_sessions
+        self.shutdown_timeout = shutdown_timeout
         self.observer = observer
         from .diagnostics import Diagnostics
-        self.diagnostics=Diagnostics(self.policy,observer=observer)
+        self.diagnostics=Diagnostics(observer,level=log_level,format=log_format)
         self.tls_context = ssl.create_default_context()
         self.loop = None
         self._thread = None
@@ -115,22 +120,6 @@ class Runtime:
         self._retiring_sessions = set()
         self.connections = self.calls = 0
         self.closed = False
-
-    @classmethod
-    def from_environment(cls,environment=None,*,defaults=None,ceilings=None,capabilities=None,**kwargs):
-        """Composition-root factory: snapshot and resolve startup inputs once."""
-        from .policy import resolve_policy
-        if capabilities is None:
-            capabilities=("diagnostics","host","http","rpc","transport","client_pool","client_registry")
-        policy=resolve_policy(dict(os.environ) if environment is None else environment,
-                              defaults=defaults,ceilings=ceilings,capabilities=capabilities)
-        return cls(policy=policy,**kwargs)
-
-    def effective_policy(self):
-        result=self.policy.snapshot()
-        result["runtime_capacities"]={"blocking_workers":self.blocking_workers,"calls":self.max_calls,
-                                      "connections":self.max_connections,"sessions":self.max_sessions}
-        return result
 
     def session_count(self):
         with self._ownership_lock:
@@ -157,7 +146,7 @@ class Runtime:
             self._session_reservations.discard(token)
 
     def _start(self,timeout=None):
-        timeout=self.policy.value("SHUTDOWN_TIMEOUT_MS")/1000 if timeout is None else max(0,timeout)
+        timeout=self.shutdown_timeout if timeout is None else max(0,timeout)
         deadline=time.monotonic()+timeout
         if not self._start_lock.acquire(timeout=timeout):
             raise concurrent.futures.TimeoutError("runtime startup deadline")
@@ -270,7 +259,8 @@ class Runtime:
                     "failed_http_endpoints":len(getattr(self,"_http_poisoned",{})),
                     "session_reservations":len(self._session_reservations),
                     "session_total":self.session_count(),
-                    "capacities":self.effective_policy()["runtime_capacities"]}
+                    "capacities":{"blocking_workers":self.blocking_workers,"calls":self.max_calls,
+                                  "connections":self.max_connections,"sessions":self.max_sessions}}
         result["diagnostics"]=self.diagnostics.status()
         return result
 
@@ -312,7 +302,7 @@ class Runtime:
         return await asyncio.shield(wrapped)
 
     def close(self, timeout=None):
-        timeout=self.policy.value("SHUTDOWN_TIMEOUT_MS")/1000 if timeout is None else timeout
+        timeout=self.shutdown_timeout if timeout is None else timeout
         if not self._close_lock.acquire(timeout=timeout):
             raise RuntimeError("runtime close deadline; ownership retained")
         try:

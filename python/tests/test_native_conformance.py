@@ -56,15 +56,15 @@ class NativeConformanceTests(unittest.TestCase):
                 self.assertEqual(error.exception.disposition,"not_sent")
                 self.assertEqual(calls,[])
 
-    def test_environment_caps_native_rpc_sync_and_async_deadlines(self):
-        with tempfile.TemporaryDirectory() as directory,Runtime() as server_runtime,Runtime.from_environment({"XGC2_XRPC_CALL_TIMEOUT_MS":"50"}) as client_runtime:
+    def test_call_timeout_limit_caps_sync_and_async_deadlines(self):
+        with tempfile.TemporaryDirectory() as directory,Runtime() as server_runtime,Runtime() as client_runtime:
             path=os.path.join(directory,"deadline.sock")
             async def reply(request):
                 await asyncio.sleep(.12)
                 return web.Response(body=b"ok",headers={"X-Request-ID":request.headers.get("X-Request-ID","public")})
             app=web.Application()
             app.router.add_get("/slow",reply)
-            with Host.from_app(app,path=path,runtime=server_runtime),Client(path,runtime=client_runtime) as client:
+            with Host.from_app(app,path=path,runtime=server_runtime),Client(path,runtime=client_runtime,limits=Limits(call_timeout=.05)) as client:
                 for operation in (lambda:client.call("/slow",method="GET",timeout=.3),
                                   lambda:client_runtime.run(client.call_async("/slow",method="GET",timeout=.3),1)):
                     started=time.monotonic()

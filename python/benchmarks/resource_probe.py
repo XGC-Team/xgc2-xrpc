@@ -29,7 +29,7 @@ def probe(calls=1000,concurrency=8):
     before=sample()
     tracemalloc.start()
     with tempfile.TemporaryDirectory() as directory:
-        runtime=Runtime.from_environment({"XGC2_XRPC_LOG_LEVEL":"error"},blocking_workers=4,max_calls=16,max_connections=16,max_sessions=4)
+        runtime=Runtime(log_level="error",blocking_workers=4,max_calls=16,max_connections=16,max_sessions=4)
         path=os.path.join(directory,"probe.sock")
         limits=Limits(connections=16,in_flight=16,body_bytes=8192,response_bytes=8192)
         async def echo(context,value): return value

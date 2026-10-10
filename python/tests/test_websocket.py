@@ -295,18 +295,17 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(self.runtime.session_count(), 1)
         self.assertEqual(clients[0].status()["session_references"], 8)
 
-    def test_environment_precedence_tightens_native_role_caps(self):
-        self.runtime.close()
-        self.runtime = Runtime.from_environment({"XGC2_XRPC_CLIENT_MAX_CONNECTIONS": "2",
-            "XGC2_XRPC_MAX_REQUEST_BYTES": "8", "XGC2_XRPC_MAX_RESPONSE_BYTES": "8"}, max_calls=4)
+    def test_explicit_limits_bound_the_native_pool_and_message_sizes(self):
         origin, _ = self.serve(self.echo)
-        client = self.client(origin, limits=Limits(connections=1, body_bytes=4, response_bytes=4))
+        client = self.client(origin, limits=Limits(connections=2, body_bytes=8, response_bytes=8))
         self.assertEqual((client.limits.connections, client.limits.body_bytes, client.limits.response_bytes), (2, 8, 8))
+        default = self.client(origin)
+        self.assertEqual(default.limits.connections, 16)
         async def consume(socket):
             await socket.send_bytes(b"12345678")
             self.assertEqual((await socket.receive()).data, b"12345678")
             with self.assertRaises(Fault): await socket.send_bytes(b"x")
-        client.consume("/policy", consume, timeout=1, max_msg_bytes=100, total_send_bytes=100, total_receive_bytes=100)
+        client.consume("/limits", consume, timeout=1, max_msg_bytes=100, total_send_bytes=100, total_receive_bytes=100)
         self.assertEqual(client._pool.connector.limit, 2)
 
     def test_redirect_never_contacts_second_native_destination(self):

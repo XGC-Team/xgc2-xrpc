@@ -6,12 +6,11 @@ import unittest
 from unittest.mock import patch
 
 from xgc2_xrpc.diagnostics import Diagnostics
-from xgc2_xrpc.policy import resolve_policy
 
 
 class DiagnosticTests(unittest.TestCase):
     def test_no_worker_before_first_emitted_record(self):
-        diagnostics = Diagnostics(resolve_policy({}), stream=io.StringIO())
+        diagnostics = Diagnostics(stream=io.StringIO())
         self.assertFalse(diagnostics.status()["worker_started"])
         diagnostics.emit("call_started", {})
         self.assertFalse(diagnostics.status()["worker_started"])
@@ -28,7 +27,7 @@ class DiagnosticTests(unittest.TestCase):
         def observer(event, fields):
             observed.append((event, fields, threading.get_ident()))
 
-        diagnostics = Diagnostics(resolve_policy({}), observer=observer, stream=output)
+        diagnostics = Diagnostics(observer=observer, stream=output)
         try:
             self.assertTrue(diagnostics.emit("handler_failed", {
                 "request_id": "request:1", "instance_id": "boot:1", "service": "camera",
@@ -51,27 +50,34 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostics.status()["redacted_fields"], 6)
         self.assertEqual(diagnostics.status()["observed"], 1)
 
-    def test_live_log_level_and_startup_text_format(self):
+    def test_level_filters_records_and_text_format_is_selected_at_construction(self):
         output = io.StringIO()
-        policy = resolve_policy({"XGC2_XRPC_LOG_FORMAT": "text"})
-        diagnostics = Diagnostics(policy, stream=output)
+        diagnostics = Diagnostics(level="debug", format="text", stream=output)
+        quiet = io.StringIO()
+        filtered = Diagnostics(level="warn", stream=quiet)
         try:
-            diagnostics.emit("call_started", {"request_id": "before"})
-            policy.update({"LOG_LEVEL": "debug"}, expected_revision=1, authorized=True)
-            diagnostics.emit("call_started", {"request_id": "after"})
-            diagnostics.close(1)
+            for owner in (diagnostics, filtered):
+                owner.emit("call_started", {"request_id": "request"})
+                owner.emit("transport_failed", {"category": "unavailable"})
+                owner.close(1)
         finally:
             diagnostics.close(1)
-        self.assertNotIn("before", output.getvalue())
+            filtered.close(1)
         self.assertIn("debug call_started", output.getvalue())
-        self.assertIn('request_id="after"', output.getvalue())
-        self.assertEqual(diagnostics.status()["filtered"], 1)
+        self.assertIn('request_id="request"', output.getvalue())
+        self.assertNotIn("call_started", quiet.getvalue())
+        self.assertIn('"event":"transport_failed"', quiet.getvalue().replace(" ", ""))
+        self.assertEqual(filtered.status()["filtered"], 1)
+        self.assertEqual((Diagnostics().level, Diagnostics().format), ("info", "json"))
+        for bad in ({"level": "verbose"}, {"level": 3}, {"format": "logfmt"}):
+            with self.assertRaises(ValueError):
+                Diagnostics(**bad)
 
     def test_observer_is_independent_of_log_verbosity(self):
         output = io.StringIO()
         observed = []
-        diagnostics = Diagnostics(resolve_policy({"XGC2_XRPC_LOG_LEVEL": "error"}),
-                                  observer=lambda event, fields: observed.append(event), stream=output)
+        diagnostics = Diagnostics(observer=lambda event, fields: observed.append(event),
+                                  level="error", stream=output)
         try:
             diagnostics.emit("call_started", {})
             diagnostics.close(1)
@@ -90,7 +96,7 @@ class DiagnosticTests(unittest.TestCase):
                 entered.set()
                 release.wait(3)
 
-        diagnostics = Diagnostics(resolve_policy({}), observer=observer, max_records=2, stream=output)
+        diagnostics = Diagnostics(observer=observer, max_records=2, stream=output)
         try:
             diagnostics.emit("shutdown_started", {})
             self.assertTrue(entered.wait(1))
@@ -125,7 +131,7 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_rate_aggregation_has_fixed_counters_and_no_retry_queue(self):
         output = io.StringIO()
-        diagnostics = Diagnostics(resolve_policy({}), stream=output)
+        diagnostics = Diagnostics(stream=output)
         try:
             with patch("xgc2_xrpc.diagnostics.time.monotonic", side_effect=[10.0, 10.1, 10.2, 11.1]):
                 diagnostics.emit("connection_rejected", {})
@@ -144,7 +150,7 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_unknown_events_do_not_create_metric_labels_or_log_contents(self):
         output = io.StringIO()
-        diagnostics = Diagnostics(resolve_policy({"XGC2_XRPC_LOG_LEVEL": "debug"}), max_records=4, stream=output)
+        diagnostics = Diagnostics(level="debug", max_records=4, stream=output)
         initial_count = len(diagnostics.status()["event_counts"])
         try:
             for index in range(1000):
@@ -161,8 +167,7 @@ class DiagnosticTests(unittest.TestCase):
         for log_format in ("json", "text"):
             with self.subTest(format=log_format):
                 output = io.StringIO()
-                diagnostics = Diagnostics(resolve_policy({"XGC2_XRPC_LOG_FORMAT": log_format}),
-                                          max_record_bytes=256, stream=output)
+                diagnostics = Diagnostics(format=log_format, max_record_bytes=256, stream=output)
                 try:
                     diagnostics.emit("handler_failed", {
                         "service": "a" * 128, "request_id": "b" * 128,
@@ -188,7 +193,7 @@ class DiagnosticTests(unittest.TestCase):
         def observer(event, fields):
             raise ValueError("secret-observer-error")
 
-        diagnostics = Diagnostics(resolve_policy({}), observer=observer, stream=BrokenStream())
+        diagnostics = Diagnostics(observer=observer, stream=BrokenStream())
         try:
             diagnostics.emit("handler_failed", {})
             diagnostics.emit("shutdown_started", {})
@@ -214,7 +219,7 @@ class DiagnosticTests(unittest.TestCase):
             def flush(self):
                 pass
 
-        diagnostics = Diagnostics(resolve_policy({}), stream=BlockingStream())
+        diagnostics = Diagnostics(stream=BlockingStream())
         try:
             diagnostics.emit("handler_failed", {})
             self.assertTrue(entered.wait(1))

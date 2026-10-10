@@ -24,68 +24,64 @@ import httpx
 from aiohttp import web
 from .unix import UnixLease
 from .wire import WireError, bounded_json_dumps, validate_request_metadata, validate_response_metadata, validate_request_id, timeout_ms_from_seconds, strict_json_loads
-from .policy import resolve_policy, PolicyError, _registry
 from .app import HOST_KEY, DEADLINE_KEY, _text_size
 from .runtime import _CALL_OWNER
 
 _ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
 
-_LIMIT_FIELDS={"HOST_MAX_CONNECTIONS":"connections","HOST_MAX_IN_FLIGHT":"in_flight",
-               "MAX_HEADER_BYTES":"header_bytes","MAX_REQUEST_BYTES":"body_bytes",
-               "MAX_RESPONSE_BYTES":"response_bytes","HEADER_TIMEOUT_MS":"header_timeout",
-               "CALL_TIMEOUT_MS":"call_timeout","IDLE_TIMEOUT_MS":"idle_timeout",
-               "SHUTDOWN_TIMEOUT_MS":"shutdown_timeout"}
+_MAX_MILLISECONDS=2147483647
+_MAX_CALL_SECONDS=86400
+CLIENT_CONNECTIONS=16
 
 @dataclass(frozen=True)
 class Limits:
-    connections: int = None
-    in_flight: int = None
-    header_bytes: int = None
-    header_count: int = 64
-    body_bytes: int = None
-    response_bytes: int = None
-    header_timeout: float = None
-    call_timeout: float = None
-    idle_timeout: float = None
-    shutdown_timeout: float = None
-    def __post_init__(self):
-        defaults=resolve_policy({})
-        for field_name,option in _LIMIT_FIELDS.items():
-            if getattr(self,option) is None:
-                value=defaults.value(field_name)
-                object.__setattr__(self,option,value/1000 if field_name.endswith("_MS") else value)
-        for name in ("connections","in_flight","header_bytes","header_count","body_bytes","response_bytes"):
-            if type(getattr(self,name)) is not int:
-                raise ValueError("integer resource limits required")
-        if any(isinstance(v,bool) or not isinstance(v,(int,float)) for v in self.__dict__.values()):
-            raise ValueError("numeric resource limits required")
-        if any(not math.isfinite(v) or v <= 0 for v in self.__dict__.values()):
-            raise ValueError("finite positive limits required")
-        registry=_registry()
-        for name,option in _LIMIT_FIELDS.items():
-            chosen=getattr(self,option)*(1000 if name.endswith("_MS") else 1)
-            if chosen>registry.fields[name].maximum:
-                raise PolicyError(name,"host/client option exceeds registry maximum")
+    """Resource limits for a Host or Client; times are seconds.
 
-    @classmethod
-    def from_policy(cls,policy,*,overrides=None,client=False):
-        values=dict(overrides.__dict__) if overrides is not None else {}
-        fields=policy.fields
-        mapping=dict(_LIMIT_FIELDS)
-        if client:
-            mapping.pop("HOST_MAX_CONNECTIONS")
-            mapping["CLIENT_MAX_CONNECTIONS"]="connections"
-        for field_name,option in mapping.items():
-            field=fields.get(field_name)
-            if field is None:
-                continue
-            if overrides is None or field.source!="sdk_default":
-                values[option]=field.value/1000 if field_name.endswith("_MS") else field.value
-            if field.ceiling is not None and option in values:
-                chosen=values[option]*1000 if field_name.endswith("_MS") else values[option]
-                if chosen>field.ceiling:
-                    raise PolicyError(field_name,"host/client option exceeds declared ceiling")
-        return cls(**values)
+    Defaults: connections 32, in_flight 32, header_bytes 16384, header_count 64,
+    body_bytes and response_bytes 1048576, header_timeout 5, call_timeout 30
+    (at most 86400), idle_timeout 30, shutdown_timeout 5, reference_idle_timeout 30.
+    A Client given no Limits uses connections=16 per reference instead of 32.
+    """
+    connections: int = 32
+    in_flight: int = 32
+    header_bytes: int = 16384
+    header_count: int = 64
+    body_bytes: int = 1048576
+    response_bytes: int = 1048576
+    header_timeout: float = 5.0
+    call_timeout: float = 30.0
+    idle_timeout: float = 30.0
+    shutdown_timeout: float = 5.0
+    reference_idle_timeout: float = 30.0
+    def __post_init__(self):
+        for name in ("connections","in_flight","header_bytes","header_count","body_bytes","response_bytes"):
+            value=getattr(self,name)
+            if type(value) is not int:
+                raise ValueError("integer resource limits required")
+            if not 0<value<=_MAX_MILLISECONDS:
+                raise ValueError("%s must be in 1..%d"%(name,_MAX_MILLISECONDS))
+        for name in ("header_timeout","call_timeout","idle_timeout","shutdown_timeout","reference_idle_timeout"):
+            value=getattr(self,name)
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+                raise ValueError("finite positive limits required")
+            if value*1000>_MAX_MILLISECONDS:
+                raise ValueError("%s exceeds the wire maximum"%name)
+        if self.call_timeout>_MAX_CALL_SECONDS:
+            raise ValueError("call_timeout exceeds 86400 seconds")
+
+def _host_limits(limits):
+    if limits is None:
+        return Limits()
+    if not isinstance(limits,Limits):
+        raise TypeError("Limits required")
+    return limits
+
+def _client_limits(limits):
+    if limits is None:
+        return Limits(connections=CLIENT_CONNECTIONS)
+    if not isinstance(limits,Limits):
+        raise TypeError("Limits required")
+    return limits
 
 class Fault(Exception):
     def __init__(self, code, message, status=None):
@@ -278,7 +274,7 @@ class _HttpCallOwner:
 class Host:
     def __init__(self,path,routes,*,runtime,limits=None,reclaim_unreachable=False,allowed_uids=None,instance_id="",discovery_routes=()):
         self.path,self.routes,self.runtime=path,dict(routes),runtime
-        self.limits=Limits.from_policy(runtime.policy,overrides=limits)
+        self.limits=_host_limits(limits)
         self.reclaim_unreachable=reclaim_unreachable
         self.allowed_uids=allowed_uids
         self.instance_id=instance_id
@@ -703,7 +699,7 @@ class Client:
     """
     def __init__(self,path,*,runtime,limits=None,instance_id="",headers=None):
         self.path,self.runtime,self.instance_id=path,runtime,instance_id
-        self.limits=Limits.from_policy(runtime.policy,overrides=limits,client=True)
+        self.limits=_client_limits(limits)
         self._maintained_headers=_maintained_headers(headers,self.limits)
         self._session=None
         self._retiring_session=None
@@ -711,7 +707,7 @@ class Client:
         self._retiring_transport=None
         self._retiring_transport_task=None
         self._session_reservation=None
-        self._pool_idle=min(self.limits.idle_timeout,runtime.policy.value("CLIENT_REFERENCE_IDLE_TIMEOUT_MS")/1000)
+        self._pool_idle=min(self.limits.idle_timeout,self.limits.reference_idle_timeout)
         self._key=("unix",path,self.limits.connections,self._pool_idle)
         self._origin="http://localhost"
         self._ssl=None
@@ -722,7 +718,7 @@ class Client:
 
     @classmethod
     def from_service(cls,service,*,runtime,local_target,tls_context=None,limits=None,discovery=False,transport_factory=None,headers=None):
-        selected=Limits.from_policy(runtime.policy,overrides=limits,client=True)
+        selected=_client_limits(limits)
         address=service.endpoint.address
         if type(address) is not str or len(address)>selected.header_bytes:
             raise ValueError("bounded service endpoint required")
