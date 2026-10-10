@@ -28,8 +28,9 @@ var (
 	// ErrAlreadyReplied is returned by a second answer to the same request.
 	ErrAlreadyReplied = errors.New("udpx: request already answered")
 	// ErrDeadlineExceeded is returned when a request is answered after its
-	// deadline: the client has already given up and nothing is sent.
-	ErrDeadlineExceeded = errors.New("udpx: request deadline passed; no reply sent")
+	// deadline or after the server closed: the request was abandoned, the client
+	// reports an unknown outcome and nothing is sent.
+	ErrDeadlineExceeded = errors.New("udpx: request abandoned (deadline passed or server closed); no reply sent")
 	// ErrReplyTooLarge is returned when a reply did not fit in one datagram. A
 	// short resource_exhausted reply was sent in its place.
 	ErrReplyTooLarge = errors.New("udpx: reply exceeds the datagram limit; resource_exhausted sent")
@@ -376,6 +377,8 @@ func (s *Server) dispatch(datagram []byte, from netip.AddrPort) {
 		return
 	}
 	s.work.Add(2) // the handler goroutine and the pending responder
+	s.executed.Add(1)
+	s.inFlight.Add(1)
 	s.admitMu.Unlock()
 	deadline := now.Add(min(time.Duration(m.word)*time.Millisecond, s.budget))
 	ctx, cancel := context.WithDeadline(s.base, deadline)
@@ -389,8 +392,6 @@ func (s *Server) dispatch(datagram []byte, from netip.AddrPort) {
 	response.watch = context.AfterFunc(ctx, response.expire)
 	response.mu.Unlock()
 	request := Request{Method: string(m.method), Body: bytes.Clone(m.body), Source: from, KeyID: m.keyID, ID: m.id, Deadline: deadline}
-	s.executed.Add(1)
-	s.inFlight.Add(1)
 	go s.run(ctx, handler, request, response)
 }
 
