@@ -45,8 +45,9 @@ std::vector<std::uint8_t> frame(const Key &key, Type type, std::uint16_t flags,
   put32(out.data() + 44, word);
   put16(out.data() + 48, static_cast<std::uint32_t>(method.size()));
   put16(out.data() + 50, static_cast<std::uint32_t>(body.size()));
-  std::memcpy(out.data() + header_bytes, method.data(), method.size());
-  std::memcpy(out.data() + header_bytes + method.size(), body.data(), body.size());
+  // memcpy from the null data() of an empty view is undefined even for zero bytes.
+  if (!method.empty()) std::memcpy(out.data() + header_bytes, method.data(), method.size());
+  if (!body.empty()) std::memcpy(out.data() + header_bytes + method.size(), body.data(), body.size());
   const auto signed_size = out.size() - tag_bytes;
   hmac_sha256(key.data(), key.size(), out.data(), signed_size, out.data() + signed_size);
   return out;
