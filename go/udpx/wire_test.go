@@ -90,22 +90,22 @@ func TestParseRejectsMalformedDatagrams(t *testing.T) {
 	}
 	mutate := func(base func() []byte, edit func([]byte) []byte) []byte { return edit(base()) }
 	cases := map[string][]byte{
-		"empty":             nil,
-		"shorter than min":  make([]byte, headerLen+tagLen-1),
-		"larger than max":   append(valid(), make([]byte, MaxDatagram)...),
-		"bad magic":         mutate(valid, func(d []byte) []byte { d[0] = 'Y'; return d }),
-		"bad version":       mutate(valid, func(d []byte) []byte { d[4] = 2; return d }),
-		"type zero":         mutate(valid, func(d []byte) []byte { d[5] = 0; return d }),
-		"type three":        mutate(valid, func(d []byte) []byte { d[5] = 3; return d }),
-		"unknown flag":      mutate(valid, func(d []byte) []byte { d[7] = 2; return d }),
-		"flag on reply":     mutate(reply, func(d []byte) []byte { d[7] = 1; return d }),
-		"zero method":       mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[48:], 0); return d }),
-		"method too long":   mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[48:], MaxMethodLen+1); return d }),
-		"method on reply":   mutate(reply, func(d []byte) []byte { binary.BigEndian.PutUint16(d[48:], 1); return d }),
-		"body length long":  mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[50:], 3); return d }),
-		"body length short": mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[50:], 1); return d }),
-		"trailing byte":     append(valid(), 0),
-		"missing byte":      valid()[:len(valid())-1],
+		"empty":              nil,
+		"shorter than min":   make([]byte, headerLen+tagLen-1),
+		"larger than max":    append(valid(), make([]byte, MaxDatagram)...),
+		"bad magic":          mutate(valid, func(d []byte) []byte { d[0] = 'Y'; return d }),
+		"bad version":        mutate(valid, func(d []byte) []byte { d[4] = 2; return d }),
+		"type zero":          mutate(valid, func(d []byte) []byte { d[5] = 0; return d }),
+		"type three":         mutate(valid, func(d []byte) []byte { d[5] = 3; return d }),
+		"unknown flag":       mutate(valid, func(d []byte) []byte { d[7] = 2; return d }),
+		"unknown reply flag": mutate(reply, func(d []byte) []byte { d[7] = 2; return d }),
+		"zero method":        mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[48:], 0); return d }),
+		"method too long":    mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[48:], MaxMethodLen+1); return d }),
+		"method on reply":    mutate(reply, func(d []byte) []byte { binary.BigEndian.PutUint16(d[48:], 1); return d }),
+		"body length long":   mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[50:], 3); return d }),
+		"body length short":  mutate(valid, func(d []byte) []byte { binary.BigEndian.PutUint16(d[50:], 1); return d }),
+		"trailing byte":      append(valid(), 0),
+		"missing byte":       valid()[:len(valid())-1],
 	}
 	for name, datagram := range cases {
 		if _, err := parse(datagram); err == nil {
@@ -116,6 +116,12 @@ func TestParseRejectsMalformedDatagrams(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := parse(reply()); err != nil {
+		t.Fatal(err)
+	}
+	// A reply that echoes the expected-instance bit is tolerated.
+	echoed := reply()
+	echoed[7] = 1
+	if _, err := parse(echoed); err != nil {
 		t.Fatal(err)
 	}
 }

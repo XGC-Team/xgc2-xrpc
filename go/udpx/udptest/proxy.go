@@ -7,7 +7,6 @@ package udptest
 
 import (
 	"errors"
-	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -336,9 +335,4 @@ func (d *direction) relay(datagram []byte, send func([]byte) bool) {
 			time.AfterFunc(delay, deliver)
 		}
 	}
-}
-
-// String describes the proxy for test logs.
-func (p *Proxy) String() string {
-	return fmt.Sprintf("udptest proxy %s -> %s", p.conn.LocalAddr(), p.upstream)
 }

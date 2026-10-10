@@ -139,7 +139,9 @@ func parse(datagram []byte) (message, error) {
 	}
 	m.typ = datagram[5]
 	m.flags = binary.BigEndian.Uint16(datagram[6:])
-	if m.typ != typeRequest && m.typ != typeReply || m.flags&^flagExpectedInstance != 0 || m.typ == typeReply && m.flags != 0 {
+	// Only bit 0 is defined. A reply is authenticated and has no use for the
+	// bit, so a peer that echoes it is tolerated.
+	if m.typ != typeRequest && m.typ != typeReply || m.flags&^flagExpectedInstance != 0 {
 		return m, errMalformed
 	}
 	m.keyID = binary.BigEndian.Uint32(datagram[8:])
