@@ -2,7 +2,6 @@ package grpcx
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"net"
 	"path/filepath"
@@ -24,111 +23,51 @@ type acceptCounter struct {
 
 func (l *acceptCounter) Accept() (net.Conn, error) { l.calls.Add(1); return l.Listener.Accept() }
 
-func TestPrepareAndStopBeforeServe(t *testing.T) {
-	for _, graceful := range []bool{false, true} {
-		t.Run(map[bool]string{false: "stop", true: "shutdown"}[graceful], func(t *testing.T) {
-			lease, err := unixlease.Reserve(context.Background(), filepath.Join(privateTempDir(t), "edge.sock"), unixlease.Options{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			listener, err := lease.Listen()
-			if err != nil {
-				t.Fatal(err)
-			}
-			tracked := &acceptCounter{Listener: listener}
-			host, err := PrepareEdgeTLS(tracked, lease, func(grpc.ServiceRegistrar) error { return nil }, &tls.Config{Certificates: []tls.Certificate{{}}}, EdgeOptions{OwnerStreamLifetime: time.Second})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tracked.calls.Load() != 0 {
-				t.Fatal("Prepare accepted a connection")
-			}
-			select {
-			case <-host.Done():
-				t.Fatal("unstarted accept loop reported done")
-			default:
-			}
-			if graceful {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				defer cancel()
-				if err := host.Shutdown(ctx); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				host.Stop()
-			}
-			select {
-			case <-host.Drained():
-			case <-time.After(time.Second):
-				t.Fatal("prepared host did not drain")
-			}
-			select {
-			case <-host.Done():
-			default:
-				t.Fatal("prepared accept loop incomplete")
-			}
-			if _, err := listener.Accept(); !errors.Is(err, net.ErrClosed) {
-				t.Fatal("prepared listener still open", err)
-			}
-			if err := host.Serve(); !errors.Is(err, grpc.ErrServerStopped) {
-				t.Fatal("stopped host restarted", err)
-			}
-			replacement, err := unixlease.Reserve(context.Background(), lease.Path(), unixlease.Options{})
-			if err != nil {
-				t.Fatal("prepared lease was retained after actual drain", err)
-			}
-			replacement.Close()
-		})
-	}
-}
-
-func TestPrepareRegistrationFailureDoesNotStart(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	tracked := &acceptCounter{Listener: listener}
-	wanted := errors.New("registration failed")
-	host, err := PrepareEdgeTLS(tracked, nil, func(grpc.ServiceRegistrar) error { return wanted }, &tls.Config{Certificates: []tls.Certificate{{}}}, EdgeOptions{OwnerStreamLifetime: time.Second})
-	if host != nil || !errors.Is(err, wanted) || tracked.calls.Load() != 0 {
-		t.Fatalf("partial startup host=%v err=%v accepts=%d", host, err, tracked.calls.Load())
-	}
-}
-
-func TestPreparedServeStopCompetition(t *testing.T) {
+// Stop and Shutdown may arrive before the accept loop has started. The host
+// must still drain, release its lease and never accept afterwards.
+func TestStopRacingTheAcceptLoopStillDrains(t *testing.T) {
 	for i := 0; i < 30; i++ {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		lease, err := unixlease.Reserve(context.Background(), filepath.Join(privateTempDir(t), "race.sock"), unixlease.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		host, err := PrepareEdgeTLS(listener, nil, func(grpc.ServiceRegistrar) error { return nil }, &tls.Config{Certificates: []tls.Certificate{{}}}, EdgeOptions{OwnerStreamLifetime: time.Second})
+		listener, err := lease.Listen()
 		if err != nil {
-			listener.Close()
 			t.Fatal(err)
 		}
-		start := make(chan struct{})
+		tracked := &acceptCounter{Listener: listener}
+		host, err := ServeWithOptions(tracked, lease, func(grpc.ServiceRegistrar) {}, HostOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
 		var group sync.WaitGroup
-		group.Add(3)
-		go func() { defer group.Done(); <-start; _ = host.Serve() }()
-		go func() { defer group.Done(); <-start; host.Stop() }()
+		group.Add(2)
+		go func() { defer group.Done(); host.Stop() }()
 		go func() {
 			defer group.Done()
-			<-start
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			_ = host.Shutdown(ctx)
 		}()
-		close(start)
 		group.Wait()
 		select {
 		case <-host.Drained():
 		case <-time.After(time.Second):
 			t.Fatal("competing lifetime did not drain")
 		}
-		if err := host.Serve(); !errors.Is(err, grpc.ErrServerStopped) {
-			t.Fatal(err)
+		select {
+		case <-host.Done():
+		default:
+			t.Fatal("accept loop incomplete after Drained")
 		}
+		if _, err := listener.Accept(); !errors.Is(err, net.ErrClosed) {
+			t.Fatal("listener still open", err)
+		}
+		replacement, err := unixlease.Reserve(context.Background(), lease.Path(), unixlease.Options{})
+		if err != nil {
+			t.Fatal("the lease was retained after the actual drain", err)
+		}
+		replacement.Close()
 	}
 }
 
