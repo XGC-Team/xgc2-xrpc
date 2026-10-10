@@ -30,23 +30,33 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// DialOptions are plain limits. A zero field selects the default named in its
+// comment; nothing is read from the process environment.
 type DialOptions struct {
 	boundAuthorization bool
 	LocalTargetID      string
 	DialContext        xrpc.DialContext
 	TLSConfig          *tls.Config
-	MaxMessageBytes    int
-	MaxRequestBytes    int
-	MaxResponseBytes   int
+	// MaxMessageBytes sets both message limits when MaxRequestBytes or
+	// MaxResponseBytes is zero (default xrpc.DefaultMaxMessageBytes).
+	MaxMessageBytes  int
+	MaxRequestBytes  int
+	MaxResponseBytes int
 	// JSON representation limits are independent of native protobuf wire limits.
 	// Zero selects twice the corresponding finite wire budget.
 	MaxRequestJSONBytes  int
 	MaxResponseJSONBytes int
-	MaxHeaderBytes       uint32
-	MaxCallTime          time.Duration
-	IdleTimeout          time.Duration
-	MaxInFlight          int
-	MaxReferences        int
+	// MaxHeaderBytes bounds received header lists (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes uint32
+	// MaxCallTime caps every call's budget (default xrpc.DefaultCallTimeout).
+	MaxCallTime time.Duration
+	// IdleTimeout closes an idle channel (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// MaxInFlight bounds admitted calls (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// MaxReferences bounds cached references of a Profile (default xrpc.DefaultMaxReferences).
+	MaxReferences int
+	// ReferenceIdleTimeout retires idle cached references (default xrpc.DefaultReferenceIdleTimeout).
 	ReferenceIdleTimeout time.Duration
 	Metadata             metadata.MD
 	Diagnostics          *xrpc.Diagnostics
@@ -55,7 +65,7 @@ type DialOptions struct {
 
 func (o DialOptions) defaults() DialOptions {
 	if o.MaxHeaderBytes == 0 {
-		o.MaxHeaderBytes = uint32(xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES"))
+		o.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if o.Metrics == nil {
 		o.Metrics = &xrpc.Metrics{}
@@ -63,17 +73,17 @@ func (o DialOptions) defaults() DialOptions {
 	if o.MaxRequestBytes <= 0 {
 		o.MaxRequestBytes = o.MaxMessageBytes
 		if o.MaxRequestBytes <= 0 {
-			o.MaxRequestBytes = int(xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES"))
+			o.MaxRequestBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxResponseBytes <= 0 {
 		o.MaxResponseBytes = o.MaxMessageBytes
 		if o.MaxResponseBytes <= 0 {
-			o.MaxResponseBytes = int(xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES"))
+			o.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxCallTime <= 0 {
-		o.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		o.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if o.MaxRequestJSONBytes <= 0 {
 		o.MaxRequestJSONBytes = representationBudget(o.MaxRequestBytes)
@@ -82,7 +92,13 @@ func (o DialOptions) defaults() DialOptions {
 		o.MaxResponseJSONBytes = representationBudget(o.MaxResponseBytes)
 	}
 	if o.IdleTimeout <= 0 {
-		o.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		o.IdleTimeout = xrpc.DefaultIdleTimeout
+	}
+	if o.MaxReferences <= 0 {
+		o.MaxReferences = xrpc.DefaultMaxReferences
+	}
+	if o.ReferenceIdleTimeout <= 0 {
+		o.ReferenceIdleTimeout = xrpc.DefaultReferenceIdleTimeout
 	}
 	return o
 }
@@ -108,7 +124,7 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 	}
 	options = options.defaults()
 	if options.MaxInFlight <= 0 {
-		options.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		options.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	slots := make(chan struct{}, options.MaxInFlight)
 	budget := newDialBudget()
@@ -157,19 +173,35 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 	return grpc.NewClient(target, args...)
 }
 
+// HostOptions are plain limits. A zero field selects the default named in its
+// comment; nothing is read from the process environment.
 type HostOptions struct {
 	// Authorize establishes the injected transport caller grant. Product
 	// method/scope checks remain in its native interceptors.
-	Authorize                                  func(context.Context) bool
-	MaxConnections                             int
-	MaxConcurrentStreams                       uint32
-	MaxMessageBytes                            int
-	MaxRequestBytes, MaxResponseBytes          int
-	MaxHeaderBytes                             uint32
-	MaxInFlight                                int
-	MaxCallTime, IdleTimeout, HandshakeTimeout time.Duration
-	ShutdownTimeout                            time.Duration
-	InstanceID                                 string
+	Authorize func(context.Context) bool
+	// MaxConnections bounds accepted connections (default xrpc.DefaultMaxConnections).
+	MaxConnections int
+	// MaxConcurrentStreams bounds streams per connection (default xrpc.DefaultStreamsPerConnection).
+	MaxConcurrentStreams uint32
+	// MaxMessageBytes sets both message limits when MaxRequestBytes or
+	// MaxResponseBytes is zero (default xrpc.DefaultMaxMessageBytes).
+	MaxMessageBytes  int
+	MaxRequestBytes  int
+	MaxResponseBytes int
+	// MaxHeaderBytes bounds received header lists (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes uint32
+	// MaxInFlight bounds admitted calls and streams (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// MaxCallTime caps the caller's budget (default xrpc.DefaultCallTimeout).
+	MaxCallTime time.Duration
+	// IdleTimeout closes idle connections (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// HandshakeTimeout bounds connection setup (default xrpc.DefaultHeaderTimeout).
+	HandshakeTimeout time.Duration
+	// ShutdownTimeout is the drain budget of owners that call Shutdown with it
+	// (default xrpc.DefaultShutdownTimeout).
+	ShutdownTimeout time.Duration
+	InstanceID      string
 	// DiscoveryMethods names exact unary description methods. Only an absent
 	// instance is unbound; supplied empty or mismatched instances stay rejected.
 	DiscoveryMethods []string
@@ -183,40 +215,40 @@ func (o HostOptions) defaults() HostOptions {
 		o.Metrics = &xrpc.Metrics{}
 	}
 	if o.MaxConnections <= 0 {
-		o.MaxConnections = int(xrpc.DefaultPolicyInteger("HOST_MAX_CONNECTIONS"))
+		o.MaxConnections = xrpc.DefaultMaxConnections
 	}
 	if o.MaxConcurrentStreams == 0 {
-		o.MaxConcurrentStreams = uint32(xrpc.DefaultPolicyInteger("GRPC_MAX_STREAMS_PER_CONNECTION"))
+		o.MaxConcurrentStreams = xrpc.DefaultStreamsPerConnection
 	}
 	if o.MaxRequestBytes <= 0 {
 		o.MaxRequestBytes = o.MaxMessageBytes
 		if o.MaxRequestBytes <= 0 {
-			o.MaxRequestBytes = int(xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES"))
+			o.MaxRequestBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxResponseBytes <= 0 {
 		o.MaxResponseBytes = o.MaxMessageBytes
 		if o.MaxResponseBytes <= 0 {
-			o.MaxResponseBytes = int(xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES"))
+			o.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxHeaderBytes == 0 {
-		o.MaxHeaderBytes = uint32(xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES"))
+		o.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if o.MaxInFlight <= 0 {
-		o.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		o.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	if o.MaxCallTime <= 0 {
-		o.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		o.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if o.IdleTimeout <= 0 {
-		o.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		o.IdleTimeout = xrpc.DefaultIdleTimeout
 	}
 	if o.HandshakeTimeout <= 0 {
-		o.HandshakeTimeout = time.Duration(xrpc.DefaultPolicyInteger("HEADER_TIMEOUT_MS")) * time.Millisecond
+		o.HandshakeTimeout = xrpc.DefaultHeaderTimeout
 	}
 	if o.ShutdownTimeout <= 0 {
-		o.ShutdownTimeout = time.Duration(xrpc.DefaultPolicyInteger("SHUTDOWN_TIMEOUT_MS")) * time.Millisecond
+		o.ShutdownTimeout = xrpc.DefaultShutdownTimeout
 	}
 	return o
 }

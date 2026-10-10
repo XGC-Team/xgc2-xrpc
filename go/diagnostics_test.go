@@ -56,12 +56,8 @@ func (w *blockingSink) Write(body []byte) (int, error) {
 }
 
 func TestDiagnosticsSaturationAndRealWriterDrain(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: []string{"XGC2_XRPC_LOG_LEVEL=debug"}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	sink := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: sink, MaxQueuedRecords: 2, MaxRecordBytes: 512})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: sink, Level: "debug", MaxQueuedRecords: 2, MaxRecordBytes: 512})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,37 +97,38 @@ func TestDiagnosticsSaturationAndRealWriterDrain(t *testing.T) {
 	}
 }
 
-func TestDiagnosticPolicyLiveRevisionAndFormat(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: []string{"XGC2_XRPC_LOG_FORMAT=text"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDiagnosticsLiveLevelAndFormat(t *testing.T) {
 	var sink bytes.Buffer
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: &sink})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: &sink, Format: "text"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	diagnostics.Emit(xrpc.Diagnostic{Level: "debug", Event: "suppressed_debug"})
-	if _, err = diagnostics.UpdatePolicy(1, map[string]string{"LOG_LEVEL": "debug"}); err != nil {
+	if err = diagnostics.SetLevel("debug"); err != nil {
 		t.Fatal(err)
 	}
 	diagnostics.Emit(xrpc.Diagnostic{Level: "debug", Event: "visible_debug"})
-	if _, err = diagnostics.UpdatePolicy(1, map[string]string{"LOG_LEVEL": "trace"}); err == nil {
-		t.Fatal("stale revision succeeded")
+	if err = diagnostics.SetLevel("verbose"); err == nil {
+		t.Fatal("unknown level accepted")
 	}
-	if _, err = diagnostics.UpdatePolicy(2, map[string]string{"LOG_FORMAT": "json"}); err == nil {
-		t.Fatal("immutable format changed live")
+	for _, bad := range []xrpc.DiagnosticOptions{{Sink: &sink, Level: "loud"}, {Sink: &sink, Format: "xml"}, {}} {
+		if _, err = xrpc.NewDiagnostics(bad); err == nil {
+			t.Fatalf("invalid options accepted: %+v", bad)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err = diagnostics.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err = diagnostics.SetLevel("trace"); err == nil {
+		t.Fatal("closed owner accepted a level change")
+	}
 	if output := sink.String(); strings.Contains(output, "suppressed_debug") || !strings.Contains(output, "visible_debug") || json.Valid([]byte(output)) {
 		t.Fatalf("verbosity/format not applied %q", output)
 	}
-	if status := diagnostics.Status(); status.Revision != 2 || status.Level != "debug" || status.Format != "text" {
-		t.Fatalf("policy provenance lost %+v", status)
+	if status := diagnostics.Status(); status.Level != "debug" || status.Format != "text" {
+		t.Fatalf("diagnostic settings lost %+v", status)
 	}
 }
 
@@ -139,11 +136,7 @@ type failingSink struct{}
 
 func (failingSink) Write([]byte) (int, error) { return 0, syscall.ENOSPC }
 func TestDiagnosticSinkFailureAndRepeatedEventRateLimit(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: failingSink{}})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: failingSink{}})
 	if err != nil {
 		t.Fatal(err)
 	}

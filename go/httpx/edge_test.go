@@ -14,18 +14,8 @@ import (
 	"github.com/XGC-Team/xgc2-xrpc/go"
 )
 
-func TestEdgeResolvedResponseBudgetOnNativeWrites(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: []string{"XGC2_XRPC_MAX_RESPONSE_BYTES=4"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	limits, err := (HostOptions{}).WithPolicy(policy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if limits.MaxResponseBytes != 4 {
-		t.Fatal("response policy not applied")
-	}
+func TestEdgeResponseBudgetOnNativeWrites(t *testing.T) {
+	limits := HostOptions{MaxResponseBytes: 4}
 	writeErrors := make(chan error, 2)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -94,24 +84,16 @@ func TestEdgeResolvedResponseBudgetOnNativeWrites(t *testing.T) {
 	}
 }
 
-func TestEdgeWithoutRPCPolicyPreservesDomainStreamingBudget(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: []string{}, Capabilities: []string{"host", "http", "transport"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	limits, err := (HostOptions{}).WithPolicy(policy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if limits.MaxResponseBytes != 0 || limits.MaxCallTime != 0 {
-		t.Fatal("non-RPC edge acquired an internal body/lifetime budget")
-	}
+// An edge with zero options keeps the domain's streaming contract: no response
+// byte budget and no call lifetime are imposed on it.
+func TestEdgeDefaultsPreserveDomainStreamingBudget(t *testing.T) {
+	limits := HostOptions{}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	host, err := ServeEdge(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(strings.Repeat("x", int(xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES"))+1)))
+		_, _ = w.Write([]byte(strings.Repeat("x", xrpc.DefaultMaxMessageBytes+1)))
 	}), limits)
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +111,7 @@ func TestEdgeWithoutRPCPolicyPreservesDomainStreamingBudget(t *testing.T) {
 	}
 	body, err := io.ReadAll(response.Body)
 	response.Body.Close()
-	if err != nil || int64(len(body)) != xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES")+1 {
+	if err != nil || len(body) != xrpc.DefaultMaxMessageBytes+1 {
 		t.Fatalf("stream bytes=%d err=%v", len(body), err)
 	}
 }

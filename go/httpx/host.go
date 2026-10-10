@@ -17,52 +17,71 @@ import (
 	unixlease "github.com/XGC-Team/xgc2-xrpc/go/unix"
 )
 
+// HostOptions are plain limits. A zero field selects the default named in its
+// comment; nothing is read from the process environment.
 type HostOptions struct {
 	// Authorize runs after finite admission and before domain dispatch. It must
 	// return true while the request context remains live.
 	Authorize func(*http.Request) bool
 	// DiscoveryPaths names GET-only public description routes. All other routes stay instance-bound.
-	DiscoveryPaths   []string
-	InstanceID       string
-	MaxBodyBytes     int64
+	DiscoveryPaths []string
+	InstanceID     string
+	// MaxBodyBytes bounds one request body (default xrpc.DefaultMaxMessageBytes).
+	MaxBodyBytes int64
+	// MaxResponseBytes bounds one response body. Serve defaults it to
+	// xrpc.DefaultMaxMessageBytes; ServeEdge and RunEdge leave a zero value
+	// unbounded so a domain stream keeps its own contract.
 	MaxResponseBytes int64
-	MaxHeaderBytes   int
-	MaxConnections   int
-	MaxInFlight      int
-	MaxCallTime      time.Duration
-	HeaderTimeout    time.Duration
-	IdleTimeout      time.Duration
-	WriteTimeout     time.Duration
-	ShutdownTimeout  time.Duration
-	Diagnostics      *xrpc.Diagnostics
-	Metrics          *xrpc.Metrics
-	Service          string
+	// MaxHeaderBytes bounds decoded header fields (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes int
+	// MaxConnections bounds accepted connections (default xrpc.DefaultMaxConnections).
+	MaxConnections int
+	// MaxInFlight bounds admitted calls (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// MaxCallTime caps the caller's budget on Serve (default xrpc.DefaultCallTimeout).
+	// ServeEdge applies it only when set, so zero preserves streaming.
+	MaxCallTime time.Duration
+	// HeaderTimeout bounds reading request headers (default xrpc.DefaultHeaderTimeout).
+	HeaderTimeout time.Duration
+	// IdleTimeout closes idle keep-alive connections (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// WriteTimeout is net/http's absolute response deadline; zero disables it.
+	// ServeEvents extends it on every frame, so streams outlive it.
+	WriteTimeout time.Duration
+	// ShutdownTimeout is the drain budget of RunEdge (default xrpc.DefaultShutdownTimeout).
+	ShutdownTimeout time.Duration
+	Diagnostics     *xrpc.Diagnostics
+	Metrics         *xrpc.Metrics
+	Service         string
 }
 
+// defaults applies the documented xrpc limits to zero fields. MaxResponseBytes
+// is not defaulted here: internal hosts default it in Handler, while edges keep
+// streaming responses unbounded.
 func (o HostOptions) defaults() HostOptions {
 	if o.MaxBodyBytes <= 0 {
-		o.MaxBodyBytes = xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES")
+		o.MaxBodyBytes = xrpc.DefaultMaxMessageBytes
 	}
 	if o.MaxHeaderBytes <= 0 {
-		o.MaxHeaderBytes = int(xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES"))
+		o.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if o.MaxConnections <= 0 {
-		o.MaxConnections = int(xrpc.DefaultPolicyInteger("HOST_MAX_CONNECTIONS"))
+		o.MaxConnections = xrpc.DefaultMaxConnections
 	}
 	if o.MaxInFlight <= 0 {
-		o.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		o.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	if o.MaxCallTime <= 0 {
-		o.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		o.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if o.HeaderTimeout <= 0 {
-		o.HeaderTimeout = time.Duration(xrpc.DefaultPolicyInteger("HEADER_TIMEOUT_MS")) * time.Millisecond
+		o.HeaderTimeout = xrpc.DefaultHeaderTimeout
 	}
 	if o.IdleTimeout <= 0 {
-		o.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		o.IdleTimeout = xrpc.DefaultIdleTimeout
 	}
 	if o.ShutdownTimeout <= 0 {
-		o.ShutdownTimeout = time.Duration(xrpc.DefaultPolicyInteger("SHUTDOWN_TIMEOUT_MS")) * time.Millisecond
+		o.ShutdownTimeout = xrpc.DefaultShutdownTimeout
 	}
 	return o
 }
@@ -75,7 +94,7 @@ func Handler(next http.Handler, options HostOptions) http.Handler {
 		options.Metrics = &xrpc.Metrics{}
 	}
 	if options.MaxResponseBytes <= 0 {
-		options.MaxResponseBytes = xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES")
+		options.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 	}
 	slots := make(chan struct{}, options.MaxInFlight)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

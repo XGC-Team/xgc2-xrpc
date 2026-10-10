@@ -30,6 +30,8 @@ const InstanceIDHeader = "X-Xrpc-Instance-ID"
 
 var ErrResponseTooLarge = errors.New("xrpc: HTTP response exceeds byte limit")
 
+// Config is a plain limits struct. A zero limit selects the default named in
+// its comment; nothing is read from the process environment.
 type Config struct {
 	boundAuthorization bool
 	LocalTargetID      string
@@ -39,20 +41,31 @@ type Config struct {
 	TLSForService      func(xrpc.ServiceRef) (*tls.Config, error)
 	// Headers are copied at construction. Wire-owned identity/budget headers
 	// are rejected; authentication remains an explicitly supplied capability.
-	Headers              map[string]string
-	MaxResponseBytes     int64
-	MaxRequestBytes      int64
-	MaxHeaderBytes       int64
-	MaxCallTime          time.Duration
-	HeaderTimeout        time.Duration
-	MaxConnections       int
-	MaxInFlight          int
-	IdleTimeout          time.Duration
-	MaxReferences        int
+	Headers map[string]string
+	// MaxResponseBytes bounds one response body (default xrpc.DefaultMaxMessageBytes).
+	MaxResponseBytes int64
+	// MaxRequestBytes bounds one request body (default xrpc.DefaultMaxMessageBytes).
+	MaxRequestBytes int64
+	// MaxHeaderBytes bounds response headers (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes int64
+	// MaxCallTime caps every call's budget (default xrpc.DefaultCallTimeout).
+	MaxCallTime time.Duration
+	// HeaderTimeout bounds waiting for response headers (default xrpc.DefaultHeaderTimeout).
+	HeaderTimeout time.Duration
+	// MaxConnections bounds connections per reference (default xrpc.DefaultClientConnections).
+	MaxConnections int
+	// MaxInFlight bounds admitted calls (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// IdleTimeout closes idle pooled connections (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// MaxReferences bounds cached references of a Profile (default xrpc.DefaultMaxReferences).
+	MaxReferences int
+	// ReferenceIdleTimeout retires idle cached references (default xrpc.DefaultReferenceIdleTimeout).
 	ReferenceIdleTimeout time.Duration
 	Diagnostics          *xrpc.Diagnostics
 	Metrics              *xrpc.Metrics
 }
+
 type callDeadlineKey struct{}
 
 type Client struct {
@@ -90,28 +103,28 @@ func New(config Config) (*Client, error) {
 		return nil, errors.New("xrpc: response byte limit is too large")
 	}
 	if config.MaxResponseBytes <= 0 {
-		config.MaxResponseBytes = xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES")
+		config.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 	}
 	if config.MaxRequestBytes <= 0 {
-		config.MaxRequestBytes = xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES")
+		config.MaxRequestBytes = xrpc.DefaultMaxMessageBytes
 	}
 	if config.MaxHeaderBytes <= 0 {
-		config.MaxHeaderBytes = xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES")
+		config.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if config.MaxCallTime <= 0 {
-		config.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		config.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if config.HeaderTimeout <= 0 {
-		config.HeaderTimeout = time.Duration(xrpc.DefaultPolicyInteger("HEADER_TIMEOUT_MS")) * time.Millisecond
+		config.HeaderTimeout = xrpc.DefaultHeaderTimeout
 	}
 	if config.MaxConnections <= 0 {
-		config.MaxConnections = int(xrpc.DefaultPolicyInteger("CLIENT_MAX_CONNECTIONS"))
+		config.MaxConnections = xrpc.DefaultClientConnections
 	}
 	if config.MaxInFlight <= 0 {
-		config.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		config.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	if config.IdleTimeout <= 0 {
-		config.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		config.IdleTimeout = xrpc.DefaultIdleTimeout
 	}
 	transport := &http.Transport{Proxy: nil, DisableCompression: true, MaxConnsPerHost: config.MaxConnections, MaxIdleConnsPerHost: config.MaxConnections, MaxIdleConns: config.MaxConnections, IdleConnTimeout: config.IdleTimeout, ResponseHeaderTimeout: config.HeaderTimeout, MaxResponseHeaderBytes: config.MaxHeaderBytes, ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}}
 	owner, closeOwner := context.WithCancel(context.Background())
@@ -486,6 +499,12 @@ type Profile struct {
 func NewProfile(config Config) *Profile {
 	if config.Metrics == nil {
 		config.Metrics = &xrpc.Metrics{}
+	}
+	if config.MaxReferences <= 0 {
+		config.MaxReferences = xrpc.DefaultMaxReferences
+	}
+	if config.ReferenceIdleTimeout <= 0 {
+		config.ReferenceIdleTimeout = xrpc.DefaultReferenceIdleTimeout
 	}
 	return &Profile{config: config, clients: refpool.New[xrpc.ServiceRef, *Client](config.MaxReferences, config.ReferenceIdleTimeout, func(c *Client) { c.Close() })}
 }

@@ -51,11 +51,7 @@ func run() error {
 	if *socket == "" || !xrpc.ValidID(*instance) || *duration <= 0 || *duration > 24*time.Hour {
 		return errors.New("xrpc fixture: explicit socket, canonical instance and finite duration required")
 	}
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: os.Environ()})
-	if err != nil {
-		return err
-	}
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: os.Stderr})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: os.Stderr})
 	if err != nil {
 		return err
 	}
@@ -85,12 +81,7 @@ func run() error {
 	if *profile == "grpc" {
 		ref.Profile = xrpc.GRPC
 		ref.Service = "grpc.health.v1.Health"
-		limits, err := (grpcx.HostOptions{InstanceID: *instance, Service: ref.Service, Diagnostics: diagnostics}).WithPolicy(policy)
-		if err != nil {
-			listener.Close()
-			lease.Close()
-			return err
-		}
+		limits := grpcx.HostOptions{InstanceID: *instance, Service: ref.Service, Diagnostics: diagnostics}
 		server := health.NewServer()
 		server.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 		host, err := grpcx.ServeWithOptions(listener, lease, func(r grpc.ServiceRegistrar) { healthpb.RegisterHealthServer(r, server) }, limits)
@@ -108,7 +99,7 @@ func run() error {
 		case <-ctx.Done():
 		case <-host.Done():
 		}
-		shutdown, finish := context.WithTimeout(context.Background(), limits.ShutdownTimeout)
+		shutdown, finish := context.WithTimeout(context.Background(), xrpc.DefaultShutdownTimeout)
 		defer finish()
 		return host.Shutdown(shutdown)
 	}
@@ -117,12 +108,7 @@ func run() error {
 		lease.Close()
 		return errors.New("xrpc fixture: profile must be http or grpc")
 	}
-	limits, err := (httpx.HostOptions{InstanceID: *instance, Service: ref.Service, Diagnostics: diagnostics, DiscoveryPaths: []string{"/v1/describe"}}).WithPolicy(policy)
-	if err != nil {
-		listener.Close()
-		lease.Close()
-		return err
-	}
+	limits := httpx.HostOptions{InstanceID: *instance, Service: ref.Service, Diagnostics: diagnostics, DiscoveryPaths: []string{"/v1/describe"}}
 	mux := http.NewServeMux()
 	var host *httpx.Host
 	var published atomic.Pointer[httpx.Host]
@@ -171,7 +157,7 @@ func run() error {
 	case <-ctx.Done():
 	case <-host.Done():
 	}
-	shutdown, finish := context.WithTimeout(context.Background(), limits.ShutdownTimeout)
+	shutdown, finish := context.WithTimeout(context.Background(), xrpc.DefaultShutdownTimeout)
 	defer finish()
 	return host.Shutdown(shutdown)
 }
