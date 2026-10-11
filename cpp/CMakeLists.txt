@@ -11,6 +11,12 @@
 #
 # `-DXGC2_XRPC_COMPONENTS=udp` builds and installs the udp.v1 library alone.
 # grpc is not built by default because it needs the gRPC development packages.
+#
+# SOVERSION is the ABI generation of one library, never the product version: it
+# changes when a release breaks that library's C++ ABI. 0.2.0 broke the ABI of
+# every library 0.1.0 shipped (generation 2); udp is new in 0.2.0 (generation 1).
+# Header-only code (method.hpp, method_udp.hpp, method_http.hpp, stop.hpp,
+# delivery.hpp) has no ABI and rides with the component that installs it.
 set(XGC2_XRPC_COMPONENTS "unix;diagnostics;bootstrap;http;json_http;udp" CACHE STRING
   "Components to build: unix diagnostics bootstrap http json_http grpc udp")
 set(_xrpc_known unix diagnostics bootstrap http json_http grpc udp)
@@ -62,59 +68,75 @@ if("grpc" IN_LIST _xrpc_components)
 endif()
 
 # One shared library per component: target xgc2_xrpc_<component>, alias
-# XgcXrpc::<component>, export file XgcXrpc<Export>Targets.cmake.
+# XgcXrpc::<component>, export file XgcXrpc<Export>Targets.cmake. Everything a
+# component installs carries its name as the install COMPONENT, which is how the
+# packaging splits one build into Debian packages.
 function(xgc2_xrpc_component component export_name)
-  cmake_parse_arguments(ARG "" "" "SOURCES;HEADERS" ${ARGN})
+  cmake_parse_arguments(ARG "" "SOVERSION" "SOURCES;HEADERS" ${ARGN})
+  if(NOT ARG_SOVERSION)
+    message(FATAL_ERROR "xgc2_xrpc_component(${component}) needs a SOVERSION")
+  endif()
   set(target xgc2_xrpc_${component})
   add_library(${target} SHARED ${ARG_SOURCES})
   add_library(XgcXrpc::${component} ALIAS ${target})
   set_target_properties(${target} PROPERTIES EXPORT_NAME ${component}
-    VERSION ${PROJECT_VERSION} SOVERSION 1 INSTALL_RPATH "$ORIGIN")
+    VERSION ${PROJECT_VERSION} SOVERSION ${ARG_SOVERSION} INSTALL_RPATH "$ORIGIN")
   target_compile_features(${target} PUBLIC cxx_std_17)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   target_include_directories(${target} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
   install(TARGETS ${target} EXPORT XgcXrpc${export_name}Targets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${component}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${component})
   install(EXPORT XgcXrpc${export_name}Targets NAMESPACE XgcXrpc::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc)
-  list(TRANSFORM ARG_HEADERS PREPEND include/xgc2/xrpc/)
-  install(FILES ${ARG_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xgc2/xrpc)
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc COMPONENT ${component})
+  set(headers "")
+  foreach(header IN LISTS ARG_HEADERS)
+    list(APPEND headers include/xgc2/xrpc/${header})
+  endforeach()
+  install(FILES ${headers} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xgc2/xrpc COMPONENT ${component})
 endfunction()
 
 # stop.hpp and delivery.hpp are header-only vocabulary of the unix base.
 if("unix" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(unix Unix SOURCES src/unix.cpp HEADERS unix.hpp stop.hpp delivery.hpp)
+  xgc2_xrpc_component(unix Unix SOVERSION 2 SOURCES src/unix.cpp HEADERS unix.hpp stop.hpp delivery.hpp)
 endif()
 if("diagnostics" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(diagnostics Diagnostics SOURCES src/diagnostics.cpp HEADERS diagnostics.hpp)
+  xgc2_xrpc_component(diagnostics Diagnostics SOVERSION 2 SOURCES src/diagnostics.cpp HEADERS diagnostics.hpp)
 endif()
 if("bootstrap" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(bootstrap Bootstrap SOURCES src/bootstrap.cpp HEADERS bootstrap.hpp)
+  xgc2_xrpc_component(bootstrap Bootstrap SOVERSION 2 SOURCES src/bootstrap.cpp HEADERS bootstrap.hpp)
   target_link_libraries(xgc2_xrpc_bootstrap PUBLIC xgc2_xrpc_unix PRIVATE OpenSSL::Crypto Threads::Threads)
 endif()
 if("http" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(http Http SOURCES src/http.cpp HEADERS http.hpp bounded_output.hpp)
+  set(_xrpc_http_headers http.hpp bounded_output.hpp)
+  # method_http.hpp serves the router of method.hpp, which the udp component installs.
+  if("udp" IN_LIST _xrpc_components)
+    list(APPEND _xrpc_http_headers method_http.hpp)
+  endif()
+  xgc2_xrpc_component(http Http SOVERSION 2 SOURCES src/http.cpp HEADERS ${_xrpc_http_headers})
   target_include_directories(xgc2_xrpc_http SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
   target_compile_definitions(xgc2_xrpc_http PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
   target_link_libraries(xgc2_xrpc_http PUBLIC xgc2_xrpc_unix xgc2_xrpc_diagnostics
     xgc2_xrpc_bootstrap PRIVATE Threads::Threads)
 endif()
 if("json_http" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(json_http JsonHttp SOURCES src/json_http.cpp HEADERS json_http.hpp)
+  xgc2_xrpc_component(json_http JsonHttp SOVERSION 2 SOURCES src/json_http.cpp HEADERS json_http.hpp)
   target_link_libraries(xgc2_xrpc_json_http PUBLIC xgc2_xrpc_http nlohmann_json::nlohmann_json)
 endif()
 if("grpc" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(grpc Grpc SOURCES src/grpc.cpp HEADERS grpc.hpp)
+  xgc2_xrpc_component(grpc Grpc SOVERSION 2 SOURCES src/grpc.cpp HEADERS grpc.hpp)
   target_link_libraries(xgc2_xrpc_grpc PUBLIC xgc2_xrpc_unix xgc2_xrpc_diagnostics
     PkgConfig::XgcXrpcNativeGrpc Threads::Threads)
 endif()
 if("udp" IN_LIST _xrpc_components)
-  xgc2_xrpc_component(udp Udp SOURCES src/udp_wire.cpp src/udp_keys.cpp src/udp_net.cpp
-    src/udp_server.cpp src/udp_client.cpp HEADERS udp.hpp)
+  # method.hpp (the router, standard library only) and method_udp.hpp (the router on a
+  # udp.v1 server) are header-only and travel with the library that every
+  # distribution, Bionic included, ships.
+  xgc2_xrpc_component(udp Udp SOVERSION 1 SOURCES src/udp_wire.cpp src/udp_keys.cpp src/udp_net.cpp
+    src/udp_server.cpp src/udp_client.cpp HEADERS udp.hpp method.hpp method_udp.hpp)
   target_link_libraries(xgc2_xrpc_udp PRIVATE OpenSSL::Crypto Threads::Threads)
 endif()
 
@@ -125,7 +147,7 @@ write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/XgcXrpcConfigVersio
   VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/XgcXrpcConfig.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/XgcXrpcConfigVersion.cmake
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc)
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/XgcXrpc COMPONENT config)
 
 if(BUILD_TESTING)
   set(_xrpc_test_flags -Wall -Wextra -Wpedantic -UNDEBUG)
@@ -173,12 +195,22 @@ if(BUILD_TESTING)
   if("udp" IN_LIST _xrpc_components)
     # The tests reach the library's internals (codec, address helpers) through
     # its exported symbols and the private headers in src/.
+    xgc2_xrpc_test(method tests/method_test.cpp LINK XgcXrpc::udp)
+    xgc2_xrpc_test(method_udp tests/method_udp_test.cpp LINK XgcXrpc::udp)
     xgc2_xrpc_test(udp_wire tests/udp_wire_test.cpp LINK XgcXrpc::udp)
     xgc2_xrpc_test(udp_server tests/udp_server_test.cpp LINK XgcXrpc::udp ARGS 127.0.0.1)
     # IPv6 loopback, or a private one made in a user+network namespace; exit 77
     # (skipped) where neither exists. See the comment in the test.
-    add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND xrpc_cpp_udp_server_test ::1)
-    set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    if(CMAKE_VERSION VERSION_LESS 3.16)
+      # CMake before 3.16 has no SKIP_RETURN_CODE: report "skipped" as a pass.
+      add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND sh -c
+        "\"$0\" ::1; status=$?; if [ $status -eq 77 ]; then exit 0; fi; exit $status"
+        $<TARGET_FILE:xrpc_cpp_udp_server_test>)
+      set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60)
+    else()
+      add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND xrpc_cpp_udp_server_test ::1)
+      set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endif()
     set_tests_properties(xrpc_cpp_udp_server PROPERTIES TIMEOUT 60)
     # The peer of the cross-language tests: a fixed command line and READY line
     # (see the header of the source); the Go interop test starts this binary.
@@ -189,6 +221,18 @@ if(BUILD_TESTING)
     xgc2_xrpc_test(udp_interop tests/udp_interop_test.cpp LINK XgcXrpc::udp
       ARGS $<TARGET_FILE:xgc2-xrpc-udp-interop-server>)
     add_dependencies(xrpc_cpp_udp_interop_test xgc2-xrpc-udp-interop-server)
+  endif()
+  if("http" IN_LIST _xrpc_components AND "udp" IN_LIST _xrpc_components)
+    xgc2_xrpc_test(method_http tests/method_http_test.cpp LINK XgcXrpc::http)
+    # One router on both transports, as a separate process: the peer of the
+    # cross-language method tests (see the header of the source).
+    add_executable(xgc2-xrpc-method-interop-server tests/method_interop_server.cpp)
+    target_compile_features(xgc2-xrpc-method-interop-server PRIVATE cxx_std_17)
+    target_compile_options(xgc2-xrpc-method-interop-server PRIVATE ${_xrpc_test_flags})
+    target_link_libraries(xgc2-xrpc-method-interop-server PRIVATE XgcXrpc::http XgcXrpc::udp Threads::Threads)
+    xgc2_xrpc_test(method_interop tests/method_interop_test.cpp LINK XgcXrpc::http XgcXrpc::udp
+      ARGS $<TARGET_FILE:xgc2-xrpc-method-interop-server>)
+    add_dependencies(xrpc_cpp_method_interop_test xgc2-xrpc-method-interop-server)
   endif()
   if("grpc" IN_LIST _xrpc_components)
     find_program(XgcXrpcGrpcPlugin grpc_cpp_plugin)

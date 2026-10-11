@@ -20,6 +20,10 @@ the selected components are searched for.
 | `json_http` | `XgcXrpc::json_http` | nlohmann-json >= 3.7, `http` | GNU >= 9, clang >= 10 |
 | `grpc` | `XgcXrpc::grpc` | gRPC++ >= 1.16, Protobuf, pkg-config, `unix`, `diagnostics` | GNU >= 9, clang >= 10 |
 
+`udp` also installs the header-only method router (`method.hpp`, `method_udp.hpp`,
+see [Method addressing](#method-addressing)) and `http` installs `method_http.hpp`
+when `udp` is built too.
+
 The default is every component except `grpc`, which needs the gRPC development
 packages. `-DXGC2_XRPC_COMPONENTS=udp` builds the udp.v1 library without Boost,
 nlohmann-json or gRPC being present. The Beast-based components need Boost >= 1.70,
@@ -31,9 +35,19 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release                            # defa
 cmake -S . -B build -DXGC2_XRPC_COMPONENTS="http;json_http;grpc;udp"       # an explicit set
 cmake -S . -B build -DXGC2_XRPC_COMPONENTS=udp                             # udp.v1 alone
 cmake --build build --parallel 2
-ctest --test-dir build --output-on-failure
+(cd build && ctest --output-on-failure)
 cmake --install build --prefix /explicit/package/prefix
 ```
+
+CMake 3.10 is enough (Ubuntu 18.04's own): there, build in a directory with
+`mkdir build && cd build && cmake .. -DXGC2_XRPC_COMPONENTS=udp && make -j2 && ctest`.
+
+Every file a component installs carries the component's name as its CMake install
+component (`unix`, `diagnostics`, `bootstrap`, `http`, `json_http`, `grpc`, `udp`;
+the package files are `config`), and each library has its own SONAME generation:
+`SOVERSION` is the ABI generation of that library, not the product version. The
+libraries 0.1.0 shipped are generation 2 since 0.2.0 broke their ABI; `udp`, new in
+0.2.0, is generation 1.
 
 Headers and CMake exports are installed per component, so a reduced installation
 contains only what it was built with. Installed consumers use
@@ -167,6 +181,57 @@ whether everything finished and is idempotent. The destructor shuts down at once
 `inflight_ignored`, `unanswered`, `replies_sent` and `inflight`. Handlers run on the I/O
 thread: they must not block, and must not call `shutdown` or destroy the server.
 
+## Method addressing
+
+A callable operation is named `<service>/<Method>` (`xgc2.chassis.hold/Engage`: dotted
+identifiers, one identifier, at most 128 bytes) with a JSON request and a JSON reply, and
+every profile carries the same name: the udp.v1 method field verbatim,
+`POST /v1/call/<service>/<Method>` on http.v1. `MethodRouter` (`xgc2/xrpc/method.hpp`,
+header only, standard library only) holds the handlers; the transports serve them:
+
+```cpp
+#include <xgc2/xrpc/method_http.hpp>   // needs XgcXrpc::http (and the udp component's method.hpp)
+#include <xgc2/xrpc/method_udp.hpp>    // needs XgcXrpc::udp
+using namespace xgc2::xrpc;
+
+MethodRouter router;
+router.add("xgc2.chassis.hold/Engage", [&](MethodRequest request, MethodReply reply) {
+  // request.body is the JSON text; complete from this thread or another one, once.
+  reply.complete(R"({"held":true})");           // or reply.error(MethodCode::Conflict, "stale revision", R"({"revision":3})");
+});
+
+add_methods(udp_server, router);                 // before udp_server.start(): same names, same handlers
+
+HttpServer host(unix_options, [&](HttpRequest request, HttpReply reply) {
+  if (handle_method_call(router, request, reply)) return;   // /v1/call/...
+  /* the domain's other routes, for example GET /v1/describe */
+}, limits, identity);
+```
+
+A `MethodReply` completes at most once from any thread, also after the handler returned;
+copies share the call (an `HttpReply` copy keeps the call's admission and the endpoint
+lease until released). A handler that throws is answered `internal`; one that drops every
+copy without answering sends nothing (the caller sees an unknown outcome). On http.v1 a
+result is 200 with the JSON, an error is the XRPC envelope `{"error":{"code","message",
+"details"}}` with the status of its code (`method_code_http_status`); on udp.v1 it is
+the status of the code and the body `{"code","message","details"}` (`unauthenticated`
+has no udp.v1 form and is sent as `permission_denied`). `handle_method_call` answers 400
+for an invalid name or a query, 404 for an unknown method, 405 (`Allow: POST`) for another
+verb and 415 for another content type, before any handler runs; targets outside
+`/v1/call/` return false and stay with the domain.
+
+`capabilities_json` and `describe_json` build the readiness envelope
+`{"service","api_version","instance_id","ready","facts"}` and the convention by which a
+host lists the capabilities it serves per entity,
+`"capabilities":[{"name":"<service>","entities":["<id>",...]}]`, so a caller resolves
+"entity X, capability C" to a service generically. The meaning of the facts belongs to the
+domain.
+
+`xgc2-xrpc-method-interop-server` (`tests/method_interop_server.cpp`, built with the tests
+when `http` and `udp` are both built) serves one router on a Unix socket and a udp.v1
+port with one shared instance; the Go conformance test drives it through
+`Dispatcher.CallMethod`.
+
 ### Interop server and tests
 
 `xgc2-xrpc-udp-interop-server` (from `tests/udp_interop_server.cpp`, built when tests are
@@ -198,6 +263,10 @@ this client passes the same scenarios against the Go reference server.
 | `xrpc_cpp_udp_server` | real sockets on 127.0.0.1: calls and statuses, duplicate datagrams and a running call, async completion from other threads, missed deadlines, dropped/throwing handlers, size limits, authentication drops, rate limits, pins, in-flight limit, cache TTL and capacity, client validation and retransmission timing, forged replies, request and reply loss through a lossy proxy, shutdown with work in flight, option rules, concurrent callers |
 | `xrpc_cpp_udp_server_ipv6` | the same on `::1`; without IPv6 loopback the test builds a private one in a new user+network namespace, and is skipped (exit 77) if the system refuses that too |
 | `xrpc_cpp_udp_interop` | the interop server as a separate process: command line, READY line, each method, key selection, SIGTERM |
+| `xrpc_cpp_method` | method names, error bodies (escaping, invalid UTF-8), the router, shared replies, capability facts and the describe envelope |
+| `xrpc_cpp_method_udp` | a router on a real udp.v1 server: names, statuses, async completion, shared replies, retransmission, error bodies equal to `udp::error_body` |
+| `xrpc_cpp_method_http` | a router on a real http.v1 host over a Unix socket: statuses, envelopes, refusals, instance fence before routing, async completion, domain routes beside it |
+| `xrpc_cpp_method_interop` | the method interop server as a separate process: both transports, one instance, describe, shutdown |
 
 ### Bionic build and run of udp
 
@@ -211,7 +280,7 @@ cmake -S . -B build-bionic -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=$T/bin/bionic-gcc -DCMAKE_CXX_COMPILER=$T/bin/bionic-g++ \
   -DCMAKE_SYSROOT=$T/bionic-sysroot -DXGC2_XRPC_COMPONENTS=udp
 cmake --build build-bionic
-ctest --test-dir build-bionic --output-on-failure           # runs on the host's glibc
+(cd build-bionic && ctest --output-on-failure)               # runs on the host's glibc
 
 # The same binaries on the sysroot's own loader, glibc 2.27, libstdc++ 7 and OpenSSL:
 S=$T/bionic-sysroot
@@ -222,13 +291,16 @@ $RUN build-bionic/cpp/xrpc_cpp_udp_server_test ::1
 $RUN build-bionic/cpp/xrpc_cpp_udp_interop_test $PWD/build-bionic/cpp/xgc2-xrpc-udp-interop-server
 
 # The binaries need no more than Bionic provides:
-readelf --version-info build-bionic/cpp/libxgc2_xrpc_udp.so.0.1.0 | grep -oE '(GLIBC|GLIBCXX|CXXABI)_[0-9.]+' | sort -Vu
+readelf --version-info build-bionic/cpp/libxgc2_xrpc_udp.so.1 | grep -oE '(GLIBC|GLIBCXX|CXXABI)_[0-9.]+' | sort -Vu
 ```
 
-Result: all four tests pass both ways; the library requires `GLIBC_2.14`, `GLIBCXX_3.4.22`
-and `CXXABI_1.3.9`, below the sysroot's 2.27, 3.4.25 and 1.3.11. A real Bionic host
-(Jetson Nano, Xavier) should build the same way with its own `g++-7` and `libssl-dev` and
-without the sysroot options; that was not run here.
+Result: all six tests (`method`, `method_udp`, `udp_wire`, `udp_server`, `udp_server_ipv6`,
+`udp_interop`) pass both ways; the library requires `GLIBC_2.14`, `GLIBCXX_3.4.22` and
+`CXXABI_1.3.9`, below the sysroot's 2.27, 3.4.25 and 1.3.11. The configuration also builds
+and passes with the CMake 3.10.2 that Bionic ships (without `-S`/`-B`, `--test-dir` and
+`--parallel`, which that version lacks). A real Bionic host (Jetson Nano, Xavier) should build
+the same way with its own `g++-7`, `cmake` and `libssl-dev` and without the sysroot options;
+that was not run here.
 
 ## Language level and stop tokens
 
