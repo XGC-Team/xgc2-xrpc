@@ -11,18 +11,186 @@ concurrency:
   group: xrpc-ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  build-debs:
+  matrix:
+    name: capability matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Check the matrix against the tests in the tree
+        run: python3 tools/check-matrix.py
+      - name: Test the checker
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
+  go:
+    name: go ${{ matrix.go }}
     strategy:
       fail-fast: false
       matrix:
-        suite: [focal, jammy, noble]
+        go: ['1.24', 'stable']
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./... -timeout 300s
+      - name: go test -race
+        run: CGO_ENABLED=1 go test -race ./... -timeout 600s
+
+  cpp:
+    name: cpp ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: 'g++ amd64', runner: ubuntu-latest, cxx: g++}
+          - {name: 'clang++-10 amd64', runner: ubuntu-latest, cxx: clang++-10}
+          - {name: 'g++ arm64', runner: ubuntu-24.04-arm, cxx: g++}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Every component, gRPC included, with ctest
+        run: .xgc2/scripts/in-image.sh "$(.xgc2/scripts/images.sh focal)" .xgc2/scripts/ci-cpp.sh full "${{ matrix.cxx }}"
+
+  cpp-udp:
+    name: udp component on ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {suite: focal}
+          - {suite: jammy}
+          - {suite: noble}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: The udp component alone with ctest
+        run: .xgc2/scripts/in-image.sh "$(.xgc2/scripts/images.sh ${{ matrix.suite }})" .xgc2/scripts/ci-cpp.sh udp g++
+
+  bionic-udp:
+    name: udp component on bionic ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: The udp component with the stock g++ 7.5 and CMake 3.10 of the image
+        run: .xgc2/scripts/in-image.sh "$(.xgc2/scripts/images.sh bionic)" .xgc2/scripts/ci-cpp.sh udp g++
+
+  rust:
+    name: rust ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.85', stable]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
+      - name: cargo test
+        working-directory: rust
+        run: cargo "+${{ matrix.toolchain }}" test --locked
+
+  python:
+    name: python 3.8
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Install the pinned runtime dependencies
+        run: python -m pip install 'aiohttp==3.10.11' 'httpx==0.28.1' 'httpcore==1.0.9'
+      - name: unittest
+        run: PYTHONPATH=python python -m unittest discover -s python/tests
+
+  node:
+    name: node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Node SDK tests
+        working-directory: node
+        run: |
+          npm ci
+          npm test
+      - name: TypeScript client tests
+        working-directory: ts
+        run: |
+          npm ci
+          npm test
+
+  interop:
+    name: go to c++ interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build the C++ servers and run the Go tests against them
+        run: .xgc2/scripts/in-image.sh "$(.xgc2/scripts/images.sh focal)" .xgc2/scripts/ci-interop.sh
+
+  build-debs:
+    name: packages ${{ matrix.suite }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [bionic, focal, jammy, noble]
         arch: [amd64, arm64]
         include:
           - {arch: amd64, runner: ubuntu-latest}
           - {arch: arm64, runner: ubuntu-24.04-arm}
-          - {suite: focal, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic@sha256:fce2d76fddf4f6439bf0a188249b731650febdc163befc360bed186b269d252a'}
-          - {suite: jammy, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-jammy-full-humble@sha256:94b723df918e4eb04c6d4ef4e4ae6ce7364deb8087909eb710b6847ee6ba7421'}
-          - {suite: noble, image: 'ghcr.io/xgc-team/xgc2-images/xgc2-build-noble-full-jazzy@sha256:1f9ba87ad4f6fd088493693b70d61e9987a65ce94fb36ee19e3a8e6dbc8829c9'}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -32,18 +200,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and install SDK artifacts
-        env:
-          IMAGE: ${{ matrix.image }}
-          SUITE: ${{ matrix.suite }}
-        run: |
-          set -euo pipefail
-          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-            -e GITHUB_SHA -e GITHUB_RUN_ID -e GITHUB_EVENT_NAME \
-            -e GITHUB_REPOSITORY -e GITHUB_WORKFLOW_REF \
-            -e RUNNER_TEMP=/out \
-            -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/out" -w /work \
-            "$IMAGE" bash .xgc2/scripts/build-ci.sh "$SUITE"
+      - name: Build and install-check the packages
+        run: .xgc2/scripts/in-image.sh "$(.xgc2/scripts/images.sh ${{ matrix.suite }})" bash .xgc2/scripts/build-ci.sh ${{ matrix.suite }}
       - uses: actions/upload-artifact@v4
         with:
           name: xgc2-xrpc-debs-${{ matrix.suite }}-${{ matrix.arch }}
