@@ -203,3 +203,32 @@ func TestClientRejectsOverloadBeforeDial(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClientGeneratesARequestIdentityWhenNoneIsGiven(t *testing.T) {
+	seen := make(chan string, 4)
+	client, _ := fixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get(RequestIDHeader)
+		w.Write([]byte("null"))
+	}), 1024)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ids := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		if _, _, _, err := client.Do(ctx, "POST", "/generated", "", "", nil); err != nil {
+			t.Fatal(err)
+		}
+		id := <-seen
+		if len(id) != 32 || !xrpc.ValidID(id) || ids[id] {
+			t.Fatalf("generated identity %q is not fresh 128-bit hex", id)
+		}
+		ids[id] = true
+	}
+	// A supplied identity is still carried unchanged; an invalid one is refused.
+	if _, _, _, err := client.Do(ctx, "POST", "/given", "caller:1", "", nil); err != nil || <-seen != "caller:1" {
+		t.Fatalf("supplied identity: %v", err)
+	}
+	var failure *xrpc.CallError
+	if _, _, _, err := client.Do(ctx, "POST", "/bad", "not valid!", "", nil); !errors.As(err, &failure) || failure.Disposition != xrpc.NotSent || failure.Code != "invalid_argument" {
+		t.Fatalf("invalid identity: %v", err)
+	}
+}

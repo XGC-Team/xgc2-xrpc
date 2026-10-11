@@ -212,3 +212,31 @@ func TestStatusForCode(t *testing.T) {
 		}
 	}
 }
+
+func TestDispatcherGivesACallWithoutAnIdentityAFreshOne(t *testing.T) {
+	recorded := &recorder{}
+	dispatcher, err := xrpc.NewDispatcher(map[string]xrpc.Caller{xrpc.UDP: recorded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	call := xrpc.Call{Service: methodRef(xrpc.UDP), Method: "svc/Method"}
+	for i := 0; i < 2; i++ {
+		if _, err := dispatcher.Call(ctx, call); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := recorded.calls[0].RequestID, recorded.calls[1].RequestID
+	if len(first) != 32 || len(second) != 32 || first == second {
+		t.Fatalf("identities %q %q", first, second)
+	}
+	// The caller's own copy is untouched, and an invalid identity is still refused.
+	if call.RequestID != "" {
+		t.Fatal("the dispatcher modified the caller's call")
+	}
+	call.RequestID = "not valid!"
+	if _, err := dispatcher.Call(ctx, call); xrpc.Code(err) != "invalid_argument" || len(recorded.calls) != 2 {
+		t.Fatalf("invalid identity reached a caller: %v", err)
+	}
+}

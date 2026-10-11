@@ -12,6 +12,7 @@ import (
 	"github.com/XGC-Team/xgc2-xrpc/go"
 	unixlease "github.com/XGC-Team/xgc2-xrpc/go/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -130,5 +131,50 @@ func TestRepresentationBudgetRemainsExplicitAndBounded(t *testing.T) {
 	_, err := profile.Call(ctx, call)
 	if xrpc.Code(err) != "resource_exhausted" || profile.Status().References != 0 {
 		t.Fatalf("representation overflow allocated transport: %v", err)
+	}
+}
+
+func TestProfileGeneratesARequestIdentityWhenNoneIsGiven(t *testing.T) {
+	files, message := bytesDescriptor(t)
+	lease, err := unixlease.Reserve(context.Background(), filepath.Join(privateTempDir(t), "rpc.sock"), unixlease.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := lease.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan string, 4)
+	host, err := ServeWithOptions(listener, lease, func(r grpc.ServiceRegistrar) {
+		r.RegisterService(&grpc.ServiceDesc{ServiceName: "fixture.Representation", HandlerType: (*interface{})(nil), Methods: []grpc.MethodDesc{{MethodName: "Echo", Handler: func(server any, ctx context.Context, decode func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+			input := dynamicpb.NewMessage(message)
+			if err := decode(input); err != nil {
+				return nil, err
+			}
+			handler := func(ctx context.Context, _ any) (any, error) {
+				md, _ := metadata.FromIncomingContext(ctx)
+				seen <- md.Get(RequestIDMetadata)[0]
+				return input, nil
+			}
+			return interceptor(ctx, input, &grpc.UnaryServerInfo{Server: server, FullMethod: "/fixture.Representation/Echo"}, handler)
+		}}}}, struct{}{})
+	}, HostOptions{InstanceID: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { host.Stop(); <-host.Drained() }()
+	profile := NewProfile(DialOptions{LocalTargetID: "local"}, files)
+	defer func() { profile.Close(); <-profile.Drained() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	call := xrpc.Call{Service: xrpc.ServiceRef{TargetID: "local", Service: "fixture.Representation", APIVersion: "v1", InstanceID: "boot", Profile: xrpc.GRPC, Endpoint: xrpc.Endpoint{Kind: "unix", Address: lease.Path()}}, Method: "/fixture.Representation/Echo", Payload: []byte(`{"data":"AQID"}`)}
+	for i := 0; i < 2; i++ {
+		if _, err := profile.Call(ctx, call); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := <-seen, <-seen
+	if len(first) != 32 || len(second) != 32 || first == second {
+		t.Fatalf("generated identities %q %q", first, second)
 	}
 }

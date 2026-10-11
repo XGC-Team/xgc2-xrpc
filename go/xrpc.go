@@ -224,9 +224,12 @@ func NewDispatcher(profiles map[string]Caller) (*Dispatcher, error) {
 	}
 	return &Dispatcher{profiles: copy}, nil
 }
-func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, error) {
+
+// caller validates call, gives it a fresh request identity when it has none and
+// returns the Caller of its profile.
+func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, Call, error) {
 	if _, err := Remaining(ctx); err != nil {
-		return nil, Failure(Code(err), NotSent, err)
+		return nil, call, Failure(Code(err), NotSent, err)
 	}
 	// A udp.v1 reference comes from configuration and may leave the instance
 	// empty; the first answer reveals it. Internal http.v1 and grpc.v1
@@ -236,25 +239,32 @@ func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, error) {
 		check = call.Service.Validate
 	}
 	if err := check(); err != nil {
-		return nil, Failure("invalid_argument", NotSent, err)
+		return nil, call, Failure("invalid_argument", NotSent, err)
+	}
+	if call.RequestID == "" {
+		id, err := NewRequestID()
+		if err != nil {
+			return nil, call, Failure("internal", NotSent, err)
+		}
+		call.RequestID = id
 	}
 	if call.Method == "" || !ValidID(call.RequestID) {
-		return nil, Failure("invalid_argument", NotSent, errors.New("xrpc: method and request ID required"))
+		return nil, call, Failure("invalid_argument", NotSent, errors.New("xrpc: method and canonical request ID required"))
 	}
 	if d == nil || d.profiles[call.Service.Profile] == nil {
-		return nil, Failure("unavailable", NotSent, errors.New("xrpc: profile is not composed"))
+		return nil, call, Failure("unavailable", NotSent, errors.New("xrpc: profile is not composed"))
 	}
-	return d.profiles[call.Service.Profile], nil
+	return d.profiles[call.Service.Profile], call, nil
 }
 func (d *Dispatcher) Call(ctx context.Context, call Call) (Result, error) {
-	caller, err := d.caller(ctx, call)
+	caller, call, err := d.caller(ctx, call)
 	if err != nil {
 		return Result{}, err
 	}
 	return caller.Call(ctx, call)
 }
 func (d *Dispatcher) Observe(ctx context.Context, call Call, emit func(Result) error) error {
-	caller, err := d.caller(ctx, call)
+	caller, call, err := d.caller(ctx, call)
 	if err != nil {
 		return err
 	}

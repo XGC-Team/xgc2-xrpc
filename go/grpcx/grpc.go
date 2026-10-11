@@ -504,6 +504,13 @@ func (p *Profile) prepare(ctx context.Context, call xrpc.Call) (context.Context,
 	if err := call.Service.ValidateInternal(); err != nil {
 		return ctx, nil, nil, nil, nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
 	}
+	if call.RequestID == "" {
+		id, err := xrpc.NewRequestID()
+		if err != nil {
+			return ctx, nil, nil, nil, nil, xrpc.Failure("internal", xrpc.NotSent, err)
+		}
+		call.RequestID = id
+	}
 	if !xrpc.ValidID(call.RequestID) {
 		return ctx, nil, nil, nil, nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: canonical request identity required"))
 	}

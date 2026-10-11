@@ -243,8 +243,18 @@ func (c *Client) doStream(ctx context.Context, method, path, requestID, contentT
 	if err != nil {
 		return nil, xrpc.Failure(xrpc.Code(err), xrpc.NotSent, err)
 	}
-	if c == nil || c.client == nil || !validID(requestID) {
-		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: HTTP client and request identity required"))
+	if c == nil || c.client == nil {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: HTTP client required"))
+	}
+	if requestID == "" {
+		generated, err := xrpc.NewRequestID()
+		if err != nil {
+			return nil, xrpc.Failure("internal", xrpc.NotSent, err)
+		}
+		requestID = generated
+	}
+	if !validID(requestID) {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: canonical request identity required"))
 	}
 	if c.owner.Err() != nil {
 		return nil, xrpc.Failure("unavailable", xrpc.NotSent, errors.New("xrpc: HTTP client closed"))
