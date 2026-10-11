@@ -4,6 +4,10 @@ Go 1.24+, native `net/http`, native `grpc-go`, native TLS and plain UDP;
 production builds use `CGO_ENABLED=0`. There are no domain, database, workflow,
 discovery, or provider-activation dependencies.
 
+The module is released with the other SDKs under one product version, 0.2.0: its tag is
+`go/v0.2.0` (the module lives in the `go/` directory of the repository, so its tags carry
+that prefix), and a consumer pins `github.com/XGC-Team/xgc2-xrpc/go v0.2.0`.
+
 | Package | Provides |
 |---|---|
 | `xrpc` | `ServiceRef`, dispositions and `CallError`, `Dispatcher` and method addressing, `Describe` and capability facts, `Diagnostics`, `LoadBootstrapInput`, default limits |

@@ -83,7 +83,7 @@ reloaded world) exits or reports `ready: false`, it does not re-issue its identi
 - A caller may pin an expected instance. A server of another instance refuses the call
   with `conflict` (HTTP 409, gRPC FAILED_PRECONDITION, `udp.v1` status conflict) before
   any domain dispatch.
-- A client verifies the instance of every answer. **A pinned call that is answered by
+- A client that pinned an instance verifies the instance of every answer. **A pinned call that is answered by
   another instance fails with `conflict` and the disposition `outcome_unknown`**, with the
   answering instance reported where the language can. The pinned instance may have run
   the request before it went away, so the caller must not conclude that nothing happened.

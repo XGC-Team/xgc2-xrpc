@@ -41,9 +41,9 @@ if [[ "$suite" = focal ]]; then cxx=clang++-10; fi
   --release-source-sha "$GITHUB_SHA"
 "${PYTHON:-python3}" tools/check-install.py --artifacts "$scratch/packages" \
   --work-dir "$scratch/installed" --distribution "$suite" \
-  --architecture "$arch" --cxx "$cxx" --negative-controls "${check_args[@]}"
+  --architecture "$arch" --cxx "$cxx" --negative-controls ${check_args[@]+"${check_args[@]}"}
 if [[ "${GITHUB_EVENT_NAME:-}" = push ]]; then
-  python3 .xgc2/scripts/emit-build-artifact.py \
+  "${PYTHON:-python3}" .xgc2/scripts/emit-build-artifact.py \
     --artifacts "$scratch/packages" \
     --install-receipt "$scratch/installed/install-evidence.json" \
     --output "$scratch/packages/build-manifest.json"
