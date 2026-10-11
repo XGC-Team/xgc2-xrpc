@@ -52,9 +52,9 @@ Limits are plain options with documented defaults; nothing reads the environment
 (cd go && go vet ./... && go test ./... && CGO_ENABLED=1 go test -race ./...)
 
 # C++ (CMake 3.10 or newer; add ";grpc" to the components where gRPC 1.16 or newer is installed)
-cmake -S . -B build -DXGC2_XRPC_COMPONENTS="unix;diagnostics;bootstrap;http;json_http;udp"
-cmake --build build -j2 && (cd build && ctest --output-on-failure)
-cmake -S . -B build-udp -DXGC2_XRPC_COMPONENTS=udp     # the udp.v1 library alone (g++ 7.5 is enough)
+(mkdir -p build && cd build && cmake .. -DXGC2_XRPC_COMPONENTS="unix;diagnostics;bootstrap;http;json_http;udp" \
+  && cmake --build . -- -j2 && ctest --output-on-failure)
+(mkdir -p build-udp && cd build-udp && cmake .. -DXGC2_XRPC_COMPONENTS=udp)    # the udp.v1 library alone (g++ 7.5 is enough)
 
 # Rust, Python, Node, TypeScript
 (cd rust && cargo test --locked)

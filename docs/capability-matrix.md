@@ -173,7 +173,7 @@ subtly different.
 
 ```sh
 (cd go && go vet ./... && go test ./... && CGO_ENABLED=1 go test -race ./...)
-cmake -S . -B build && cmake --build build -j2 && (cd build && ctest --output-on-failure)   # add -DXGC2_XRPC_COMPONENTS="...;grpc" for gRPC
+(mkdir -p build && cd build && cmake .. && cmake --build . -- -j2 && ctest --output-on-failure)   # add -DXGC2_XRPC_COMPONENTS="...;grpc" for gRPC
 (cd rust && cargo test --locked)
 PYTHONPATH=python python3 -m unittest discover -s python/tests
 (cd node && npm ci && npm test)
