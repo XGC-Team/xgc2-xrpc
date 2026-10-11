@@ -122,30 +122,31 @@ pub unsafe extern "C" fn consumer_release(host: *mut c_void) {
 "###;
 
 struct Fixture {
-    _root: tempfile::TempDir,
     artifact: PathBuf,
 }
 fn fixture() -> &'static Fixture {
     static FIXTURE: OnceLock<Fixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
-        let root = tempfile::Builder::new().prefix("xrpc-ffi-consumer-").tempdir().unwrap();
-        let source = root.path().join("src");
-        std::fs::create_dir(&source).unwrap();
+        // Cargo's per-package scratch directory (inside target/, removed by `cargo clean`): a static value is
+        // never dropped, so a TempDir here would leave the whole consumer build behind in /tmp on every run.
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("xrpc-ffi-consumer");
+        let source = root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("lib.rs"), CONSUMER).unwrap();
         let manifest = format!(
             "[package]\nname=\"xrpc-ffi-consumer\"\nversion=\"0.0.0\"\nedition=\"2021\"\n\n[lib]\ncrate-type=[\"cdylib\"]\n\n[dependencies]\nxgc2-xrpc={{path={:?}}}\nlibc=\"0.2\"\n",
             env!("CARGO_MANIFEST_DIR")
         );
-        std::fs::write(root.path().join("Cargo.toml"), manifest).unwrap();
-        let target = root.path().join("target");
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        let target = root.join("target");
         let output = Command::new(env!("CARGO"))
             .args(["build", "--offline", "--manifest-path"])
-            .arg(root.path().join("Cargo.toml"))
+            .arg(root.join("Cargo.toml"))
             .arg("--target-dir").arg(&target)
             .output().unwrap();
         assert!(output.status.success(), "independent SDK consumer build failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        Fixture { artifact: target.join("debug/libxrpc_ffi_consumer.so"), _root: root }
+        Fixture { artifact: target.join("debug/libxrpc_ffi_consumer.so") }
     })
 }
 
