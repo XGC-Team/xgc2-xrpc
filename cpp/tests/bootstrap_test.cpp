@@ -219,7 +219,7 @@ void private_input_and_application() {
   write_private(path, std::string(16 * 1024 + 1, ' '));
   expect_error(BootstrapErrorCode::UnsafeFile, [&] { (void)loadBootstrapInput(path); });
 
-  const std::string opaque = R"({"text":"机器人 \uD83D\uDE80","number":1.25,"yes":true,"none":null,"items":[false,2,"s"]})";
+  const std::string opaque = R"({"text":"héllo wörld ✓ \uD83D\uDE80","number":1.25,"yes":true,"none":null,"items":[false,2,"s"]})";
   write_private(path, document(binding, "{}", opaque));
   assert(loadBootstrapInput(path).application_json() == opaque);
   const auto nested = [](unsigned count) { return std::string(count, '[') + "true" + std::string(count, ']'); };

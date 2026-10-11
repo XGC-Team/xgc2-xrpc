@@ -14,6 +14,9 @@ from aiohttp import web
 from xgc2_xrpc import AppRouter, Host, Client, Limits, Runtime, Fault, TransportError
 from xgc2_xrpc.websocket import WebSocketClient
 
+# One character that takes three bytes in UTF-8: the limits count payload bytes, not characters.
+THREE_BYTES = "\u2713"
+
 
 class WebSocketTests(unittest.TestCase):
     def setUp(self):
@@ -81,8 +84,8 @@ class WebSocketTests(unittest.TestCase):
         async def consume(socket):
             borrowed.append(socket)
             self.assertEqual(socket.protocol, "robot.v1")
-            await socket.send_str("界界")
-            self.assertEqual((await socket.receive()).data, "界界")
+            await socket.send_str(THREE_BYTES * 2)
+            self.assertEqual((await socket.receive()).data, THREE_BYTES * 2)
             await socket.send_bytes(b"\x00\r\nabc")
             self.assertEqual((await socket.receive()).data, b"\x00\r\nabc")
             await socket.ping(b"ok")
@@ -141,9 +144,9 @@ class WebSocketTests(unittest.TestCase):
             with self.assertRaises(TypeError): await socket.send_str(Encoded("x"))
             await socket.send_bytes(Bytes(b"1234"))
             self.assertEqual((await socket.receive()).data, b"1234")
-            await socket.send_str("界")
-            self.assertEqual((await socket.receive()).data, "界")
-            with self.assertRaises(Fault): await socket.send_str("界")
+            await socket.send_str(THREE_BYTES)
+            self.assertEqual((await socket.receive()).data, THREE_BYTES)
+            with self.assertRaises(Fault): await socket.send_str(THREE_BYTES)
             self.assertEqual(socket.sent_bytes, 7)
         client.consume("/bounds", consume, timeout=1, max_msg_bytes=8, total_send_bytes=8)
 
@@ -161,13 +164,13 @@ class WebSocketTests(unittest.TestCase):
         async def cumulative(request):
             socket = web.WebSocketResponse(compress=False)
             await socket.prepare(request)
-            await socket.send_str("界")
-            await socket.send_str("界")
+            await socket.send_str(THREE_BYTES)
+            await socket.send_str(THREE_BYTES)
             return socket
         other, _ = self.serve(cumulative)
         second = self.client(other)
         async def twice(socket):
-            self.assertEqual((await socket.receive()).data, "界")
+            self.assertEqual((await socket.receive()).data, THREE_BYTES)
             await socket.receive()
         with self.assertRaises(Fault): second.consume("/total", twice, timeout=1, max_msg_bytes=3, total_receive_bytes=5)
 

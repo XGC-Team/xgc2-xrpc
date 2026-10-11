@@ -75,7 +75,7 @@ test("multi-line data, CRLF line ends and heartbeat comments", async () => {
 });
 
 test("a stream written one byte at a time, splitting UTF-8 sequences and CRLF, parses the same", async () => {
-  const text = frame({ id: "é-1", event: "greeting", data: "héllo 日本語 \u{1f600}" }) + "data: a\r\ndata: b\r\n\r\n";
+  const text = frame({ id: "é-1", event: "greeting", data: "héllo wörld \u2713 \u{1f600}" }) + "data: a\r\ndata: b\r\n\r\n";
   const bytes = Buffer.from(text, "utf8");
   const server = await serve(async (_req, res) => {
     const out = stream(res);
@@ -96,7 +96,7 @@ test("a stream written one byte at a time, splitting UTF-8 sequences and CRLF, p
       },
     });
     assert.deepEqual(seen.events, [
-      { event: "greeting", data: "héllo 日本語 \u{1f600}", id: "é-1" },
+      { event: "greeting", data: "héllo wörld \u2713 \u{1f600}", id: "é-1" },
       { event: "message", data: "a\nb", id: undefined },
     ]);
   } finally {
