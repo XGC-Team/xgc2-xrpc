@@ -1,6 +1,6 @@
 {
   "name": "@xgc2/xrpc-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "XRPC http.v1 client for browsers and Node: JSON unary calls and resumable event streams over fetch",
   "license": "Apache-2.0",
   "type": "module",

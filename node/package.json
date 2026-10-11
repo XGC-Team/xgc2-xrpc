@@ -1,6 +1,6 @@
 {
   "name": "@xgc2/xrpc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bounded HTTP RPC clients and HTTP, Unix-socket and WebSocket hosts for XGC2 service edges",
   "license": "Apache-2.0",
   "main": "index.cjs",
