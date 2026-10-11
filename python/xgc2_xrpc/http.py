@@ -140,6 +140,9 @@ class Context:
     deadline: float
     cancelled: threading.Event
     peer_uid: object = None
+    # The query string of a discovery route, without "?" (for example "wait_ready_ms=250");
+    # empty if there is none. Any other route is refused when it carries a query.
+    query: str = ""
     def remaining(self):
         return max(0.0,self.deadline-time.monotonic())
     def check_cancelled(self):
@@ -575,7 +578,9 @@ class Host:
                 _,uid,_=struct.unpack("3i",sock.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
             if self.allowed_uids is not None and uid not in self.allowed_uids:
                 raise Fault("unavailable","peer UID is not authorized")
-            context=Context(request_id,time.monotonic()+budget,threading.Event(),uid)
+            # A discovery route is chosen by method and path; its query is not part of the match.
+            discovery=request.method=="GET" and request.path in self.discovery_routes
+            context=Context(request_id,time.monotonic()+budget,threading.Event(),uid,request.query_string if discovery else "")
             request[DEADLINE_KEY]=context.deadline
             deadline_timer=arm_deadline(context.deadline)
             async def invoke():
@@ -584,7 +589,7 @@ class Host:
                     handler=self.routes.get(("GET",request.path))
                 if handler is None:
                     raise Fault("not_found","unknown domain route")
-                if request.query_string:
+                if request.query_string and not discovery:
                     raise Fault("invalid_argument","query parameters are not part of this route")
                 if request.content_length and request.content_length>self.limits.body_bytes:
                     raise Fault("resource_exhausted","request body exceeds limit")

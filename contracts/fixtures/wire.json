@@ -675,6 +675,154 @@
       "dispatch": false
     },
     {
+      "name": "discovery_query_absent",
+      "method": "GET",
+      "path": "/v1/describe?wait_ready_ms=250",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "discovery_query_empty_value",
+      "method": "GET",
+      "path": "/v1/describe?wait_ready_ms=",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "discovery_query_bound",
+      "method": "GET",
+      "path": "/v1/describe?wait_ready_ms=250",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-1"
+        ]
+      ],
+      "status": 200,
+      "dispatch": true
+    },
+    {
+      "name": "discovery_query_mismatch",
+      "method": "GET",
+      "path": "/v1/describe?wait_ready_ms=250",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          "fixture:boot-2"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_query_empty_instance",
+      "method": "GET",
+      "path": "/v1/describe?wait_ready_ms=250",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ],
+        [
+          "X-Xrpc-Instance-ID",
+          ""
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_path_is_exact_not_a_prefix",
+      "method": "GET",
+      "path": "/v1/describe/more?wait_ready_ms=250",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_query_does_not_exempt_a_bound_route",
+      "method": "GET",
+      "path": "/v1/echo?wait_ready_ms=250",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
+      "name": "discovery_query_is_not_the_path",
+      "method": "GET",
+      "path": "/v1/echo?/v1/describe",
+      "headers": [
+        [
+          "X-Xrpc-Timeout-Ms",
+          "1000"
+        ],
+        [
+          "X-Request-ID",
+          "fixture:request-1"
+        ]
+      ],
+      "status": 409,
+      "dispatch": false
+    },
+    {
       "name": "head_bound",
       "method": "HEAD",
       "path": "/v1/echo",

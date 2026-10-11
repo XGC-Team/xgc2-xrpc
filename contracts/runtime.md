@@ -197,7 +197,7 @@ whose identity has exactly that form uses it as the id). Servers echo it in the 
 ## Shared wire rules
 
 The wire rules of `http.v1` and `grpc.v1` are common to all languages, negative cases
-included; the corpora are [fixtures/wire.json](fixtures/wire.json) (33 `http.v1` cases,
+included; the corpora are [fixtures/wire.json](fixtures/wire.json) (41 `http.v1` cases,
 run by every host SDK) and [fixtures/grpc-wire.json](fixtures/grpc-wire.json) (23 `grpc.v1`
 cases, run by Go).
 
@@ -207,7 +207,13 @@ cases, run by Go).
 - Exactly one `X-Xrpc-Instance-ID` is required on a bound call and verified on its response.
   Explicit discovery permits a missing instance only on configured GET routes; a supplied
   empty, duplicate or mismatched instance is rejected anyway, and an empty header value is
-  not a missing header.
+  not a missing header. **A discovery route is chosen by method and path alone**: the query
+  string is not part of the match, so `GET /v1/describe?wait_ready_ms=250` needs no instance
+  (Core does not know it before the first describe) and the handler receives the query to
+  validate. A query never makes another route, or a longer path (`/v1/describe/more`), a
+  discovery route, and a route that takes no query may refuse one after the fence has passed.
+  Every host with the exemption follows this (Go, C++, Rust, Python, Node); the shared corpus
+  has the cases.
 - GET and HEAD may have no body or `Content-Length`; JSON parsing applies only where a
   route requires a JSON body; a HEAD response has no body.
 - HTTP framing belongs to the maintained parser. A rejection before the body is read either
@@ -262,10 +268,12 @@ valid (for example the bound ROS master URI and its run id, a world generation, 
 flowing) and their meaning belongs to the domain. When such a dependency is replaced, the
 service exits or reports `ready: false` with the reason; it never serves a stale binding.
 
-- `http.v1`: `GET /v1/describe`. The optional query `wait_ready_ms=<0..30000>` makes the
-  server hold the request (an asynchronous reply, no busy loop) until `ready` becomes true or
-  the wait elapses, and then answer with the current envelope; a caller waits for readiness
-  with one outstanding call instead of polling.
+- `http.v1`: `GET /v1/describe`, an explicit discovery route that needs no instance header
+  (see the shared wire rules: the query is not part of the match). The optional query
+  `wait_ready_ms=<0..30000>` makes the server hold the request (an asynchronous reply, no
+  busy loop) until `ready` becomes true or the wait elapses, and then answer with the current
+  envelope; a caller waits for readiness with one outstanding call instead of polling. The
+  domain's handler parses and bounds `wait_ready_ms`.
 - `grpc.v1`: the unary `Describe(DescribeRequest{wait_ready_ms}) -> DescribeReply{service,
   api_version, instance_id, ready, facts_json}` with the same semantics.
 - `udp.v1`: an ordinary authenticated method, `<service>/Describe`; every reply carries the

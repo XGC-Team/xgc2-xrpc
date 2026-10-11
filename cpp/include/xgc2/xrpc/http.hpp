@@ -33,6 +33,10 @@ struct HttpLimits {
 };
 struct HttpIdentity {
   std::string instance_id;
+  // GET paths that may be called without the instance header. A request is a
+  // discovery call when its method is GET and the part of its target before any
+  // '?' is listed here; the query (wait_ready_ms, for one) is not part of the match
+  // and stays in HttpRequest::target for the handler.
   std::vector<std::string> discovery_targets;
 };
 struct HttpRequest {

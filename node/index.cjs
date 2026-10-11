@@ -447,7 +447,9 @@ function createRPCHost(handler, options = {}) {
     const ids = entries("x-request-id"), timeouts = entries("x-xrpc-timeout-ms"), instances = entries("x-xrpc-instance-id");
     let code;
     if (ids.length !== 1 || !/^[A-Za-z0-9._:-]{1,128}$/.test(ids[0]) || timeouts.length !== 1 || !/^[1-9][0-9]{0,7}$/.test(timeouts[0]) || Number(timeouts[0]) > 86400000 || instances.length > 1) code = "invalid_argument";
-    else if (!(req.method === "GET" && discovery.has(req.url) && instances.length === 0) && (instances.length !== 1 || instances[0] !== instanceId)) code = "conflict";
+    // A discovery route is chosen by method and path; its query (wait_ready_ms, for one)
+    // is not part of the match and stays in req.url for the handler.
+    else if (!(req.method === "GET" && discovery.has(req.url.split("?", 1)[0]) && instances.length === 0) && (instances.length !== 1 || instances[0] !== instanceId)) code = "conflict";
     if (code) {
       options.diagnostics?.emit("call_rejected", { category: code, instance_id: instanceId });
       res.writeHead(code === "conflict" ? 409 : 400, { "Content-Type": "application/json", Connection: "close" });

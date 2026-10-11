@@ -29,6 +29,12 @@ finally:
     runtime.close()
 ```
 
+A route in `discovery_routes` is an explicit unbound GET: it is matched by method and path
+alone, so `GET /v1/describe?wait_ready_ms=250` needs no instance header (Core does not know
+the instance before its first describe), and the query string reaches the handler as
+`Context.query`. Any other route is refused when it carries a query, and a query never makes
+another route a discovery route. (`Host.from_app` handlers read `request.query` themselves.)
+
 Limits are plain values with the defaults below; the environment is never read.
 
 | `Limits` field | Default | `Runtime` parameter | Default |

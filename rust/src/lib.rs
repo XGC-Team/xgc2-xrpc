@@ -136,6 +136,10 @@ pub struct Context {
     pub deadline: Instant,
     pub peer_uid: Option<u32>,
     pub method: hyper::Method,
+    /// The query string of a discovery route, without the `?` (for example
+    /// `wait_ready_ms=250`); empty if there is none. Any other route is refused
+    /// when it carries a query, so the handler of a route that takes none never sees one.
+    pub query: String,
     pub(crate) owner: Arc<host::Owner>,
     pub(crate) admission: Arc<host::CallAdmission>,
 }

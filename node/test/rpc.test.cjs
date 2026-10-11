@@ -44,6 +44,26 @@ test("all shared wire fixtures use the native HTTP parser and gate dispatch", as
     }
   } finally { await fixture.close(); }
 });
+test("a discovery route takes a query without an instance and the handler sees it", async () => {
+  const seen = [];
+  const fixture = await httpsHost((req, res) => { seen.push(req.url); res.setHeader("Content-Type", "application/json"); res.end('{"ok":true}'); }, { discoveryPaths: ["/v1/describe"] });
+  const ask = (target, instance) => new Promise((resolve, reject) => {
+    const headers = { "X-Request-ID": "probe:1", "X-Xrpc-Timeout-Ms": "1000", ...(instance ? { "X-Xrpc-Instance-ID": instance } : {}) };
+    require("node:https").get(new URL(target, fixture.address), { ca: cert, headers }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); }).on("error", reject);
+  });
+  try {
+    // Core does not know the instance before the first describe.
+    assert.equal(await ask("/v1/describe?wait_ready_ms=250"), 200);
+    assert.deepEqual(seen, ["/v1/describe?wait_ready_ms=250"]);
+    assert.equal(await ask("/v1/describe?wait_ready_ms=250", boot), 200);
+    // The query is no part of the match: it makes no other route and no longer path discovery.
+    for (const target of ["/v1/echo?wait_ready_ms=250", "/v1/describe/more?wait_ready_ms=250", "/v1/other?/v1/describe"]) {
+      assert.equal(await ask(target), 409, target);
+    }
+    assert.equal(await ask("/v1/describe?wait_ready_ms=250", "someone-else"), 409);
+    assert.equal(seen.length, 2);
+  } finally { await fixture.close(); }
+});
 test("one shared client reuses connections and rejects stale/remote references", async () => {
   const fixture = await httpsHost((_req,res) => res.end('{"ok":true}'));
   const client = new HTTPClient({ localTarget: "local", tls: { ca: cert } });

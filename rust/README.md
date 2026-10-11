@@ -90,7 +90,11 @@ instance ID, the selected profile, and a canonical Unix socket path for the
 local target. `Client::from_service` and `BlockingClient::from_service` enforce
 these constraints before admission; `from_service_with_limits` additionally
 preserves the owner's limits. The product checks its expected service
-and API version. Discovery remains an explicit unbound Unix request.
+and API version. Discovery remains an explicit unbound Unix request: a route in
+`Limits::discovery_routes` is matched by method (GET) and path alone, so
+`GET /v1/describe?wait_ready_ms=250` needs no instance header, and its query string
+reaches the handler as `Context::query`. Any other route is refused when it carries a
+query, and a query never makes another route a discovery route.
 
 ```rust,no_run
 use xgc2_xrpc::{BlockingClient, CallError, Limits, Runtime, ServiceRef};

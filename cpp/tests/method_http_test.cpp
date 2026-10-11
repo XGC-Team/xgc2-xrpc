@@ -92,9 +92,15 @@ int main() {
   limits.request_bytes = 4096;
   limits.response_bytes = 4096;
   // The domain keeps its own routes beside the method calls.
+  std::mutex target_mutex;
+  std::string last_target;
   HttpServer host(UnixOptions{path}, [&](HttpRequest request, HttpReply reply) {
     if (handle_method_call(router, request, reply)) return;
     ++fixture.domain_routes;
+    {
+      std::lock_guard<std::mutex> lock(target_mutex);
+      last_target = request.target;
+    }
     HttpResponse response;
     response.headers.emplace_back("Content-Type", "application/json");
     response.body = describe_json("method-test", "v1", instance, true);
@@ -162,6 +168,23 @@ int main() {
   HttpClient unpinned(path, limits);
   response = unpinned.call(post("xgc2.test/Echo", "{}"), deadline());
   assert(response.status == 409 && fixture.handler_runs == runs);
+  // Discovery is chosen by method and path: the first describe of Core carries a
+  // wait_ready_ms query and no instance, and the handler sees the whole target.
+  HttpRequest describe_wait;
+  describe_wait.method = "GET";
+  describe_wait.target = "/v1/describe?wait_ready_ms=250";
+  response = unpinned.call(describe_wait, deadline());
+  assert(response.status == 200 && response.body == describe_json("method-test", "v1", instance, true));
+  {
+    std::lock_guard<std::mutex> lock(target_mutex);
+    assert(last_target == "/v1/describe?wait_ready_ms=250");
+  }
+  // A query makes neither another route nor a longer path a discovery route.
+  for (const char *target : {"/v1/call/xgc2.test/Echo?wait_ready_ms=250", "/v1/describe/more?wait_ready_ms=250", "/v1/other?/v1/describe"}) {
+    describe_wait.target = target;
+    assert(unpinned.call(describe_wait, deadline()).status == 409);
+  }
+  assert(fixture.handler_runs == runs);
   unpinned.close();
 
   // A handler that throws is answered internal.

@@ -431,7 +431,9 @@ Competing public nodes cannot be adopted as the listener's recorded inode.
 
 Internal calls bind an incarnation, canonical finite timeout and caller request
 ID. Explicit discovery permits an absent instance only on configured GET
-routes; empty/duplicate/mismatched fields still fail. Responses verify both
+routes (`HttpIdentity::discovery_targets`, matched on the part of the target before any
+`?`, so `GET /v1/describe?wait_ready_ms=250` needs no instance and the handler reads the
+query from `HttpRequest::target`); empty/duplicate/mismatched fields still fail. Responses verify both
 instance and request ID. Default IDs use OS randomness across client/process
 instances. HTTP parsing/serialization belongs to Beast; rejected body framing
 is closed before another request can be interpreted. HEAD is header-only. The

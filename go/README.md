@@ -120,8 +120,9 @@ XGC2_XRPC_METHOD_INTEROP_SERVER=/tmp/xrpc-cpp/cpp/xgc2-xrpc-method-interop-serve
 
 `httpx.Serve` requires canonical finite wire metadata on a Unix listener. Bound
 calls require an exact instance header; only explicitly configured GET
-discovery routes permit an absent instance. Empty/duplicate supplied
-identities remain errors. `Client.Do/DoStream` accept caller request IDs (an empty one gets a fresh
+discovery routes permit an absent instance. A discovery route is matched on its path
+alone: `GET /v1/describe?wait_ready_ms=250` needs no instance and the handler reads the
+query from `r.URL`. Empty/duplicate supplied identities remain errors. `Client.Do/DoStream` accept caller request IDs (an empty one gets a fresh
 random identity, as it does in `Dispatcher.Call` and `grpcx.Profile`);
 `DoWithHeaders` and immutable `Config.Headers` supply authentication while
 rejecting wire/framing overrides. `Client.Reference()` returns its immutable

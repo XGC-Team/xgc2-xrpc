@@ -272,10 +272,13 @@ class HttpServer::Impl {
         if (request.count("X-Request-ID") == 1 &&
             valid_id(std::string(request["X-Request-ID"])))
           request_id = std::string(request["X-Request-ID"]);
+        // A discovery route is chosen by method and path; its query (for example
+        // wait_ready_ms) is not part of the match.
+        const std::string target(request.target());
         const bool discovery = request.method() == http::verb::get &&
                                std::find(identity.discovery_targets.begin(),
                                          identity.discovery_targets.end(),
-                                         std::string(request.target())) !=
+                                         target.substr(0, target.find('?'))) !=
                                    identity.discovery_targets.end();
         const auto instance_count = request.count("X-Xrpc-Instance-ID");
         if (instance_count > 1)

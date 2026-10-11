@@ -232,3 +232,65 @@ func TestClientGeneratesARequestIdentityWhenNoneIsGiven(t *testing.T) {
 		t.Fatalf("invalid identity: %v", err)
 	}
 }
+
+func TestDiscoveryRouteTakesAQueryWithoutAnInstance(t *testing.T) {
+	path := filepath.Join(privateTempDir(t), "rpc.sock")
+	lease, err := unixlease.Reserve(context.Background(), path, unixlease.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := lease.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan string, 8)
+	host, err := Serve(listener, lease, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.RequestURI()
+		w.Write([]byte(`{"ok":true}`))
+	}), HostOptions{InstanceID: "boot-1", DiscoveryPaths: []string{"/v1/describe"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = host.Shutdown(ctx)
+	})
+	ref := func(instance string) xrpc.ServiceRef {
+		return xrpc.ServiceRef{TargetID: "local", Service: "test", APIVersion: "1", InstanceID: instance, Profile: xrpc.HTTP, Endpoint: xrpc.Endpoint{Kind: "unix", Address: path}}
+	}
+	// Core does not know the instance before the first describe.
+	unpinned, err := New(Config{LocalTargetID: "local", Service: ref("")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(unpinned.Close)
+	pinned, err := New(Config{LocalTargetID: "local", Service: ref("boot-1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pinned.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, status, header, err := unpinned.Do(ctx, "GET", "/v1/describe?wait_ready_ms=250", "describe:1", "", nil); err != nil || status != 200 || header.Get(InstanceIDHeader) != "boot-1" {
+		t.Fatalf("status=%d instance=%q err=%v", status, header.Get(InstanceIDHeader), err)
+	}
+	if got := <-seen; got != "/v1/describe?wait_ready_ms=250" {
+		t.Fatalf("the handler saw %q", got)
+	}
+	if _, status, _, err := pinned.Do(ctx, "GET", "/v1/describe?wait_ready_ms=250", "describe:2", "", nil); err != nil || status != 200 {
+		t.Fatalf("pinned: status=%d err=%v", status, err)
+	}
+	<-seen
+	// The query is no part of the match: it makes no other route and no longer path discovery.
+	for _, target := range []string{"/v1/echo?wait_ready_ms=250", "/v1/describe/more?wait_ready_ms=250", "/v1/other?/v1/describe"} {
+		if _, status, _, err := unpinned.Do(ctx, "GET", target, "describe:3", "", nil); err != nil || status != 409 {
+			t.Fatalf("%s: status=%d err=%v", target, status, err)
+		}
+	}
+	select {
+	case got := <-seen:
+		t.Fatalf("a call that had to fail reached the handler: %s", got)
+	default:
+	}
+}

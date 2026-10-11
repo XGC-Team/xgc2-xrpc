@@ -57,6 +57,10 @@ await host.listen();   // verifies the directory, reclaims a stale socket, binds
 await host.close();    // drains admitted work, then removes the socket
 ```
 
+`discoveryPaths` lists GET routes that may be called without the instance header. They are matched on
+the path alone: `GET /v1/describe?wait_ready_ms=250` needs no instance, and the handler reads the
+query from `req.url`.
+
 The socket lives in a private runtime directory that the supervisor created: the
 directory must exist, be owned by the effective user and have mode 0700, and no
 path component may be a symlink. The host binds relative to that directory, sets
