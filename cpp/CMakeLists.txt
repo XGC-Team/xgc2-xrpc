@@ -201,16 +201,8 @@ if(BUILD_TESTING)
     xgc2_xrpc_test(udp_server tests/udp_server_test.cpp LINK XgcXrpc::udp ARGS 127.0.0.1)
     # IPv6 loopback, or a private one made in a user+network namespace; exit 77
     # (skipped) where neither exists. See the comment in the test.
-    if(CMAKE_VERSION VERSION_LESS 3.16)
-      # CMake before 3.16 has no SKIP_RETURN_CODE: report "skipped" as a pass.
-      add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND sh -c
-        "\"$0\" ::1; status=$?; if [ $status -eq 77 ]; then exit 0; fi; exit $status"
-        $<TARGET_FILE:xrpc_cpp_udp_server_test>)
-      set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60)
-    else()
-      add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND xrpc_cpp_udp_server_test ::1)
-      set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
-    endif()
+    add_test(NAME xrpc_cpp_udp_server_ipv6 COMMAND xrpc_cpp_udp_server_test ::1)
+    set_tests_properties(xrpc_cpp_udp_server_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(xrpc_cpp_udp_server PROPERTIES TIMEOUT 60)
     # The peer of the cross-language tests: a fixed command line and READY line
     # (see the header of the source); the Go interop test starts this binary.
