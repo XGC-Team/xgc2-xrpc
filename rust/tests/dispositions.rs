@@ -5,6 +5,10 @@ use std::{
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -35,6 +39,26 @@ fn canned(dir: &std::path::Path, reply: Vec<u8>) -> PathBuf {
             head.push(byte[0]);
         }
         let _ = stream.write_all(&reply);
+    });
+    path
+}
+
+/// Take one connection, read the request head and say nothing for longer than any budget of
+/// these tests, so that the client's own deadline is the only thing that can end the call.
+fn silent(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("silent.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        thread::sleep(Duration::from_millis(800));
     });
     path
 }
@@ -132,16 +156,36 @@ fn nothing_sent_is_not_sent() {
 fn a_request_that_outlives_its_budget_is_outcome_unknown() {
     let mut runtime = Runtime::new(RuntimeOptions::default()).unwrap();
     let dir = directory();
+    let path = silent(dir.path());
+    let client = BlockingClient::unix(&runtime, &path, "boot").unwrap();
+    let error = client
+        .call("/slow", json!({}), Duration::from_millis(100))
+        .unwrap_err();
+    assert_eq!(error.disposition, Disposition::OutcomeUnknown);
+    drop(client);
+    runtime.close(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn a_host_stops_a_handler_when_the_budget_it_was_sent_runs_out() {
+    let mut runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let dir = directory();
     let path = dir.path().join("rpc.sock");
+    let finished = Arc::new(AtomicBool::new(false));
+    let flag = finished.clone();
     let mut host = Host::bind(
         &runtime,
         &path,
         "boot".into(),
         Limits::default(),
         false,
-        handler(|_, _, _| async {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            Ok(json!({}))
+        handler(move |_, _, _| {
+            let flag = flag.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok(json!({}))
+            }
         }),
     )
     .unwrap();
@@ -149,7 +193,21 @@ fn a_request_that_outlives_its_budget_is_outcome_unknown() {
     let error = client
         .call("/slow", json!({}), Duration::from_millis(100))
         .unwrap_err();
-    assert_eq!(error.disposition, Disposition::OutcomeUnknown);
+    // The host holds the same budget and may answer deadline_exceeded just before the client's own
+    // timer fires, and the client may drop an answer that arrives with its budget; if the client's
+    // timer wins, no answer arrived. All three are the deadline passing, never a success.
+    match error.disposition {
+        Disposition::OutcomeUnknown => {}
+        Disposition::ResponseReceived => assert!(
+            error.code.as_deref() == Some("deadline_exceeded")
+                || (error.code.is_none() && error.message.contains("deadline")),
+            "{error:?}"
+        ),
+        Disposition::NotSent => panic!("the request was sent: {error:?}"),
+    }
+    // The handler was cancelled at the budget, not left to finish.
+    thread::sleep(Duration::from_millis(600));
+    assert!(!finished.load(Ordering::SeqCst));
     drop(client);
     host.close().unwrap();
     runtime.close(Duration::from_secs(2)).unwrap();
