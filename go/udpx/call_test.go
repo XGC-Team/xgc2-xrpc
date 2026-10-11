@@ -29,9 +29,12 @@ func TestRoundTrip(t *testing.T) {
 	if reply.Status != udpx.StatusOK || string(reply.Body) != `{"hello":"robot"}` || reply.Instance != server.Instance() || reply.InstanceID() != server.InstanceID() || reply.Sent != 1 {
 		t.Fatalf("reply %+v", reply)
 	}
-	if stats := server.Stats(); stats.Executed != 1 || stats.Replies < 1 || stats.Requests < 1 {
+	if stats := server.Stats(); stats.Executed != 1 || stats.Requests < 1 {
 		t.Fatalf("stats %+v", stats)
 	}
+	// The server counts a reply after it has written the datagram, so the caller can have the
+	// reply before the counter moves.
+	eventually(t, "the reply to be counted", func() bool { return server.Stats().Replies >= 1 })
 }
 
 func TestErrorBodiesCarryStatusMessageAndDetails(t *testing.T) {
