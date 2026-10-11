@@ -1,258 +1,340 @@
 # XGC2 XRPC runtime contract
 
-XRPC supplies transport and host libraries. It does not run a central daemon,
-start a provider on an invocation, discover services by querying a workflow
-database, or implement domain operations.
+XRPC owns the mechanics of communication between processes and hosts: listening and
+dialing, framing, request correlation, deadlines, cancellation, the error vocabulary,
+admission limits, drain, instance fencing and the authentication of the carrier.
+Domains own state, the meaning of readiness, completion semantics, trust decisions and
+device effects. XRPC runs no central daemon, starts no provider on an invocation,
+discovers no service and implements no domain operation.
 
-Runtime environment, configuration delivery, persistence, observability and
-administrative ownership follow [operations.md](operations.md). The shared
-environment namespace is `XGC2_XRPC_`; domain configuration is separate.
+Function first: a capability is a stable in-process API first, and XRPC is the thin
+adapter that exposes it to other processes or hosts. A caller in the same process calls
+the function and takes no local RPC hop. A capability is built only for a cell of the
+[capability matrix](../docs/capability-matrix.md) that has a real consumer; every other
+cell is absent and says why.
 
-## Choose the actual service boundary
-
-A product directory, process or small function does not by itself require an
-RPC listener. Establish its actual functions, callers and useful isolation or
-remote invocation before choosing one of these forms:
-
-| Form | Ownership and invocation |
-| --- | --- |
-| Independent service | A justified process boundary owns its endpoint, readiness and drain; callers use XRPC for its necessary service capabilities |
-| Module in an existing service host | The host shares one endpoint, execution/admission and lifecycle; modules expose domain functions through that host without their own listener, probe or ServiceRef |
-| Library or pure data path | Call domain functions directly or use the native data interface; no listener or service bootstrap is required |
-
-Simple modules may belong in an existing aggregate host. A data relay or
-device-facing process may retain its necessary data transport without gaining
-a separate RPC control plane. When service invocation is needed, use the shared
-SDK mechanisms; do not infer that need from a protocol or directory inventory.
-Record the chosen boundary and its callers/benefit in the owning product.
+This contract is the shared requirement of all SDKs. Companions:
+[udp-v1.md](udp-v1.md) (the datagram profile), [events.md](events.md) (http.v1 event
+streams), [sessions.md](sessions.md) (long-lived grpc.v1 sessions),
+[operations.md](operations.md) (diagnostics and status), [bootstrap.md](bootstrap.md)
+(startup input) and [fault-conformance.md](fault-conformance.md) (the fault and interop
+tests that exist). A statement here is a requirement; the capability matrix names the
+tests that show each SDK meets it.
 
 ## Profiles
 
-`http.v1` uses HTTP/1.1 over a private Unix stream or authenticated HTTPS.
-Named domain routes use JSON for structured values. Binary resources use HTTP
-content types and streaming; multipart/mixed carries typed metadata plus
-binary parts when both belong to one immutable capture. HTTP parsers and
-serializers come from maintained language libraries. First-party local RPC
-must not introduce separate JSON-line or private binary framing.
+| Profile | Encoding | Carriers | Modes | Security |
+| --- | --- | --- | --- | --- |
+| `http.v1` | JSON over HTTP/1.1 | private Unix socket; TLS (server authentication or mutual TLS) | unary; server event stream ([events.md](events.md)) | Unix: the permissions of a private directory. TLS: X.509 server authentication, optional client certificates |
+| `grpc.v1` | Protobuf over HTTP/2 | Unix socket; TLS or mutual TLS | unary; server streaming; bidirectional; long-lived session option ([sessions.md](sessions.md)) | as http.v1; a session may verify the peer certificate with a caller-supplied hook (pinning) |
+| `udp.v1` | binary header and a JSON body, one datagram per request and per reply | UDP over IPv4 or IPv6 on a LAN | unary only | HMAC-SHA256 per key: authenticity and integrity, no confidentiality ([udp-v1.md](udp-v1.md)) |
 
-`grpc.v1` uses typed Protobuf methods and native gRPC unary/stream semantics.
-Private Unix endpoints and authenticated remote channels share the endpoint
-ownership contract. HTTP-only applications do not link gRPC.
+Not provided, for lack of a consumer: raw TCP RPC, client streaming as a public mode and
+plaintext TCP HTTP or gRPC hosts. (The one plaintext TCP listener, Core's browser edge,
+is product code, not an SDK host.)
 
-Browser APIs, MCP, provider stdio, discovery, ROS and hardware protocols are
-explicit edge adapters. Their public or device wire contracts remain with
-their owning product. First-party domain operations exposed through those
-adapters still use the common host and invocation primitives where applicable.
-Platform-owned control calls use XRPC even when an existing implementation
-uses ROS services or command topics. ROS remains an algorithm/user-facing or
-device integration interface (for example MAVROS flight controller services),
-not the platform's internal service bus. ROS/Zenoh/DDS/RTP telemetry, real-time
-data loops, C ABI and shared memory remain data/implementation boundaries.
-Functions within the same host can call their domain implementation directly.
+`http.v1` uses HTTP/1.1 with JSON for structured values, parsed and serialized by the
+maintained HTTP library of each language; first-party local RPC does not introduce
+JSON-line or private binary framing. Binary resources use HTTP content types and
+streaming; `multipart/mixed` carries typed metadata plus binary parts when both belong to
+one immutable capture. `grpc.v1` uses typed Protobuf methods and native gRPC semantics;
+HTTP-only applications do not link gRPC.
 
-## Service references and lifecycle
+Browser APIs, MCP, provider stdio, ROS and hardware protocols are explicit edge adapters
+whose wire contracts stay with their product. ROS remains the interface of algorithms and
+devices, not the platform's internal service bus; real-time data loops, C ABIs and shared
+memory are data boundaries outside XRPC.
 
-A service reference identifies `target_id`, `service`, `api_version`,
-`instance_id`, `profile`, and `endpoint` (`kind`, `address`). The service/process
-owner returns this reference. An invocation consumes it; it never contains a
-process definition or bootstrap settings. SDKs have no workflow, SQL, process
-supervisor or product-domain dependencies. Remote dialing is injected by the
-Agent transport owner; a remote Unix pathname is not a local dial target.
+## Service references
 
-Internal service references have a nonempty instance_id. HTTP clients send
-X-Xrpc-Instance-ID and verify the same response header. A host configured with
-an instance rejects a missing or different instance with conflict (409),
-before domain dispatch. Public edge APIs and explicit discovery may omit
-instance binding; they must not be used as an internal invocation fallback.
+A service reference identifies one service endpoint:
 
-Unix ownership is one exclusive lifetime lease. The lease rejects non-socket
-paths and symlinks, retains an advisory owner lock, records the bound inode,
-and only removes that inode at close. The default existing-path policy is
-fail; reclaim-unreachable is explicit and requires a bounded failed connect
-and an unchanged inode. Socket mode defaults to 0600 and is configurable.
-Leases release on exceptions. Close/stop are idempotent. gRPC external bind
-uses reserve, bind, record-bound while retaining the same lease.
+```
+{target_id, service, api_version, instance_id?, profile, endpoint{kind, address}, key_id?}
+```
 
-All languages use the same sibling lock name: `<socket-path>.xrpc.lock` and
-Linux `flock(LOCK_EX|LOCK_NB)`, acquired before any existing socket probe or
-bind. The runtime directory is owned by the effective user and mode 0700.
-The lock is an owned regular 0600 file with one hard link and is not unlinked
-at unlock. Directory/path checks and bind must refer to the same retained
-directory. A binding failure releases only resources owned by that attempt.
-Stopping acceptance is not termination of admitted handlers: the endpoint
-lease remains held until all owned work is quiescent. A shutdown deadline can
-report failed quiescence; it cannot release the lease while old work continues.
+| Profile | Endpoint kind and address |
+| --- | --- |
+| `http.v1` | `unix`: an absolute canonical path of fewer than 108 bytes; `https`: an authenticated origin with no credentials, path, query or fragment |
+| `grpc.v1` | `unix` as above; `tls`: `host:port` |
+| `udp.v1` | `udp`: `host:port`, IPv6 literals in brackets, port 1 to 65535 in canonical form |
 
-No implicit global umask changes, generic process launches, domain membership,
-workflow recovery state or registry service are part of the SDK.
+`udp.v1` and the `udp` kind exist only together. `key_id` names the HMAC key of a `udp.v1`
+service in the caller's key ring; zero means unspecified (the ring then holds exactly one
+key) and it is zero for the other profiles. A `udp.v1` instance pin is the 32-digit
+lowercase hexadecimal form of the 128-bit instance. `service` names the host that serves
+the call; it is not the capability (see Method addressing), except that `grpc.v1` takes
+the protobuf service name from it.
 
-## Calls and resources
+The owner of a service returns its reference after startup; an invocation only consumes
+it and never carries a process definition or bootstrap settings. SDKs depend on no
+workflow, database, supervisor or product domain. Dialing a remote Unix path is the job of
+the transport owner that injects the dial function; a remote Unix pathname is never a
+local dial target.
 
-Every call has a finite caller deadline; transports include connect, write,
-read and bounded cancellation in that budget. HTTP passes remaining budget
-in `X-Xrpc-Timeout-Ms` and correlates requests through `X-Request-ID`.
-Server limits constrain header/body size, admitted connections, in-flight
-calls, idle time and handler dispatch. Limits are options of the host, not
-new robot or algorithm limits. Persistent connections are supported when
-bounded by idle time; clients reuse their transport rather than create one
-per call. A product may close a connection, but one-call-per-connection is not
-a compatibility requirement.
+## Instance fence
 
-Pinned Python grpcio 1.84.0 enforces `grpc.max_allowed_incoming_connections`
-per native listener, including connections before TLS/HTTP2 handshaking. Each
-managed Python gRPC Host therefore owns one UDS or numeric-address listener and
-reserves its positive connection cap below `INT_MAX` from the shared Runtime
-before serving. Other gRPC Hosts reserve from the same budget; HTTP admission
-uses the remainder. Failed drain retains the reservation until actual owner
-quiescence. Report the reserved amount and unknown native active count honestly;
-this listener cap is not a total process FD or RSS bound.
+Every server draws a random 128-bit instance identity at process start. It stays fixed for
+the life of the host; a service whose environment is replaced (a restarted ROS master, a
+reloaded world) exits or reports `ready: false`, it does not re-issue its identity.
 
-The wire contract is shared across languages, including negative cases:
+- Replies carry the instance: `X-Xrpc-Instance-ID` on `http.v1`, the initial metadata
+  `x-xrpc-instance-id` on `grpc.v1`, the `instance` field of every `udp.v1` reply.
+- A caller may pin an expected instance. A server of another instance refuses the call
+  with `conflict` (HTTP 409, gRPC FAILED_PRECONDITION, `udp.v1` status conflict) before
+  any domain dispatch.
+- A client verifies the instance of every answer. **A pinned call that is answered by
+  another instance fails with `conflict` and the disposition `outcome_unknown`**, with the
+  answering instance reported where the language can. The pinned instance may have run
+  the request before it went away, so the caller must not conclude that nothing happened.
+  Other `udp.v1` replies from a foreign instance are ignored, because they answer nothing
+  the caller asked.
+- Internal `http.v1` and `grpc.v1` references pin an instance. Public edge APIs and
+  explicit discovery may omit it and must not be used as an internal invocation fallback.
+  A `udp.v1` reference built from configuration may omit it and learn it from the first
+  reply.
 
-- Internal requests contain exactly one X-Xrpc-Timeout-Ms in canonical ASCII
-  decimal form, 1 through 86400000 milliseconds inclusive (no sign, leading
-  zero, fraction or exponent), and exactly one X-Request-ID; discovery remains subject to
-  these limits. IDs are 1–128 ASCII letters, digits, `.`, `_`, `:` or `-`.
-- Exactly one X-Xrpc-Instance-ID is required on bound calls and verified on
-  their responses. Explicit discovery permits a missing instance header only
-  on configured GET routes; a supplied empty, duplicate or mismatched instance
-  is still rejected. Empty header values are not missing headers.
-- Standard GET/HEAD requests may have no body or Content-Length. JSON parsing
-  applies only when a route requires a JSON body. Correct HEAD responses have
-  no body even when Content-Length describes the corresponding GET resource.
-- HTTP framing belongs to the maintained parser. Rejection before reading a
-  body either safely drains that body's framing or closes the connection;
-  rejected body bytes must never become another request.
-- Every client permits the caller to supply a request ID. A generated default
-  must be unique across independently created clients and service restarts.
-  An SDK-local counter alone is not sufficient for operation deduplication.
-- Caller budget includes queue/pool/lock wait and connection setup. Idle time
-  before the next request does not consume the next call's budget. Timeout
-  metadata can shorten a host limit; a longer caller budget does not make an
-  otherwise valid request malformed.
+## Unix endpoint ownership
 
-For `grpc.v1`, the SDK owns lowercase `x-request-id` and
-`x-xrpc-instance-id` metadata, alongside native gRPC deadline/framing. Request
-IDs use the same 1–128 ASCII token grammar above. Missing, duplicate, empty or
-invalid request IDs return `INVALID_ARGUMENT`. Duplicate instance metadata
-returns `INVALID_ARGUMENT`; a bound call with a missing, single empty or
-mismatched instance returns `FAILED_PRECONDITION`. Every rejection precedes
-domain dispatch. A declared unary discovery method alone may omit the instance
-key; a supplied value is still bound exactly, and discovery is never a fallback
-for a rejected invocation or a streaming mode.
+A private Unix endpoint is one exclusive lifetime lease (Go, C++, Rust and Python). The
+runtime directory is owned by the effective user with mode 0700 and the walk to it follows
+no symlink. The lease is a sibling lock `<socket-path>.xrpc.lock`, an owned regular file
+of mode 0600 with one hard link, taken with `flock(LOCK_EX|LOCK_NB)` before any probe or
+bind and never unlinked at unlock. Checks and bind refer to the same retained directory.
+The socket mode defaults to 0600. The lease rejects non-socket paths and symlinks, records
+the bound inode and removes only that inode. An existing path fails by default; reclaiming
+an unreachable socket is an explicit choice that needs a bounded failed connect and an
+unchanged inode. Close and stop are idempotent and a failed bind releases only what that
+attempt acquired.
 
-Admitted responses echo exactly one matching request ID and the actual hosting
-instance. Streaming hosts publish those initial metadata before blocking on
-payload I/O, and clients verify them before using stream payloads. A successful
-response with absent, duplicate or mismatched fence/correlation metadata fails
-with `FAILED_PRECONDITION`. A native transport rejection with no response
-metadata retains its native failure; it is not converted into a fictitious
-successful response. Unbound discovery returns the same hosting incarnation in
-its metadata and domain ServiceRef. There is no common business Protobuf schema;
-generated methods and payloads remain with their domain owners. The metadata
-corpus is [fixtures/grpc-wire.json](fixtures/grpc-wire.json); it does not claim
-that each language has already passed the required native checks.
+Stopping admission is not the end of admitted handlers: the lease stays held until the
+owned work is quiescent, and a shutdown deadline can report that it is not, but it cannot
+release the lease while old work continues. Node has no `flock`; its Unix host relies on
+the private directory owned by the supervisor, refuses a path that is not a socket and
+binds only after a connection attempt is refused (a socket with a live owner fails with
+"address in use").
 
-Internal gRPC streaming requires an actual caller deadline no later than the
-host's maximum call budget. Reject an absent/longer deadline before dispatch;
-substituting a shorter wrapper Context does not cancel the native stream's
-blocked receive. Cancellation must reach the underlying transport. Unary
-handlers may use a shorter effective budget, with admitted work still counted
-until it really terminates.
+## Deadlines, cancellation and replay
 
-Persistent native edge streams use an explicitly declared finite owner stream
-lifetime and connection grace, independent of the short internal RPC budget.
-Native authentication, peer epochs and domain stream semantics remain with
-that edge. The shared host enforces the actual transport lifetime, including
-blocked native I/O; a wrapper context or configurable aging grace alone cannot
-extend it. This does not release ownership of domain work that has not ended.
+- Every call has a finite deadline that covers queue and pool wait, connection setup,
+  write, read and cancellation. `http.v1` carries the remaining budget in
+  `X-Xrpc-Timeout-Ms`, `grpc.v1` uses the native deadline, `udp.v1` carries `timeout_ms`.
+  A server caps the budget by its own call budget (30 s for `http.v1` and `grpc.v1`,
+  2 s for `udp.v1` by default); a caller's budget can only shorten it.
+- Long-lived sessions are the only exception and are explicit
+  ([sessions.md](sessions.md)). Event streams have no call deadline but heartbeats
+  ([events.md](events.md)).
+- Closing a stream or connection (`http.v1`, `grpc.v1`) or abandoning a call (`udp.v1`)
+  never means that the business action stopped, and a cancelled call implies no rollback.
+- No transport replays a mutation: not after a lost reply, not after a reconnect, not
+  after a failed warm connection. `udp.v1` retransmits the same datagram with the same
+  request id inside one deadline and the server answers a duplicate from its reply cache,
+  so the handler runs at most once: that is deduplication, not replay. Reconciling an
+  unknown outcome is a domain operation.
 
-Synchronous transport failures distinguish not-sent from outcome-unknown.
-Mutation calls are not automatically replayed. A cancelled RPC does not imply
-rollback. Domain responses distinguish accepted/queued/applied/completed as
-appropriate; the SDK cannot declare physical completion. Long operations
-have explicit domain operation references and event-based observation;
-periodic receipt polling is not a generic recovery mechanism.
+## Dispositions
 
-Infrastructure errors map to invalid_argument, not_found, conflict,
-resource_exhausted, deadline_exceeded, cancelled, unavailable and internal.
-HTTP uses status codes and structured error responses, gRPC uses its native
-status codes. Unknown outcome is a client-side result property, not a claim
-that the server rejected a request. Domain errors may extend this vocabulary.
+Every client result says what the caller can know about the effect of the call, in one of
+three dispositions:
 
-A known gRPC application failure may explicitly carry one standard
-`google.rpc.ErrorInfo` detail with `domain = "xgc2.xrpc"`,
-`reason = "APPLICATION_ERROR"`, and exactly two metadata entries:
-`request_id` and `instance_id`, taken from the admitted call. A client reports
-response-received only when this single valid marker matches its request and
-the verified response instance metadata. Status code or instance metadata
-alone is insufficient: a local receive-size failure after a committed mutation
-can have the same status as an application quota rejection. Missing, duplicate
-or invalid markers leave an unsuccessful call outcome-unknown. The marker
-preserves the native error code and does not imply rollback, safe replay or
-physical completion; those meanings remain with the domain. Hosts do not
-automatically mark arbitrary transport, cancellation or handler failures.
+| Disposition | Meaning |
+| --- | --- |
+| `not_sent` | Nothing reached the peer: invalid arguments, a closed client, refused admission, a refused connection. Retrying is safe. |
+| `outcome_unknown` | Bytes may have reached the peer and no usable answer arrived: deadline, lost connection, a reply from another instance, a `udp.v1` call that was sent and never answered. The SDK never retries; the domain reconciles. |
+| `response_received` | The peer answered. This includes error answers and answers the client refuses, such as a body larger than its response limit. It says nothing about success. |
 
-Handlers own domain payloads and state. An async HTTP reply completes at most
-once and may complete from another thread. Fixed host workers/event loops
-must not multiply with robot members. Real-time loops do not accept sockets,
-parse HTTP, await network results, or run transport retries; a bounded
-handoff reports the actual domain acceptance point.
+All client SDKs implement the same three values: Go `xrpc.CallError.Disposition`,
+C++ `xgc2::xrpc::Delivery` (also `udp::Delivery`), Rust `Disposition`, Python
+`NOT_SENT`/`OUTCOME_UNKNOWN`/`RESPONSE_RECEIVED` on `TransportError`, `Fault` and
+`Response`, and Node and TypeScript `disposition`. A failure to receive is a client-side
+property, not a claim that the server rejected the request.
 
-## Data-oriented implementation
+A `grpc.v1` application failure is `response_received` only when the host marked it. A
+known domain failure of an admitted, instance-bound call may carry exactly one standard
+`google.rpc.ErrorInfo` detail with `domain = "xgc2.xrpc"`, `reason = "APPLICATION_ERROR"`
+and exactly two metadata entries, `request_id` and `instance_id`, taken from the admitted
+call. A client reports `response_received` only when this single valid marker matches its
+request and the verified response instance. Status code or instance metadata alone is
+insufficient: a local receive-size failure after a committed mutation can have the same
+status as an application quota rejection. A missing, duplicate or invalid marker leaves an
+unsuccessful call `outcome_unknown`. The marker keeps the native code and does not imply
+rollback, safe replay or physical completion. Go (`grpcx.ApplicationError`) and C++
+(`GrpcCallScope::application_error`) write and read it; hosts never mark transport,
+cancellation or arbitrary handler failures.
 
-Predictable memory use, lifetime safety and measured throughput/latency take
-precedence over an object-per-member design. Hosts share fixed execution and
-connection resources; adding a robot does not add a listener, worker pool or
-transport client pool. Store hot homogeneous records contiguously and process
-them in batches where the domain supports it. Stable handles with generations
-identify records across removal/reuse; do not expose pointers into movable
-storage. Separate cold configuration/diagnostics from hot control state.
+## Error vocabulary
 
-Long-lived observation holds its bounded transport/observer allocation rather
-than occupying an execution worker while idle. Hosts distinguish accepted
-connections/streams and pending replies from runnable domain execution.
-Registering an asynchronous observer may release its execution slot only after
-that execution actually returns; cancellation cannot pretend blocked native
-work or its memory has ended. Command overload rejects explicitly. A latest
-telemetry value policy is chosen by that data path's semantics, never imposed
-as a silent generic command drop policy.
+One set in all languages. Domains may add codes of their own inside the error body.
 
-Memory budgets include admitted connections, parser buffers, bodies, pending
-replies, queued work, operation results and slow consumers. Queue admission
-reserves its storage before reporting acceptance. Products publish limits and
-overload behavior rather than allowing unbounded heap growth. Real-time paths
-use preallocated records/handoffs and have no transport allocation or waiting.
+| Code | `http.v1` | `grpc.v1` | `udp.v1` status |
+| --- | --- | --- | --- |
+| `invalid_argument` | 400 | INVALID_ARGUMENT | 1 |
+| `not_found` | 404 | NOT_FOUND | 2 |
+| `conflict` | 409 | FAILED_PRECONDITION (also ALREADY_EXISTS, ABORTED when read) | 3 |
+| `resource_exhausted` | 429 (also 413, 431) | RESOURCE_EXHAUSTED | 4 |
+| `deadline_exceeded` | 504 (also 408) | DEADLINE_EXCEEDED | 5 |
+| `cancelled` | 499 | CANCELLED | 6 |
+| `unavailable` | 503 (also 502) | UNAVAILABLE | 7 |
+| `internal` | 500 | INTERNAL | 8 |
+| `unauthenticated` | 401 | UNAUTHENTICATED | 9, never sent: an unauthenticated datagram gets no reply |
+| `permission_denied` | 403 | PERMISSION_DENIED | 10 |
 
-Typed facades and RAII can express ownership without requiring fragmented
-object graphs. Buffer sharing, pooling and zero-copy paths require explicit
-ownership through cancellation and async completion; memory is not recycled
-while a reader or write still owns it. Prefer a bounded copy over unsafe
-aliasing. Measure allocation counts, peak resident/buffer memory, latency and
-throughput at realistic concurrency, including overload and slow peers; a
-class/struct choice or microbenchmark alone is not performance evidence. Report
-allocation rate, RSS peak, actual native/SDK thread counts, tail latency and
-saturation/recovery against the combined connection, parser, body, queued work,
-execution, pending reply and slow-consumer budget. Fixed concurrency alone does
-not establish completion of performance acceptance.
+`http.v1` answers an error as `{"error":{"code":"<code>","message":"...","details":{...}}}`
+(`details` optional); `udp.v1` as `{"code":"<code>","message":"...","details":{...}}`. A
+client takes the code from the envelope when there is one and from the status otherwise;
+a domain code is a lowercase token (`[a-z][a-z0-9_]{0,63}`) and passes through unchanged.
+Messages never carry payloads, credentials or arbitrary error text from the environment.
 
-Choose compact AoS or SoA layouts from measured hot access patterns; neither
-SoA nor ECS is a mandatory repository-wide representation. Batch compatible
-work, separate hot data from cold metadata, and check shared counters for false
-sharing and global pools for contention. Locate CPU cost before changing a
-layout. Compare the same workload's cycles/instructions/cache misses where
-hardware counters are available, together with throughput, p99, allocation and
-RSS. Report unavailable counters explicitly; object/array names alone are not
-evidence of cache benefit.
+## Request identity
+
+Request identities match `[A-Za-z0-9._:-]{1,128}`. Every client lets the caller supply one
+and generates one when the caller does not: 128 random bits as lowercase hexadecimal, unique
+across independently created clients and restarts (a process-local counter alone is not).
+`http.v1` carries it in `X-Request-ID` and `grpc.v1` in `x-request-id`; `udp.v1` uses a
+128-bit binary id, which handlers see as its 32 lowercase hexadecimal digits (a caller
+whose identity has exactly that form uses it as the id). Servers echo it in the answer.
+
+## Shared wire rules
+
+The wire rules of `http.v1` and `grpc.v1` are common to all languages, negative cases
+included; the corpora are [fixtures/wire.json](fixtures/wire.json) (33 `http.v1` cases,
+run by every host SDK) and [fixtures/grpc-wire.json](fixtures/grpc-wire.json) (23 `grpc.v1`
+cases, run by Go).
+
+- An internal `http.v1` request contains exactly one `X-Xrpc-Timeout-Ms` in canonical ASCII
+  decimal form, 1 through 86400000 (no sign, leading zero, fraction or exponent), and
+  exactly one `X-Request-ID`. Discovery is subject to the same limits.
+- Exactly one `X-Xrpc-Instance-ID` is required on a bound call and verified on its response.
+  Explicit discovery permits a missing instance only on configured GET routes; a supplied
+  empty, duplicate or mismatched instance is rejected anyway, and an empty header value is
+  not a missing header.
+- GET and HEAD may have no body or `Content-Length`; JSON parsing applies only where a
+  route requires a JSON body; a HEAD response has no body.
+- HTTP framing belongs to the maintained parser. A rejection before the body is read either
+  drains the body's framing safely or closes the connection; rejected body bytes never
+  become another request.
+- The caller's budget includes queue, pool and lock wait and connection setup. Idle time
+  before the next request does not consume the next call's budget. A longer caller budget
+  than the host's limit is not malformed; the host just shortens it.
+- For `grpc.v1` the SDK owns the lowercase metadata `x-request-id` and `x-xrpc-instance-id`
+  next to the native deadline and framing. A missing, duplicate, empty or invalid request
+  id, and duplicate instance metadata, are `INVALID_ARGUMENT`; a bound call with a missing,
+  single empty or mismatched instance is `FAILED_PRECONDITION`. Every rejection precedes
+  domain dispatch. Only a declared unary discovery method may omit the instance, and a value
+  supplied there is still bound exactly.
+- An admitted `grpc.v1` response echoes exactly one matching request id and the hosting
+  instance; streaming hosts publish those initial metadata before blocking on payload I/O
+  and clients verify them before using stream payloads. A successful response with absent,
+  duplicate or mismatched fence metadata fails with `FAILED_PRECONDITION`. A native
+  rejection that carries no response metadata keeps its native failure.
+- An internal `grpc.v1` stream (not a session) requires a real caller deadline no later than
+  the host's call budget; an absent or longer one is rejected before dispatch. Cancellation
+  reaches the native stream.
+- There is no common business Protobuf schema; generated methods and payloads stay with their
+  domain.
+
+## Admission and drain
+
+Hosts bound accepted connections, in-flight calls, header and body sizes, idle time and call
+time; the bounds are options of the host, not limits of robots or algorithms. Persistent
+connections are supported and bounded by idle time; clients reuse their transport. Excess
+work is refused with `resource_exhausted` before payload work and never queued in a hidden
+retry queue.
+
+Shutdown stops admission, lets admitted work finish within a budget, then closes. Graceful
+drain and forced close are different: a returned close never leaves owned work running
+under a released lease, and a noncooperative handler is reported as failed quiescence, not
+pretended away. Handlers own domain payloads and state; an asynchronous reply completes at
+most once and may complete from another thread. Fixed host workers and event loops do not
+multiply with robot members, and real-time loops never accept sockets, parse HTTP or await
+network results.
+
+## Describe and readiness
+
+Process alive does not mean ready. Every service answers a describe in one envelope:
+
+```
+{"service":"<name>","api_version":"<v>","instance_id":"<hex>","ready":<bool>,"facts":{...}}
+```
+
+XRPC defines the envelope only. `facts` carries the domain dependencies that make the service
+valid (for example the bound ROS master URI and its run id, a world generation, frames
+flowing) and their meaning belongs to the domain. When such a dependency is replaced, the
+service exits or reports `ready: false` with the reason; it never serves a stale binding.
+
+- `http.v1`: `GET /v1/describe`. The optional query `wait_ready_ms=<0..30000>` makes the
+  server hold the request (an asynchronous reply, no busy loop) until `ready` becomes true or
+  the wait elapses, and then answer with the current envelope; a caller waits for readiness
+  with one outstanding call instead of polling.
+- `grpc.v1`: the unary `Describe(DescribeRequest{wait_ready_ms}) -> DescribeReply{service,
+  api_version, instance_id, ready, facts_json}` with the same semantics.
+- `udp.v1`: an ordinary authenticated method, `<service>/Describe`; every reply carries the
+  instance anyway.
+
+Go has `xrpc.Describe` and C++ `describe_json` for the envelope. The socket path or address of
+a Run-owned service is passed by its owner on the command line; readiness never needs an
+external probe process.
+
+## Method addressing
+
+A callable domain operation is named `<service>/<Method>`, for example
+`xgc2.chassis.hold/Engage`, and takes and returns JSON. The service is one or more
+dot-separated identifiers, the method one identifier, an identifier a letter followed by
+letters, digits and underscores, the name at most 128 bytes. Every profile carries the same
+name, so a caller can invoke a method without knowing its domain:
+
+| Profile | Carrier of the name |
+| --- | --- |
+| `udp.v1` | the datagram `method` field, verbatim |
+| `http.v1` | `POST /v1/call/<service>/<Method>` with the JSON body; the answer is the JSON result or the XRPC error envelope. Domain hosts may keep REST-style routes for other purposes. |
+| `grpc.v1` | the native full method `/<service>/<Method>`; JSON and Protobuf are converted with the descriptors the caller links, or by a codec the caller supplies |
+
+A host that serves a capability for several entities (a world host serving every chassis of
+its world) lists it in its describe facts, so a caller resolves "entity X, capability C" to a
+service reference generically:
+
+```
+{"capabilities":[{"name":"<service>","entities":["<id>",...]}]}
+```
+
+The name is the `<service>` part of the method names, an entity is a nonempty identity of at
+most 128 bytes without control characters, and neither repeats. Go: `(*xrpc.Dispatcher).CallMethod(ctx, ref,
+"<service>/<Method>", body)` dispatches on the profile of `ref` (`xrpc.MethodCall` is the
+mapping, `udpx.Profile` lets a Dispatcher compose `udp.v1`; `xrpc.CapabilitiesJSON`,
+`Describe.Capabilities` and `Describe.Serves` carry the facts). C++: a `MethodRouter` serves
+`/v1/call/...` on an `http.v1` host (`handle_method_call`) and registers the same handlers on a
+`udp.v1` server (`add_methods`); `capabilities_json` builds the facts. The same call returns
+the same results across both languages and profiles (see the cross-language tests in the
+[capability matrix](../docs/capability-matrix.md)).
+
+## Limits are plain configuration
+
+Limits are plain option structs with documented defaults in each language. Nothing is read
+from the process environment, no registry resolves them and no deployment overrides them
+through hidden names; the composition root of a process sets the fields it needs. They bound
+SDK and transport state, not allocations inside a domain handler.
+
+| Limit | Default |
+| --- | --- |
+| host connections / in-flight calls | 32 / 32 |
+| request and response body or message | 1 MiB |
+| header bytes | 16 KiB |
+| call timeout (host) / header timeout / idle timeout / shutdown budget | 30 s / 5 s / 30 s / 5 s |
+| client connections per reference / cached references / reference idle | 16 / 64 / 30 s |
+| `grpc.v1` streams per connection | 32 |
+| `udp.v1` datagram / call budget / reply cache / in-flight / rate | 1200 bytes / 2 s / 120 s and 1024 entries / 64 / 50 per second, burst 100 per source |
+
+The wire budget is at most 86400000 ms on `http.v1` and 60000 ms on `udp.v1`. Each language
+README lists its fields.
 
 ## Language packages
 
-C++20: `cpp/`, public namespace `xgc2::xrpc`, CMake targets `XgcXrpc::unix`,
-`XgcXrpc::http`, and optional gRPC support. Boost.Beast/Asio implements HTTP;
-the Unix ownership primitive does not require Boost or ROS.
-
-Go: `go/`, module `github.com/XGC-Team/xgc2-xrpc/go`; standard net/http and
-native gRPC, without CGO. Python: `python/`, import `xgc2_xrpc`. Rust: `rust/`,
-crate `xgc2-xrpc`. Node: `node/`, package `@xgc2/xrpc`, with maintained HTTP/WS
-implementations. All share these semantics; products import the package
-rather than copy its listener, parser, deadline or cleanup implementation.
+All packages carry one product version (0.2.0). Go: `go/`, module
+`github.com/XGC-Team/xgc2-xrpc/go`, Go 1.24, native `net/http` and gRPC, no cgo. C++: `cpp/`,
+namespace `xgc2::xrpc`, C++17, one shared library per component selected with
+`XGC2_XRPC_COMPONENTS` (`unix diagnostics bootstrap http json_http grpc udp`), GNU 7.5 for
+`udp` and GNU 9 for the Boost.Beast components, clang 10 and newer. Python: `python/`, import
+`xgc2_xrpc`, Python 3.8. Rust: `rust/`, crate `xgc2-xrpc`, Rust 1.85. Node: `node/`, package
+`@xgc2/xrpc`, Node 20. TypeScript: `ts/`, package `@xgc2/xrpc-client`, ESM for browsers and
+Node 20. Products import the package; they do not copy its listener, parser, deadline or
+cleanup code.
