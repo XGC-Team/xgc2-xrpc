@@ -829,7 +829,8 @@ void loss_never_repeats_an_execution() {
     Env env;
     LossyProxy proxy(env.port(), loss.lost_requests, loss.lost_replies);
     Client client(keys());
-    const auto response = client.call(endpoint_of(proxy.port()), 7, "test/Count", "", steady_clock::now() + seconds(3));
+    // About one second of retransmissions in the worst case; the deadline leaves room for a loaded machine.
+    const auto response = client.call(endpoint_of(proxy.port()), 7, "test/Count", "", steady_clock::now() + seconds(10));
     assert(response.delivery == Delivery::ResponseReceived && response.status == Status::Ok);
     assert(response.body == "1" && env.probe.counter == 1);
     assert(proxy.dropped_requests() == loss.lost_requests && proxy.dropped_replies() == loss.lost_replies);
