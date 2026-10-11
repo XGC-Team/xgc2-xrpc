@@ -107,6 +107,15 @@ several entities lists it as `{"capabilities":[{"name":"<service>","entities":["
 `Describe.Serves(capability, entity)` read it, so a caller resolves "entity X,
 capability C" to a service generically. `ParseDescribe` decodes the envelope strictly.
 
+`conformance/method_interop_test.go` runs `CallMethod` over http.v1 (Unix) and udp.v1
+against the C++ `xgc2-xrpc-method-interop-server` (one `MethodRouter` on both transports)
+when `XGC2_XRPC_METHOD_INTEROP_SERVER` names the binary, and skips otherwise:
+
+```
+cmake -S .. -B /tmp/xrpc-cpp && cmake --build /tmp/xrpc-cpp --target xgc2-xrpc-method-interop-server
+XGC2_XRPC_METHOD_INTEROP_SERVER=/tmp/xrpc-cpp/cpp/xgc2-xrpc-method-interop-server go test ./conformance -run MethodInterop -v
+```
+
 ## http.v1 and grpc.v1 hosts and calls
 
 `httpx.Serve` requires canonical finite wire metadata on a Unix listener. Bound
