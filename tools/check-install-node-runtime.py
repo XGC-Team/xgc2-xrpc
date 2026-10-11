@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Verify the Node SDK Deb with Node or Bun in fresh offline containers."""
+"""Verify an architecture-independent npm SDK Deb (node-xgc2-xrpc or node-xgc2-xrpc-client)
+with Node or Bun in fresh offline containers."""
 import argparse
 import json
 from pathlib import Path
@@ -12,12 +13,22 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packaging"))
 from support import ABI, ROOT, digest, utc_now
+from node_deb import SDKS
 
-
-PACKAGE = "node-xgc2-xrpc"
-SDK_ROOT = "/usr/lib/xgc2/node_modules/@xgc2/xrpc"
-IDENTITY = "/usr/share/xgc2/xrpc/node/install-identity.json"
-PROBE = ROOT / "packaging/probes/node/installed.cjs"
+# What differs between the two SDKs: where the probe lives, how it is called and which
+# installed files it and the negative controls depend on. Paths are relative to the SDK root.
+PROBES = {
+    "node": {"source": ROOT / "packaging/probes/node/installed.cjs", "consumer": "/usr/lib/xgc2/lichtblick-web/xrpc-install-probe.cjs",
+             "owned": {"sdk_entry": "index.cjs", "worker": "diagnostic-worker.cjs", "ws_entry": "node_modules/ws/index.js",
+                       "ws_identity": "node_modules/ws/package.json", "sdk_identity": "package.json", "unix_host": "unix.cjs"},
+             "resolved": {"sdk": "index.cjs", "ws": "node_modules/ws/index.js"},
+             "negatives": [["missing-worker", "diagnostic-worker.cjs", "missing-worker"], ["missing-ws", "node_modules/ws", "fails"],
+                           ["missing-unix-host", "unix.cjs", "fails"]]},
+    "ts": {"source": ROOT / "packaging/probes/ts/installed.mjs", "consumer": "/usr/lib/xgc2/xrpc-client-probe/xrpc-install-probe.mjs",
+           "owned": {"sdk_entry": "dist/index.js", "calls": "dist/call.js", "events": "dist/events.js", "sdk_identity": "package.json"},
+           "resolved": {"entry": "dist/index.js"},
+           "negatives": [["missing-call-module", "dist/call.js", "fails"]]},
+}
 
 # This program runs inside each new container. Its only mounted inputs are the
 # artifact directory and the single consumer probe; installation uses dpkg.
@@ -100,10 +111,8 @@ def main():
         raise ValueError("SDK Deb was not fully installed")
 
     phase = "dpkg-file-ownership"
-    paths = {"sdk_entry": root / "index.cjs", "worker": root / "diagnostic-worker.cjs",
-             "ws_entry": root / "node_modules/ws/index.js", "ws_identity": root / "node_modules/ws/package.json",
-             "sdk_identity": root / "package.json", "registry": root / "runtime-policy.json",
-             "install_identity": Path(config["identity"])}
+    paths = {name: root / relative for name, relative in config["owned"].items()}
+    paths["install_identity"] = Path(config["identity"])
     owners = {}
     for name, file in paths.items():
         phase = "dpkg-file-ownership:" + name
@@ -151,11 +160,11 @@ def main():
                             files_count=len(files), files_sha256=hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest())
 
     phase = "consumer-placement"
-    consumer = Path("/usr/lib/xgc2/lichtblick-web/sol19-install-probe.cjs")
+    consumer = Path(config["consumer"])
     consumer.parent.mkdir(parents=True, exist_ok=True)
     if consumer.exists() or consumer.is_symlink():
         raise ValueError("consumer path already exists in runtime image")
-    shutil.copyfile("/probe.cjs", consumer)
+    shutil.copyfile("/probe.src", consumer)
     if sha256(consumer) != config["probe_sha256"]:
         raise ValueError("copied probe identity changed")
 
@@ -165,7 +174,7 @@ def main():
         command = [binary]
         if config["runtime"] == "node":
             command.append("--no-global-search-paths")
-        command += [str(consumer), str(root)]
+        command += [str(consumer), str(root), config["sdk_version"]]
         if missing_worker:
             command.append("--missing-worker")
         try:
@@ -185,8 +194,9 @@ def main():
             raise ValueError("installed consumer failed")
         if report["runtime"]["implementation"] != config["runtime"]:
             raise ValueError("probe runtime differs from selected binary")
-        if report["resolvedPaths"]["sdk"] != str(paths["sdk_entry"]) or report["resolvedPaths"]["ws"] != str(paths["ws_entry"]):
-            raise ValueError("probe escaped the installed dependency closure")
+        for key, relative in config["resolved"].items():
+            if report["resolvedPaths"][key] != str(root / relative):
+                raise ValueError("probe escaped the installed dependency closure")
 
     receipt = {"distribution": suite, "architecture": architecture, "runtime": runtime,
                "dpkg": {"control": control, "install_stdout": install.stdout, "install_stderr": install.stderr,
@@ -203,15 +213,16 @@ def main():
     negative = []
     # Each runtime is a new process. Files are restored before the next control,
     # so a later rejection cannot be explained by an earlier missing asset.
-    for name, target in (("missing-worker", paths["worker"]), ("missing-ws", root / "node_modules/ws"), ("missing-registry", paths["registry"])):
+    for name, relative, mode in config["negatives"]:
         phase = name
+        target = root / relative
         hidden = target.with_name(target.name + ".installed-probe-hidden")
         if hidden.exists() or hidden.is_symlink():
             raise ValueError("negative control backup already exists")
         target.rename(hidden)
         try:
-            result = probe(name, missing_worker=name == "missing-worker")
-            if name == "missing-worker":
+            result = probe(name, missing_worker=mode == "missing-worker")
+            if mode == "missing-worker":
                 report = result["report"]
                 if result["returncode"] != 0 or not isinstance(report, dict) or report.get("ok") is not True or report.get("mode") != name:
                     raise ValueError("missing worker boundary was not verified")
@@ -257,12 +268,15 @@ def captured(command, timeout=30):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--sdk", choices=sorted(SDKS), default="node", help="which npm SDK's Debian package to check")
     parser.add_argument("--runtime-image", required=True, help="already cached immutable full image ID or registry digest")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--runtime", choices=("node", "bun"), default="node")
     parser.add_argument("--expected-distribution", choices=ABI["distributions"],
                         help="explicit runtime suite for cross-suite Architecture: all validation")
     args = parser.parse_args()
+    sdk, probe_config = SDKS[args.sdk], PROBES[args.sdk]
+    probe_source = probe_config["source"]
     if not re.fullmatch(r"(?:sha256:|[A-Za-z0-9._:/-]+@sha256:)[0-9a-f]{64}", args.runtime_image):
         raise ValueError("runtime image must use an immutable full digest")
     directory = args.artifacts.resolve(strict=True)
@@ -287,17 +301,17 @@ def main():
         seen.add(name)
         if digest(file) != item["sha256"] or file.stat().st_size != item["bytes"]:
             raise ValueError("runtime artifact hash/size mismatch")
-    node_debs = [item for item in evidence["artifacts"] if item["kind"] == "node-deb"]
-    if len(node_debs) != 1 or node_debs[0]["package"] != PACKAGE:
-        raise ValueError("expected exactly one node-xgc2-xrpc Node Deb")
+    node_debs = [item for item in evidence["artifacts"] if item["kind"] == args.sdk + "-deb"]
+    if len(node_debs) != 1 or node_debs[0]["package"] != sdk.deb:
+        raise ValueError("expected exactly one %s Deb" % sdk.deb)
     artifact = node_debs[0]
     if not artifact["path"].endswith(".deb"):
-        raise ValueError("Node Deb artifact has an invalid suffix")
+        raise ValueError("Deb artifact has an invalid suffix")
     if not re.fullmatch(r"[0-9a-f]{64}", artifact["npm_tar_sha256"]) or not re.fullmatch(r"[0-9a-f]{40}", artifact["node_source_sha"]):
-        raise ValueError("Node Deb requires exact npm and committed Node source identities")
-    npm_artifacts = [item for item in evidence["artifacts"] if item["kind"] == "node"]
+        raise ValueError("the Deb requires exact npm and committed source identities")
+    npm_artifacts = [item for item in evidence["artifacts"] if item["kind"] == args.sdk]
     if len(npm_artifacts) != 1 or npm_artifacts[0]["sha256"] != artifact["npm_tar_sha256"]:
-        raise ValueError("Node Deb origin differs from the declared npm artifact")
+        raise ValueError("Deb origin differs from the declared npm artifact")
     image = json.loads(captured(["docker", "image", "inspect", args.runtime_image]))[0]
     if image["Architecture"] != evidence["architecture"]:
         raise ValueError("runtime image architecture mismatch")
@@ -306,13 +320,15 @@ def main():
     if native != evidence["architecture"]:
         raise ValueError("runtime checks require the target architecture's native Docker host")
     runtime_distribution = args.expected_distribution or evidence["distribution"]
-    probe_sha256 = digest(PROBE)
-    config = {"package": PACKAGE, "sdk_root": SDK_ROOT, "identity": IDENTITY,
+    probe_sha256 = digest(probe_source)
+    config = {"package": sdk.deb, "sdk_root": "/" + str(sdk.install_path), "identity": "/" + str(sdk.identity_path),
               "runtime": args.runtime, "runtime_distribution": runtime_distribution,
               "architecture": evidence["architecture"], "deb_version": evidence["deb_version"],
+              "sdk_version": evidence["version"].split("-", 1)[0],
               "deb_path": artifact["path"], "deb_sha256": artifact["sha256"], "deb_bytes": artifact["bytes"],
               "npm_tar_sha256": artifact["npm_tar_sha256"], "node_source_sha": artifact["node_source_sha"],
-              "probe_sha256": probe_sha256}
+              "probe_sha256": probe_sha256, "consumer": probe_config["consumer"], "owned": probe_config["owned"],
+              "resolved": probe_config["resolved"], "negatives": probe_config["negatives"]}
     results = {}
     # Build outputs also contain work/source snapshots. Only declared artifacts
     # enter the mounted directory, so source trees cannot satisfy the consumer.
@@ -329,26 +345,26 @@ def main():
         command = ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--memory", "512m",
                    "--cpus", "2", "--pids-limit", "128", "--user", "0:0", "--workdir", "/",
                    "--mount", "type=bind,src=" + str(staged) + ",dst=/artifacts,readonly",
-                   "--mount", "type=bind,src=" + str(PROBE) + ",dst=/probe.cjs,readonly",
+                   "--mount", "type=bind,src=" + str(probe_source) + ",dst=/probe.src,readonly",
                    "--entrypoint", "/usr/bin/python3", image["Id"], "-c", CONTAINER_PROGRAM]
         for case in ("positive", "negative"):
-            print("Checking installed Node Deb: " + args.runtime + " / " + case, flush=True)
+            print("Checking installed %s Deb: %s / %s" % (args.sdk, args.runtime, case), flush=True)
             results[case] = json.loads(captured(command + [json.dumps(dict(config, case=case))], timeout=150))
     if results["positive"]["runtime"] != results["negative"]["runtime"]:
         raise ValueError("fresh containers used different runtime binaries")
-    if digest(evidence_file) != evidence_sha256 or digest(PROBE) != probe_sha256:
+    if digest(evidence_file) != evidence_sha256 or digest(probe_source) != probe_sha256:
         raise ValueError("verification inputs changed during runtime checks")
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    receipt = {"schema": "xgc2.xrpc.node-runtime-install-evidence.v1", "created_at": utc_now(),
+    receipt = {"schema": "xgc2.xrpc.node-runtime-install-evidence.v2", "created_at": utc_now(), "sdk": args.sdk,
                "package_evidence_sha256": evidence_sha256, "probe_sha256": probe_sha256,
                "deb_sha256": artifact["sha256"], "deb_bytes": artifact["bytes"], "deb_path": artifact["path"],
-               "deb_version": evidence["deb_version"], "package": PACKAGE,
+               "deb_version": evidence["deb_version"], "package": sdk.deb,
                "image_requested": args.runtime_image, "image_id": image["Id"], "image_digests": image.get("RepoDigests", []),
                "architecture": evidence["architecture"], "build_distribution": evidence["distribution"],
                "runtime_distribution": runtime_distribution, "distribution_override_explicit": args.expected_distribution is not None,
                "cross_suite_architecture_all": runtime_distribution != evidence["distribution"], "runtime": args.runtime,
                "isolation": {"fresh_containers": 2, "network": "none", "memory": "512m", "cpus": 2,
-                             "pids_limit": 128, "mounts": ["artifacts:readonly", "installed.cjs:readonly"],
+                             "pids_limit": 128, "mounts": ["artifacts:readonly", "probe:readonly"],
                              "artifact_mount_declared_files_only": True,
                              "source_mount": False, "runtime_installation": False},
                "positive": results["positive"], "negative": results["negative"],

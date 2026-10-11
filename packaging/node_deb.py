@@ -1,4 +1,9 @@
-"""Turn a pinned, natively npm-installed SDK into a library-only Debian package."""
+"""Turn a pinned, natively npm-installed SDK into a library-only Debian package.
+
+Two npm packages ship this way, both as architecture-independent packages: the
+CommonJS SDK `@xgc2/xrpc` (with a private, pinned `ws`) and the ESM client
+`@xgc2/xrpc-client` (no dependencies). A NodeSdk describes one of them.
+"""
 import base64
 import hashlib
 import json
@@ -10,9 +15,33 @@ import tarfile
 
 from support import ROOT, digest, run, write_json
 
-PACKAGE = "node-xgc2-xrpc"
-SDK_PATH = Path("usr/lib/xgc2/node_modules/@xgc2/xrpc")
-IDENTITY_PATH = Path("usr/share/xgc2/xrpc/node/install-identity.json")
+WS_VERSION = "8.22.0"
+WS_URL = "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz"
+
+
+class NodeSdk:
+    """One npm package and the Debian package that carries its installed tree."""
+
+    def __init__(self, language, deb, npm_name, source, description, required, dependencies):
+        self.language = language            # key in the package evidence: "node" or "ts"
+        self.deb = deb                      # Debian package name
+        self.npm_name = npm_name            # npm package name
+        self.source = source                # directory of the sources
+        self.install_path = Path("usr/lib/xgc2/node_modules") / npm_name
+        self.identity_path = Path("usr/share/xgc2/xrpc") / language / "install-identity.json"
+        self.description = description
+        self.required = set(required)       # files the installed tree must contain
+        self.dependencies = dict(dependencies)  # exact runtime dependencies of package.json
+
+
+NODE = NodeSdk(
+    "node", "node-xgc2-xrpc", "@xgc2/xrpc", "node", "Pinned npm SDK and private ws; consumer provides a controlled Node >=20 runtime.",
+    ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "diagnostics.cjs", "diagnostic-worker.cjs", "unix.cjs", "package.json"],
+    {"ws": WS_VERSION})
+TS = NodeSdk(
+    "ts", "node-xgc2-xrpc-client", "@xgc2/xrpc-client", "ts", "ESM http.v1 client for browsers and Node; consumer provides a controlled Node >=20 runtime.",
+    ["dist/index.js", "dist/index.d.ts", "dist/call.js", "dist/events.js", "dist/sse.js", "dist/errors.js", "dist/wire.js", "package.json"], {})
+SDKS = {sdk.language: sdk for sdk in (NODE, TS)}
 
 
 def npm_payload(file):
@@ -62,12 +91,13 @@ def integrity(file):
 
 
 def verify_source_tar(file, source_sha):
+    """A local probe may reuse a published Node npm tarball: bind every file to its commit."""
     if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         raise ValueError("Node source SHA must be a full lowercase commit ID")
     payload = npm_payload(file)
     for name, expected in payload.items():
         # git blob IDs independently bind every actual npm payload file.
-        blob = run(["git", "rev-parse", source_sha + ":node/" + name], cwd=ROOT, capture=True)
+        blob = run(["git", "rev-parse", source_sha + ":" + NODE.source + "/" + name], cwd=ROOT, capture=True)
         with tarfile.open(file) as archive:
             data = archive.extractfile("package/" + name).read()
         actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
@@ -75,25 +105,25 @@ def verify_source_tar(file, source_sha):
             raise ValueError("npm payload differs from exact Node commit: " + name)
 
 
-def verify_installed(root, expected_tar_sha=None):
-    identity = json.loads((root / IDENTITY_PATH).read_text())
+def verify_installed(sdk, root, expected_tar_sha=None):
+    """Check an installed (or staged) tree against its identity receipt."""
+    identity = json.loads((root / sdk.identity_path).read_text())
     if (identity.get("schema"), identity.get("package"), identity.get("installedPath")) != (
-            "xgc2.xrpc.node-deb-identity.v1", PACKAGE, "/" + str(SDK_PATH)):
+            "xgc2.xrpc.node-deb-identity.v1", sdk.deb, "/" + str(sdk.install_path)):
         raise ValueError("invalid installed Node Deb identity")
     if expected_tar_sha and identity["npmTarSha256"] != expected_tar_sha:
         raise ValueError("installed npm tar identity mismatch")
-    if regular_hashes(root / SDK_PATH) != identity["files"]:
+    if regular_hashes(root / sdk.install_path) != identity["files"]:
         raise ValueError("installed Node Deb payload differs from identity")
-    sdk = json.loads((root / SDK_PATH / "package.json").read_text())
-    ws = json.loads((root / SDK_PATH / "node_modules/ws/package.json").read_text())
-    if (sdk["name"], sdk["version"], sdk["engines"], sdk["dependencies"]) != (
-            "@xgc2/xrpc", identity["sdkVersion"], {"node": ">=20"}, {"ws": "8.22.0"}):
+    manifest = json.loads((root / sdk.install_path / "package.json").read_text())
+    if (manifest["name"], manifest["version"], manifest["engines"], manifest.get("dependencies", {})) != (
+            sdk.npm_name, identity["sdkVersion"], {"node": ">=20"}, sdk.dependencies):
         raise ValueError("installed SDK runtime/dependency identity differs")
-    if (ws["name"], ws["version"]) != ("ws", "8.22.0"):
-        raise ValueError("installed private ws identity differs")
-    required = {"index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "policy.cjs",
-                "diagnostics.cjs", "diagnostic-worker.cjs", "runtime-policy.json", "package.json"}
-    if not required <= set(identity["files"]):
+    if "ws" in sdk.dependencies:
+        ws = json.loads((root / sdk.install_path / "node_modules/ws/package.json").read_text())
+        if (ws["name"], ws["version"]) != ("ws", WS_VERSION):
+            raise ValueError("installed private ws identity differs")
+    if not sdk.required <= set(identity["files"]):
         raise ValueError("installed SDK lacks a required runtime or type asset")
     return identity
 
@@ -102,7 +132,7 @@ def locked_ws_archive(lock_file, work):
     # Resolve the committed archive URL directly: an offline cache need not contain
     # the registry's mutable package manifest.
     ws_lock = json.loads(lock_file.read_text())["packages"]["node_modules/ws"]
-    if ws_lock["version"] != "8.22.0" or ws_lock["resolved"] != "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz":
+    if ws_lock["version"] != WS_VERSION or ws_lock["resolved"] != WS_URL:
         raise ValueError("unexpected ws lock identity")
     packed = json.loads(run(["npm", "pack", ws_lock["resolved"], "--offline", "--ignore-scripts", "--json",
                              "--pack-destination", work], cwd=work, capture=True))[0]
@@ -112,74 +142,75 @@ def locked_ws_archive(lock_file, work):
     return ws_tar, ws_lock
 
 
-def build_node_deb(tarball, lock_file, work, out, version, sdk_version, epoch, source_sha=None):
+def copyright_text(sdk):
+    text = ("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"
+            "\nFiles: " + "/" + str(sdk.install_path) + "/*\nCopyright: XGC Team\nLicense: Apache-2.0\n"
+            " Licensed under the Apache License, Version 2.0. On Debian systems the full\n"
+            " text is in /usr/share/common-licenses/Apache-2.0.\n")
+    if "ws" in sdk.dependencies:
+        text += ("\nFiles: /" + str(sdk.install_path) + "/node_modules/ws/*\n"
+                 "Copyright: 2011 Einar Otto Stangvik <einaros@gmail.com>\n"
+                 "License: MIT\n See /" + str(sdk.install_path) + "/node_modules/ws/LICENSE.\n")
+    return text
+
+
+def build_node_deb(sdk, tarball, lock_file, work, out, version, sdk_version, epoch, source_sha=None):
     # Preprovisioned npm cache only; no registry access, lifecycle scripts or native peers.
-    ws_tar, ws_lock = locked_ws_archive(lock_file, work)
     payload = npm_payload(tarball)
-    ws_payload = npm_payload(ws_tar)
-    consumer = work / "node-deb-npm-install"
+    consumer = work / (sdk.language + "-deb-npm-install")
     consumer.mkdir()
-    write_json(consumer / "package.json", {"private": True, "dependencies": {
-        "@xgc2/xrpc": "file:" + str(tarball.resolve()), "ws": "file:" + str(ws_tar.resolve())}})
+    dependencies = {sdk.npm_name: "file:" + str(tarball.resolve())}
+    ws_payload = ws_lock = None
+    if "ws" in sdk.dependencies:
+        ws_tar, ws_lock = locked_ws_archive(lock_file, work)
+        ws_payload = npm_payload(ws_tar)
+        dependencies["ws"] = "file:" + str(ws_tar.resolve())
+    write_json(consumer / "package.json", {"private": True, "dependencies": dependencies})
     run(["npm", "install", "--offline", "--ignore-scripts", "--omit=dev", "--omit=optional",
          "--no-audit", "--no-fund"], cwd=consumer, env={"npm_config_engine_strict": "true"})
-    installed = consumer / "node_modules/@xgc2/xrpc"
-    ws = consumer / "node_modules/ws"
-    if regular_hashes(installed) != payload or regular_hashes(ws) != ws_payload:
-        raise ValueError("native npm installation differs from pinned archives")
+    installed = consumer / "node_modules" / sdk.npm_name
+    if regular_hashes(installed) != payload:
+        raise ValueError("native npm installation differs from the pinned archive")
     npm_lock = json.loads((consumer / "package-lock.json").read_text())["packages"]
-    if set(npm_lock) != {"", "node_modules/@xgc2/xrpc", "node_modules/ws"}:
+    expected = {"", "node_modules/" + sdk.npm_name}
+    if ws_lock:
+        expected.add("node_modules/ws")
+    if set(npm_lock) != expected:
         raise ValueError("unexpected npm-installed dependency")
-    if (npm_lock["node_modules/@xgc2/xrpc"]["integrity"] != integrity(tarball) or
-            npm_lock["node_modules/ws"]["integrity"] != ws_lock["integrity"]):
+    if npm_lock["node_modules/" + sdk.npm_name]["integrity"] != integrity(tarball):
         raise ValueError("installed npm lock integrity mismatch")
-    stage = work / "deb-roots" / PACKAGE
-    target = stage / SDK_PATH
+    stage = work / "deb-roots" / sdk.deb
+    target = stage / sdk.install_path
     target.parent.mkdir(parents=True)
     shutil.copytree(installed, target)
-    # Preserve the complete installed private dependency; no npm/network is needed on target.
-    shutil.copytree(ws, target / "node_modules/ws")
-    (stage / IDENTITY_PATH.parent).mkdir(parents=True)
-    doc = stage / "usr/share/doc" / PACKAGE
+    identity = {"schema": "xgc2.xrpc.node-deb-identity.v1", "package": sdk.deb,
+                "debVersion": version, "sdkVersion": sdk_version, "installedPath": "/" + str(sdk.install_path),
+                "npmTarSha256": digest(tarball), "nodeSourceSha": source_sha,
+                "runtime": {"node": ">=20", "owner": "consumer", "includesInterpreter": False}}
+    if ws_lock:
+        ws = consumer / "node_modules/ws"
+        if regular_hashes(ws) != ws_payload or npm_lock["node_modules/ws"]["integrity"] != ws_lock["integrity"]:
+            raise ValueError("native npm installation differs from the pinned ws archive")
+        # Preserve the complete installed private dependency; no npm/network is needed on target.
+        shutil.copytree(ws, target / "node_modules/ws")
+        identity.update({"wsVersion": WS_VERSION, "wsIntegrity": ws_lock["integrity"]})
+    identity["files"] = regular_hashes(target)
+    (stage / sdk.identity_path.parent).mkdir(parents=True)
+    write_json(stage / sdk.identity_path, identity)
+    doc = stage / "usr/share/doc" / sdk.deb
     doc.mkdir(parents=True)
-    identity = {"schema": "xgc2.xrpc.node-deb-identity.v1", "package": PACKAGE,
-        "debVersion": version, "sdkVersion": sdk_version, "installedPath": "/" + str(SDK_PATH),
-        "npmTarSha256": digest(tarball), "nodeSourceSha": source_sha,
-        "wsVersion": "8.22.0", "wsIntegrity": ws_lock["integrity"],
-        "runtime": {"node": ">=20", "owner": "consumer", "includesInterpreter": False},
-        "files": regular_hashes(target)}
-    write_json(stage / IDENTITY_PATH, identity)
-    (doc / "copyright").write_text("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"
-        "\nFiles: /usr/lib/xgc2/node_modules/@xgc2/xrpc/*\nCopyright: XGC Team\nLicense: MIT\n"
-        " Permission is hereby granted, free of charge, to any person obtaining a copy\n"
-        " of this software and associated documentation files (the Software), to deal\n"
-        " in the Software without restriction, including without limitation the rights\n"
-        " to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n"
-        " copies of the Software, and to permit persons to whom the Software is\n"
-        " furnished to do so, subject to the following conditions:\n .\n"
-        " The above copyright notice and this permission notice shall be included in\n"
-        " all copies or substantial portions of the Software.\n .\n"
-        " THE SOFTWARE IS PROVIDED AS IS, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n"
-        " IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n"
-        " FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL\n"
-        " THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n"
-        " LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING\n"
-        " FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER\n"
-        " DEALINGS IN THE SOFTWARE.\n\nFiles: /usr/lib/xgc2/node_modules/@xgc2/xrpc/node_modules/ws/*\n"
-        "Copyright: 2011 Einar Otto Stangvik <einaros@gmail.com>\n"
-        "License: MIT\n See /usr/lib/xgc2/node_modules/@xgc2/xrpc/node_modules/ws/LICENSE.\n")
+    (doc / "copyright").write_text(copyright_text(sdk))
     control = stage / "DEBIAN"
     control.mkdir()
-    (control / "control").write_text("Package: " + PACKAGE + "\nVersion: " + version +
+    (control / "control").write_text("Package: " + sdk.deb + "\nVersion: " + version +
         "\nArchitecture: all\nMulti-Arch: foreign\nSection: javascript\nPriority: optional\n"
         "Maintainer: XGC Team <apt@example.com>\nDepends: ca-certificates\n"
-        "Description: XGC2 XRPC installed Node library\n"
-        " Pinned npm SDK and private ws; consumer provides a controlled Node >=20 runtime.\n")
-    verify_installed(stage, digest(tarball))
+        "Description: XGC2 XRPC " + sdk.npm_name + " installed Node library\n " + sdk.description + "\n")
+    verify_installed(sdk, stage, digest(tarball))
     for path in [stage] + sorted(stage.rglob("*")):
         os.chmod(path, 0o755 if path.is_dir() else 0o644)
         os.utime(path, (epoch, epoch))
-    deb = out / (PACKAGE + "_" + version + "_all.deb")
+    deb = out / (sdk.deb + "_" + version + "_all.deb")
     run(["dpkg-deb", "--root-owner-group", "--build", stage, deb], env={"SOURCE_DATE_EPOCH": str(epoch)})
-    return {"kind": "node-deb", "path": deb.name, "package": PACKAGE, "architecture": "all",
+    return {"kind": sdk.language + "-deb", "path": deb.name, "package": sdk.deb, "architecture": "all",
             "npm_tar_sha256": identity["npmTarSha256"], "node_source_sha": source_sha}

@@ -1,6 +1,7 @@
 #include <xgc2/xrpc/json_http.hpp>
 #include <xgc2/xrpc/bootstrap.hpp>
 #include <xgc2/xrpc/diagnostics.hpp>
+#include <xgc2/xrpc/method_http.hpp>
 #include <condition_variable>
 #include <mutex>
 #ifdef XRPC_CHECK_GRPC
@@ -17,6 +18,22 @@ int main() {
   } catch (const xgc2::xrpc::BootstrapError &error) {
     if (error.code != xgc2::xrpc::BootstrapErrorCode::InvalidInput) return 8;
   }
+  // The method router (method.hpp comes with the udp component, its http adapter with
+  // this one): a call under /v1/call/ reaches its handler, any other target is left alone.
+  xgc2::xrpc::MethodRouter router;
+  bool echoed = false;
+  router.add("probe.v1/Echo", [&echoed](xgc2::xrpc::MethodRequest request, xgc2::xrpc::MethodReply reply) {
+    echoed = request.body == "{}";
+    reply.complete(request.body);
+  });
+  xgc2::xrpc::HttpRequest routed;
+  routed.method = "POST";
+  routed.target = "/v1/call/probe.v1/Echo";
+  routed.body = "{}";
+  routed.headers.emplace_back("Content-Type", "application/json");
+  if (!xgc2::xrpc::handle_method_call(router, routed, xgc2::xrpc::HttpReply{}) || !echoed) return 11;
+  routed.target = "/v1/describe";
+  if (xgc2::xrpc::handle_method_call(router, routed, xgc2::xrpc::HttpReply{})) return 12;
   const xgc2::xrpc::HttpLimits limits;
   const auto instance = xgc2::xrpc::new_instance_id();
   xgc2::xrpc::HttpClient client("/unused-installed-sdk-probe.sock", limits, instance);

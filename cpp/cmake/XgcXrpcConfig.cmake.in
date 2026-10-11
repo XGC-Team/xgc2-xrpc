@@ -1,4 +1,9 @@
 @PACKAGE_INIT@
+# This file runs under the policies of the project that calls find_package, which can be
+# as old as CMake 3.0 (catkin packages on ROS Melodic and Noetic ask for 3.0.2), and
+# IN_LIST needs CMP0057.
+cmake_policy(PUSH)
+cmake_policy(SET CMP0057 NEW)
 set(XgcXrpc_FOUND TRUE)
 unset(XgcXrpc_NOT_FOUND_MESSAGE)
 
@@ -124,3 +129,4 @@ unset(_XgcXrpc_default_components)
 unset(_XgcXrpc_component)
 unset(_XgcXrpc_export)
 unset(_XgcXrpc_export_file)
+cmake_policy(POP)
