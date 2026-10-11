@@ -877,12 +877,24 @@ fn runtime_execution_rejects_late_completion_on_its_own_blocked_loop() {
 
 #[test]
 fn async_client_does_not_accept_ready_receipt_after_caller_deadline() {
-    use std::{future::Future, task::Poll};
+    use std::{
+        future::Future,
+        task::{Context, Wake, Waker},
+    };
+
+    struct ReceiptReady(mpsc::Sender<()>);
+    impl Wake for ReceiptReady {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
 
     let mut runtime = Runtime::new(RuntimeOptions::default()).unwrap();
     let dir = directory();
     let path = dir.path().join("rpc.sock");
     let (completed, receipt) = std::sync::mpsc::channel();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let release = gate.clone();
     let mut host = Host::bind(
         &runtime,
         &path,
@@ -890,9 +902,9 @@ fn async_client_does_not_accept_ready_receipt_after_caller_deadline() {
         Limits::default(),
         false,
         handler(move |_, _, value| {
-            let completed = completed.clone();
+            let gate = release.clone();
             async move {
-                completed.send(()).unwrap();
+                gate.notified().await;
                 Ok(value)
             }
         }),
@@ -904,21 +916,22 @@ fn async_client_does_not_accept_ready_receipt_after_caller_deadline() {
         .build()
         .unwrap();
     let result = caller.block_on(async {
-        let request = client.call("/echo", json!({"ok":true}), Duration::from_millis(100));
+        let budget = Duration::from_secs(1);
+        let request = client.call("/echo", json!({"ok":true}), budget);
         tokio::pin!(request);
-        std::future::poll_fn(|cx| match request.as_mut().poll(cx) {
-            Poll::Pending => Poll::Ready(()),
-            Poll::Ready(_) => panic!("native request must first enqueue on its owner"),
-        })
-        .await;
-        // Domain execution really completed while the independent caller loop
-        // was undriven; resuming with a ready receipt must not restart its budget.
-        receipt.recv_timeout(Duration::from_secs(1)).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
+        let waker = Waker::from(Arc::new(ReceiptReady(completed)));
+        let mut context = Context::from_waker(&waker);
+        // Hold the handler until the first poll has registered its receipt waker.
+        assert!(request.as_mut().poll(&mut context).is_pending());
+        gate.notify_one();
+        // The receipt itself wakes us while the independent caller loop is
+        // undriven; resuming after its deadline must not restart the budget.
+        receipt.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(budget + Duration::from_millis(50));
         request.await
     });
     let error = result.unwrap_err();
-    assert_ne!(error.disposition, Disposition::NotSent);
+    assert_eq!(error.disposition, Disposition::ResponseReceived);
     assert!(error.message.contains("deadline"));
     drop(caller);
     drop(client);
