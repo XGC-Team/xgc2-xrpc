@@ -219,7 +219,7 @@ void private_input_and_application() {
   write_private(path, std::string(16 * 1024 + 1, ' '));
   expect_error(BootstrapErrorCode::UnsafeFile, [&] { (void)loadBootstrapInput(path); });
 
-  const std::string opaque = R"({"text":"机器人 \uD83D\uDE80","number":1.25,"yes":true,"none":null,"items":[false,2,"s"]})";
+  const std::string opaque = R"({"text":"héllo wörld ✓ \uD83D\uDE80","number":1.25,"yes":true,"none":null,"items":[false,2,"s"]})";
   write_private(path, document(binding, "{}", opaque));
   assert(loadBootstrapInput(path).application_json() == opaque);
   const auto nested = [](unsigned count) { return std::string(count, '[') + "true" + std::string(count, ']'); };
@@ -398,8 +398,8 @@ void credentials_and_roles() {
   });
   assert(native_calls == 1);
   const auto live = std::chrono::steady_clock::now() + 1s;
-  const std::array<std::string_view, 1> correct{"Bearer ephemeral.token=="}, wrong{"Bearer other"};
-  const std::array<std::string_view, 2> duplicate{correct.front(), correct.front()};
+  const std::vector<std::string_view> correct{"Bearer ephemeral.token=="}, wrong{"Bearer other"};
+  const std::vector<std::string_view> duplicate{correct.front(), correct.front()};
   assert(server.authorize(correct, live));
   assert(!server.authorize({}, live) && !server.authorize(wrong, live) && !server.authorize(duplicate, live));
   assert(!server.authorize(correct, std::chrono::steady_clock::time_point::max()));

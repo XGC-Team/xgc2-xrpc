@@ -18,8 +18,8 @@ const applicationErrorReason = "APPLICATION_ERROR"
 type admittedIdentity struct{ requestID, instanceID string }
 type admissionKey struct{}
 
-// Install identity once across the native managed gate and BoundService chain.
-// Each later chain can tighten an unbound instance without duplicating headers.
+// Install identity once across the native managed gate and any later stage.
+// Each later stage can tighten an unbound instance without duplicating headers.
 func admittedContext(ctx context.Context, instanceID string) context.Context {
 	previous, installed := ctx.Value(admissionKey{}).(admittedIdentity)
 	ids := metadata.ValueFromIncomingContext(ctx, RequestIDMetadata)

@@ -2,11 +2,18 @@
 
 // Run from the installed consumer's directory so ordinary ancestor lookup owns
 // package resolution. The caller also disables runtime global search paths.
+//
+//   node installed.cjs <installed SDK directory> <expected SDK version> [--missing-worker]
+//
+// Prints one JSON report on success. With --missing-worker the diagnostics worker
+// file is expected to be absent and the probe verifies that this is a bounded,
+// reported failure rather than a hang or a silent success.
 delete process.env.NODE_PATH;
 delete process.env.NODE_OPTIONS;
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const runtime = {
@@ -14,7 +21,7 @@ const runtime = {
   node: process.versions.node,
   bun: process.versions.bun ?? null,
 };
-const schema = "xgc2.xrpc.node-installed-probe.v1";
+const schema = "xgc2.xrpc.node-installed-probe.v2";
 let phase = "arguments";
 let missingWorker = false;
 
@@ -24,9 +31,10 @@ function regularReadable(file) {
 }
 
 async function main() {
-  const [expectedSdkArgument, option, ...extra] = process.argv.slice(2);
+  const [expectedSdkArgument, expectedVersion, option, ...extra] = process.argv.slice(2);
   assert.equal(extra.length, 0);
   assert.ok(expectedSdkArgument && path.isAbsolute(expectedSdkArgument));
+  assert.match(expectedVersion ?? "", /^[0-9]+\.[0-9]+\.[0-9]+$/);
   assert.ok(option === undefined || option === "--missing-worker");
   missingWorker = option === "--missing-worker";
   const expectedSdk = fs.realpathSync(expectedSdkArgument);
@@ -41,14 +49,18 @@ async function main() {
   const sdkPackage = JSON.parse(fs.readFileSync(sdkPackageFile, "utf8"));
   const wsPackage = JSON.parse(fs.readFileSync(wsPackageFile, "utf8"));
   assert.equal(sdkPackage.name, "@xgc2/xrpc");
-  assert.equal(sdkPackage.version, "0.1.0");
+  assert.equal(sdkPackage.version, expectedVersion);
+  assert.equal(sdkPackage.license, "Apache-2.0");
   assert.equal(wsPackage.name, "ws");
   assert.equal(wsPackage.version, "8.22.0");
   assert.equal(sdkPackage.dependencies.ws, "8.22.0");
 
   phase = "installed-runtime-files";
-  for (const filename of ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "policy.cjs", "diagnostics.cjs", "runtime-policy.json"]) {
+  for (const filename of ["index.cjs", "index.d.cts", "client.cjs", "bootstrap.cjs", "diagnostics.cjs", "unix.cjs"]) {
     regularReadable(path.join(expectedSdk, filename));
+  }
+  for (const removed of ["policy.cjs", "runtime-policy.json"]) {
+    assert.equal(fs.existsSync(path.join(expectedSdk, removed)), false, removed);
   }
   const workerFile = path.join(expectedSdk, "diagnostic-worker.cjs");
   if (missingWorker) {
@@ -61,26 +73,49 @@ async function main() {
   phase = "public-exports";
   const sdk = require("@xgc2/xrpc");
   const publicFunctions = [
-    "createHTTPHost", "createFetchHost", "createRPCHost", "createBoundHTTPHost",
+    "createHTTPHost", "createFetchHost", "createRPCHost", "createBoundHTTPHost", "newInstanceId",
     "BootstrapBinding", "readBootstrapBinding", "loadBootstrapInput",
     "Diagnostics", "DiagnosticCloseError", "DiagnosticSinkError",
-    "proxyWebSocket", "resolvePolicy", "PolicyError", "HTTPClient", "TransportError",
+    "proxyWebSocket", "HTTPClient", "TransportError",
   ];
   for (const name of publicFunctions) assert.equal(typeof sdk[name], "function", name);
+  for (const name of ["resolvePolicy", "derivePolicy", "PolicyError"]) assert.equal(sdk[name], undefined, name);
   for (const name of ["serviceRef", "resolveCredentials"]) assert.equal(typeof sdk.BootstrapBinding.prototype[name], "function", name);
 
-  phase = "diagnostic-policy-startup";
-  const diagnostics = new sdk.Diagnostics({ sink: { kind: "supervisor_stderr", rotationOwner: "supervisor" } });
-  const policy = sdk.resolvePolicy({ environment: { XGC2_XRPC_LOG_LEVEL: "debug" }, diagnostics });
+  phase = "unix-host-and-client";
+  // A real fenced call over a private Unix socket with the installed code.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "xrpc-installed-"));
+  const socket = path.join(directory, "control.sock");
+  const instanceId = sdk.newInstanceId();
+  assert.match(instanceId, /^[0-9a-f]{32}$/);
+  const host = sdk.createRPCHost((_request, response, context) => {
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ requestId: context.requestId }));
+  }, { instanceId, unixPath: socket });
+  const client = new sdk.HTTPClient({ localTarget: "local" });
+  try {
+    await host.listen();
+    assert.equal(fs.lstatSync(socket).mode & 0o777, 0o600);
+    const reference = { target_id: "local", service: "probe", api_version: "v1", instance_id: instanceId, profile: "http.v1", endpoint: { kind: "unix", address: socket } };
+    const reply = await client.call(reference, "/v1/echo", { timeoutMs: 2000, requestId: "probe:1" });
+    assert.equal(reply.status, 200);
+    assert.equal(reply.disposition, "response_received");
+    assert.equal(JSON.parse(reply.body).requestId, "probe:1");
+    await assert.rejects(client.call({ ...reference, instance_id: "stale" }, "/v1/echo", { timeoutMs: 2000 }),
+      (error) => error.code === "conflict" && error.disposition === "outcome_unknown");
+  } finally {
+    client.close();
+    await host.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+
+  phase = "diagnostics-startup";
+  const diagnostics = new sdk.Diagnostics({ sink: { kind: "supervisor_stderr", rotationOwner: "supervisor" }, level: "debug" });
   const initial = diagnostics.status();
-  assert.equal(policy.diagnostics, diagnostics);
-  assert.equal(policy.revision, 1);
-  assert.equal(policy.fields.LOG_LEVEL.value, "debug");
-  assert.equal(policy.fields.LOG_LEVEL.source, "environment");
   assert.equal(initial.state, "running");
   assert.equal(initial.workerStarted, false);
-  assert.equal(initial.policyRevision, 1);
   assert.equal(initial.level, "debug");
+  assert.equal(initial.format, "json");
   assert.equal(initial.sink.backend, "supervisor_stderr");
   assert.equal(initial.sink.rotationOwner, "supervisor");
   assert.equal(initial.sink.opensFiles, false);
@@ -110,22 +145,11 @@ async function main() {
     return { schema, ok: true, mode: "missing-worker", negative: { verified: true, emit: emitted, closeErrorCode: "unavailable" }, runtime, resolvedPaths, packages, status };
   }
 
-  phase = "diagnostic-policy-cas";
+  phase = "worker-ack-and-close";
   const started = diagnostics.status();
   assert.equal(started.workerStarted, true);
   assert.equal(started.workerAlive, true);
   assert.ok(started.pendingRecords >= 1);
-  const changed = policy.update({ LOG_LEVEL: "warn" }, { expectedRevision: 1 });
-  assert.equal(changed.revision, 2);
-  assert.equal(policy.revision, 2);
-  assert.equal(policy.fields.LOG_LEVEL.value, "warn");
-  assert.equal(policy.fields.LOG_LEVEL.source, "administrative");
-  assert.equal(diagnostics.status().level, "warn");
-  assert.throws(() => policy.update({ LOG_LEVEL: "error" }, { expectedRevision: 1 }), (error) => error instanceof sdk.PolicyError && error.field === "revision");
-  assert.equal(policy.revision, 2);
-  assert.equal(policy.fields.LOG_LEVEL.value, "warn");
-
-  phase = "worker-ack-and-close";
   await diagnostics.close({ timeoutMs: 1000 });
   const status = diagnostics.status();
   assert.equal(status.state, "closed");
@@ -138,9 +162,8 @@ async function main() {
   assert.equal(status.workerFailures, 0);
   assert.equal(status.sinkFailures, 0);
   assert.equal(status.eventCounts.handler_failed, 1);
-  assert.equal(status.policyRevision, 2);
-  assert.equal(status.level, "warn");
-  return { schema, ok: true, mode: "positive", runtime, resolvedPaths, packages, policy: { revision: policy.revision, level: policy.fields.LOG_LEVEL.value, staleRevisionRejected: true }, status };
+  assert.equal(status.level, "debug");
+  return { schema, ok: true, mode: "positive", runtime, resolvedPaths, packages, status };
 }
 
 main().then((report) => {

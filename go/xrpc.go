@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const HTTP = "http.v1"
 const GRPC = "grpc.v1"
+const UDP = "udp.v1"
 
 type Endpoint struct {
 	Kind    string `json:"kind"`
@@ -40,6 +42,14 @@ func (e Endpoint) Validate() error {
 		if _, _, err := net.SplitHostPort(e.Address); err != nil {
 			return fmt.Errorf("xrpc: TLS endpoint: %w", err)
 		}
+	case "udp":
+		host, port, err := net.SplitHostPort(e.Address)
+		if err != nil || host == "" {
+			return errors.New("xrpc: UDP endpoint must be host:port (IPv6 literals in brackets)")
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+			return errors.New("xrpc: UDP endpoint port must be canonical 1..65535")
+		}
 	default:
 		return fmt.Errorf("xrpc: unsupported endpoint kind %q", e.Kind)
 	}
@@ -53,6 +63,10 @@ type ServiceRef struct {
 	InstanceID string   `json:"instance_id"`
 	Profile    string   `json:"profile"`
 	Endpoint   Endpoint `json:"endpoint"`
+	// KeyID names the udp.v1 HMAC key that authenticates calls to this service.
+	// Zero means unspecified: the caller's key ring must then hold exactly one
+	// key. It must be zero for other profiles.
+	KeyID uint32 `json:"key_id,omitempty"`
 }
 
 func (r ServiceRef) Validate() error {
@@ -64,7 +78,7 @@ func (r ServiceRef) Validate() error {
 	if r.InstanceID != "" && !ValidID(r.InstanceID) {
 		return errors.New("xrpc: instance identity must be canonical")
 	}
-	if r.Profile != HTTP && r.Profile != GRPC {
+	if r.Profile != HTTP && r.Profile != GRPC && r.Profile != UDP {
 		return errors.New("xrpc: unsupported profile")
 	}
 	if err := r.Endpoint.Validate(); err != nil {
@@ -76,7 +90,30 @@ func (r ServiceRef) Validate() error {
 	if r.Profile == GRPC && r.Endpoint.Kind == "https" {
 		return errors.New("xrpc: gRPC TLS endpoint must use host:port")
 	}
+	if (r.Profile == UDP) != (r.Endpoint.Kind == "udp") {
+		return errors.New("xrpc: udp.v1 requires a udp endpoint and no other profile accepts one")
+	}
+	if r.Profile == UDP && r.InstanceID != "" && !validUDPInstance(r.InstanceID) {
+		return errors.New("xrpc: udp.v1 instance identity must be 32 lowercase hexadecimal digits")
+	}
+	if r.Profile != UDP && r.KeyID != 0 {
+		return errors.New("xrpc: key identity applies to udp.v1 only")
+	}
 	return nil
+}
+
+// validUDPInstance reports whether id is the lowercase hexadecimal form of a
+// 128-bit udp.v1 instance identity, the form NewInstanceID produces.
+func validUDPInstance(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for i := range id {
+		if c := id[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateInternal rejects unbound discovery references for internal calls.
@@ -155,9 +192,15 @@ type Call struct {
 	RequestID string          `json:"request_id"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
+
+// Result is what a Caller got back. Status is the HTTP status for http.v1, the
+// equivalent of the answer's code for udp.v1 and zero for grpc.v1; Payload is
+// the JSON body. InstanceID is the instance that answered, when the transport
+// reports it, so a caller that sent an unpinned call can pin the next one.
 type Result struct {
-	Status  int             `json:"status,omitempty"`
-	Payload json.RawMessage `json:"payload"`
+	Status     int             `json:"status,omitempty"`
+	Payload    json.RawMessage `json:"payload"`
+	InstanceID string          `json:"instance_id,omitempty"`
 }
 type Caller interface {
 	Call(context.Context, Call) (Result, error)
@@ -167,42 +210,61 @@ type Observer interface {
 }
 
 // Dispatcher is immutable local composition, not a registry or discovery API.
+// It composes one Caller per profile: httpx.Profile for http.v1,
+// grpcx.Profile for grpc.v1 and udpx.Profile for udp.v1.
 type Dispatcher struct{ profiles map[string]Caller }
 
 func NewDispatcher(profiles map[string]Caller) (*Dispatcher, error) {
 	copy := make(map[string]Caller, len(profiles))
 	for profile, caller := range profiles {
-		if (profile != HTTP && profile != GRPC) || caller == nil {
+		if (profile != HTTP && profile != GRPC && profile != UDP) || caller == nil {
 			return nil, errors.New("xrpc: invalid profile caller")
 		}
 		copy[profile] = caller
 	}
 	return &Dispatcher{profiles: copy}, nil
 }
-func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, error) {
+
+// caller validates call, gives it a fresh request identity when it has none and
+// returns the Caller of its profile.
+func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, Call, error) {
 	if _, err := Remaining(ctx); err != nil {
-		return nil, Failure(Code(err), NotSent, err)
+		return nil, call, Failure(Code(err), NotSent, err)
 	}
-	if err := call.Service.ValidateInternal(); err != nil {
-		return nil, Failure("invalid_argument", NotSent, err)
+	// A udp.v1 reference comes from configuration and may leave the instance
+	// empty; the first answer reveals it. Internal http.v1 and grpc.v1
+	// references are always pinned.
+	check := call.Service.ValidateInternal
+	if call.Service.Profile == UDP {
+		check = call.Service.Validate
+	}
+	if err := check(); err != nil {
+		return nil, call, Failure("invalid_argument", NotSent, err)
+	}
+	if call.RequestID == "" {
+		id, err := NewRequestID()
+		if err != nil {
+			return nil, call, Failure("internal", NotSent, err)
+		}
+		call.RequestID = id
 	}
 	if call.Method == "" || !ValidID(call.RequestID) {
-		return nil, Failure("invalid_argument", NotSent, errors.New("xrpc: method and request ID required"))
+		return nil, call, Failure("invalid_argument", NotSent, errors.New("xrpc: method and canonical request ID required"))
 	}
 	if d == nil || d.profiles[call.Service.Profile] == nil {
-		return nil, Failure("unavailable", NotSent, errors.New("xrpc: profile is not composed"))
+		return nil, call, Failure("unavailable", NotSent, errors.New("xrpc: profile is not composed"))
 	}
-	return d.profiles[call.Service.Profile], nil
+	return d.profiles[call.Service.Profile], call, nil
 }
 func (d *Dispatcher) Call(ctx context.Context, call Call) (Result, error) {
-	caller, err := d.caller(ctx, call)
+	caller, call, err := d.caller(ctx, call)
 	if err != nil {
 		return Result{}, err
 	}
 	return caller.Call(ctx, call)
 }
 func (d *Dispatcher) Observe(ctx context.Context, call Call, emit func(Result) error) error {
-	caller, err := d.caller(ctx, call)
+	caller, call, err := d.caller(ctx, call)
 	if err != nil {
 		return err
 	}

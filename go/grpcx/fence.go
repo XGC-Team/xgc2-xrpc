@@ -33,10 +33,6 @@ func WithRequestID(ctx context.Context, requestID string) (context.Context, erro
 	return metadata.NewOutgoingContext(ctx, md), nil
 }
 
-func validateRequestMetadata(ctx context.Context, instanceID string) error {
-	return validateRequestMetadataFor(ctx, instanceID, false)
-}
-
 func validateRequestMetadataFor(ctx context.Context, instanceID string, discovery bool) error {
 	ids := metadata.ValueFromIncomingContext(ctx, RequestIDMetadata)
 	if len(ids) != 1 || !xrpc.ValidID(ids[0]) {
@@ -67,12 +63,9 @@ func validateAuthMetadata(md metadata.MD) error {
 	return nil
 }
 
-func clientMetadata(ctx context.Context, ref xrpc.ServiceRef, auth metadata.MD, boundAuthorization bool) (context.Context, error) {
+func clientMetadata(ctx context.Context, ref xrpc.ServiceRef, auth metadata.MD) (context.Context, error) {
 	md, _ := metadata.FromOutgoingContext(ctx)
 	md = md.Copy()
-	if boundAuthorization && len(md.Get("authorization")) != 0 {
-		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: caller authorization belongs to bootstrap owner"))
-	}
 	for name := range md {
 		if name != strings.ToLower(name) {
 			return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: metadata names must be canonical lowercase"))
@@ -104,71 +97,6 @@ func clientMetadata(ctx context.Context, ref xrpc.ServiceRef, auth metadata.MD, 
 		md.Set(InstanceIDMetadata, ref.InstanceID)
 	}
 	return metadata.NewOutgoingContext(ctx, md), nil
-}
-
-// BoundService applies instance fencing and finite admission to every unary
-// and stream handler. Public gateways can explicitly omit instance binding.
-func BoundService(instanceID string, maximum time.Duration, inFlight int) []grpc.ServerOption {
-	if maximum <= 0 {
-		maximum = 30 * time.Second
-	}
-	if inFlight <= 0 {
-		inFlight = 64
-	}
-	slots := make(chan struct{}, inFlight)
-	admit := func(ctx context.Context, stream bool) (context.Context, func(), error) {
-		if err := validateRequestMetadata(ctx, instanceID); err != nil {
-			return nil, nil, err
-		}
-		remaining, err := xrpc.Remaining(ctx)
-		if err != nil {
-			return nil, nil, status.Error(codes.InvalidArgument, "finite caller deadline required")
-		}
-		// grpc-go owns the stream's transport context. A derived Context cannot
-		// interrupt its RecvMsg/SendMsg; only accept native budgets we can honor.
-		if stream && remaining > maximum {
-			return nil, nil, status.Error(codes.InvalidArgument, "caller deadline exceeds host maximum")
-		}
-		select {
-		case slots <- struct{}{}:
-		default:
-			return nil, nil, status.Error(codes.ResourceExhausted, "host concurrency exhausted")
-		}
-		if !stream {
-			bounded, cancel := context.WithTimeout(ctx, maximum)
-			return bounded, func() { <-slots; cancel() }, nil
-		}
-		return ctx, func() { <-slots }, nil
-	}
-	return []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
-			ctx, release, err := admit(ctx, false)
-			if err != nil {
-				return nil, err
-			}
-			defer release()
-			ctx = admittedContext(ctx, instanceID)
-			result, err := next(ctx, request)
-			if err == nil && ctx.Err() != nil {
-				return nil, status.FromContextError(ctx.Err()).Err()
-			}
-			return result, err
-		}),
-		grpc.ChainStreamInterceptor(func(server any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, next grpc.StreamHandler) error {
-			ctx, release, err := admit(stream.Context(), true)
-			if err != nil {
-				return err
-			}
-			defer release()
-			ctx = admittedContext(ctx, instanceID)
-			stream = &readyStream{ServerStream: stream}
-			err = next(server, &boundedStream{ServerStream: stream, ctx: ctx})
-			if err == nil && ctx.Err() != nil {
-				return status.FromContextError(ctx.Err()).Err()
-			}
-			return err
-		}),
-	}
 }
 
 type boundedStream struct {
@@ -239,7 +167,7 @@ func clientUnary(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, b
 		ctx, cancel := context.WithTimeout(ctx, limits.MaxCallTime)
 		defer cancel()
 		var err error
-		ctx, err = clientMetadata(ctx, ref, limits.Metadata, limits.boundAuthorization)
+		ctx, err = clientMetadata(ctx, ref, limits.Metadata)
 		if err != nil {
 			return err
 		}
@@ -277,7 +205,7 @@ func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, 
 		}
 		ctx, budgetCancel := context.WithTimeout(ctx, limits.MaxCallTime)
 		var err error
-		ctx, err = clientMetadata(ctx, ref, limits.Metadata, limits.boundAuthorization)
+		ctx, err = clientMetadata(ctx, ref, limits.Metadata)
 		if err != nil {
 			budgetCancel()
 			return nil, err

@@ -55,6 +55,72 @@ fn persistent_connections_fencing_and_discovery() {
         .call("/echo", json!({}), Duration::from_secs(1))
         .is_err());
 }
+/// One raw HTTP/1.1 exchange on a Unix socket: the status code and the body.
+fn exchange(path: &std::path::Path, target: &str, instance: Option<&str>) -> (u16, String) {
+    use std::io::Read;
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut request = format!(
+        "GET {target} HTTP/1.1\r\nHost: local\r\nConnection: close\r\nX-Xrpc-Timeout-Ms: 1000\r\nX-Request-ID: probe:1\r\n"
+    );
+    if let Some(instance) = instance {
+        request.push_str(&format!("X-Xrpc-Instance-ID: {instance}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let status = response[9..12].parse().unwrap();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+    (status, body)
+}
+
+#[test]
+fn discovery_route_takes_a_query_without_an_instance() {
+    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("rpc.sock");
+    let _host = Host::bind(
+        &runtime,
+        &path,
+        "boot:7".into(),
+        Limits {
+            discovery_routes: vec!["/v1/describe".into()],
+            ..Limits::default()
+        },
+        false,
+        handler(|context, path, _| async move {
+            Ok(json!({"path": path, "query": context.query}))
+        }),
+    )
+    .unwrap();
+    // Core does not know the instance before the first describe: the route is
+    // matched on its path and the query reaches the handler.
+    let (status, body) = exchange(&path, "/v1/describe?wait_ready_ms=250", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        json!({"path": "/v1/describe", "query": "wait_ready_ms=250"})
+    );
+    let (status, body) = exchange(&path, "/v1/describe", None);
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["query"], "");
+    // A pinned caller may use the query too.
+    assert_eq!(exchange(&path, "/v1/describe?wait_ready_ms=250", Some("boot:7")).0, 200);
+    // The query is no part of the match: another route is not discovery because of it,
+    // and a longer path is not the discovery path.
+    for target in ["/v1/echo?wait_ready_ms=250", "/v1/describe/more?wait_ready_ms=250"] {
+        let (status, body) = exchange(&path, target, None);
+        assert_eq!(status, 409, "{target}: {body}");
+    }
+    // A bound route takes no query even with the right instance.
+    assert_eq!(exchange(&path, "/v1/echo?wait_ready_ms=250", Some("boot:7")).0, 400);
+    // A query is not a way to name a different instance.
+    assert_eq!(exchange(&path, "/v1/describe?wait_ready_ms=250", Some("boot:6")).0, 409);
+}
 #[test]
 fn missing_receipt_never_replays_mutation() {
     let runtime = Runtime::new(RuntimeOptions::default()).unwrap();

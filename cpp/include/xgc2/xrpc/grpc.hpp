@@ -1,11 +1,11 @@
 #pragma once
+#include "delivery.hpp"
+#include "stop.hpp"
 #include "unix.hpp"
-#include "runtime_policy.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <stop_token>
 #include <string>
 #include <vector>
 #include <grpcpp/grpcpp.h>
@@ -13,36 +13,28 @@
 namespace xgc2::xrpc {
 class Diagnostics;
 using GrpcClock = std::chrono::steady_clock;
+// Hard bounds for a gRPC host and its channels. The defaults suit a small
+// private control service; the owner sets other bounds explicitly. The library
+// reads no environment variables and keeps no hidden policy.
 struct GrpcLimits {
-  GrpcLimits();
-  std::size_t connections, inflight, streams_per_connection;
-  std::size_t request_bytes, response_bytes, header_bytes;
-  std::chrono::milliseconds call_timeout, idle_timeout, shutdown_timeout;
+  std::size_t connections = 32;             // accepted connections at one time
+  std::size_t inflight = 32;                // admitted calls without a result
+  std::size_t streams_per_connection = 32;  // native concurrent streams
+  std::size_t request_bytes = 1048576;      // largest request message
+  std::size_t response_bytes = 1048576;     // largest response message
+  std::size_t header_bytes = 16384;         // largest metadata block
+  std::chrono::milliseconds call_timeout{30000};    // host cap on one call
+  std::chrono::milliseconds idle_timeout{30000};    // idle connection eviction
+  std::chrono::milliseconds shutdown_timeout{5000}; // default shutdown budget
   // MAX_POLLERS alone does not bound handlers. ResourceQuota caps the native
   // synchronous pool; one additional SDK thread accepts all connections.
   int native_threads = 8;
   std::size_t native_memory_bytes = 16 * 1048576;
 };
-GrpcLimits grpc_limits(const RuntimePolicy&);
-// Client projection requires no host capability. Native channel settings do
-// not cap outgoing streams: a bounded owner may declare that field applied,
-// but must enforce its own complete concurrent-call/stream count.
-// IDLE_TIMEOUT_MS also requires an owner that actually retires idle channels;
-// the supported native baseline only provides server-side idle eviction.
-GrpcLimits grpc_client_limits(const RuntimePolicy&,
-    std::span<const std::string_view> owner_applied = {});
-inline GrpcLimits grpc_client_limits(const RuntimePolicy& policy,
-    std::initializer_list<std::string_view> owner_applied) {
-  return grpc_client_limits(policy, std::span<const std::string_view>{
-      owner_applied.begin(), owner_applied.size()});
-}
 // Leave room for native grpc-timeout rounding while preserving the caller's
 // finite budget. Throws if the host budget cannot accommodate that margin.
 GrpcClock::time_point grpc_stream_deadline(const GrpcLimits&,
                                           GrpcClock::time_point caller_deadline);
-// Also usable by the authenticated remote transport owner, who supplies its
-// credentials and address. Unix paths must use GrpcUnixServer instead.
-void configure_grpc_server(grpc::ServerBuilder&, const GrpcLimits&);
 struct GrpcStats {
   std::size_t inflight_calls = 0, active_connections = 0;
   std::uint64_t admitted_calls = 0, rejected_calls = 0,
@@ -83,6 +75,17 @@ public:
   const std::string& request_id() const noexcept { return request_id_; }
   GrpcClock::time_point deadline() const noexcept { return deadline_; }
   bool cancelled() const noexcept;
+  // Marks a known application failure of this admitted call, as contracts/
+  // runtime.md describes: returns `status` with one google.rpc.ErrorInfo detail
+  // (domain "xgc2.xrpc", reason "APPLICATION_ERROR", metadata request_id and
+  // instance_id of this call) added to its error details. The code, message and
+  // any existing details are preserved. A client reports response-received for
+  // an unsuccessful call only when it finds this single valid marker. Use it
+  // for the domain's declared refusals, not for transport, cancellation or
+  // unexpected handler failures. An OK status, a rejected scope, malformed
+  // existing details or details too large for the metadata limit leave
+  // `status` unchanged. The marker does not imply rollback or safe replay.
+  grpc::Status application_error(const grpc::Status& status) const;
   // Exactly one handoff per admission; throws on a rejected call or a second
   // handoff. The domain must also bound its own queue before accepting work.
   GrpcWorkPermit retain_work();
@@ -151,14 +154,15 @@ private:
 };
 
 // Reuse one channel per ServiceRef. This local helper never dials a remote
-// Unix pathname. Remote credentials/routes are injected by their owner.
-grpc::ChannelArguments grpc_channel_arguments(const GrpcLimits& = {});
+// Unix pathname. Remote credentials/routes are injected by their owner. Only
+// the message and metadata bounds of the limits apply to a channel; idle
+// eviction and stream counts are server-side and the channel's owner decides
+// its lifetime.
 std::shared_ptr<grpc::Channel> make_grpc_unix_channel(
     const std::string& path, const GrpcLimits& = {});
 
 // Fresh, caller-owned native context. The scope must outlive native RPC/stream
 // completion, then be destroyed before ClientContext. No automatic replay.
-enum class GrpcDelivery { NotSent, OutcomeUnknown };
 class GrpcClientCall {
 public:
   // Explicit unary discovery alone permits an empty instance_id, meaning the
@@ -166,7 +170,7 @@ public:
   // The caller must use a fresh context without manually adding XRPC keys.
   GrpcClientCall(grpc::ClientContext&, std::string instance_id,
                  GrpcClock::time_point deadline,
-                 std::stop_token cancellation = {}, std::string request_id = {},
+                 StopToken cancellation = {}, std::string request_id = {},
                  bool discovery = false);
   ~GrpcClientCall();
   GrpcClientCall(const GrpcClientCall&) = delete;
@@ -179,7 +183,11 @@ public:
   // cannot report exact bytes dispatched, so all subsequent failures have
   // conservatively unknown outcome. Validation/pre-cancel remain NotSent.
   grpc::Status mark_dispatched();
-  GrpcDelivery delivery() const noexcept;
+  // NotSent until mark_dispatched succeeds; then OutcomeUnknown until verify()
+  // sees a response of this call from the expected instance: an OK status, or a
+  // failure carrying the single matching APPLICATION_ERROR marker (see
+  // GrpcCallScope::application_error). Any other failure stays OutcomeUnknown.
+  Delivery delivery() const noexcept;
   template<class NativeUnary> grpc::Status invoke(NativeUnary&& operation) {
     const auto ready = mark_dispatched();
     if (!ready.ok()) return ready;

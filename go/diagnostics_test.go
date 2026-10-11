@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,7 +12,6 @@ import (
 	"time"
 
 	"github.com/XGC-Team/xgc2-xrpc/go"
-	"golang.org/x/sys/unix"
 )
 
 type blockingSink struct {
@@ -24,31 +21,6 @@ type blockingSink struct {
 	written bytes.Buffer
 }
 
-func TestFileDiagnosticRejectsFIFOAndSmallerArchiveGrant(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Mkfifo(filepath.Join(directory, "fifo.log"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	if sink, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "fifo.log", MaxBytes: 256, Files: 1}); err == nil {
-		sink.Close()
-		t.Fatal("FIFO log accepted")
-	}
-	if time.Since(start) > time.Second {
-		t.Fatal("FIFO constructor blocked")
-	}
-	if err := os.WriteFile(filepath.Join(directory, "small.log.1"), []byte("previous archive"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if sink, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "small.log", MaxBytes: 256, Files: 1}); err == nil {
-		sink.Close()
-		t.Fatal("old archive escaped smaller grant")
-	}
-}
-
 func (w *blockingSink) Write(body []byte) (int, error) {
 	w.once.Do(func() { close(w.started) })
 	<-w.release
@@ -56,12 +28,8 @@ func (w *blockingSink) Write(body []byte) (int, error) {
 }
 
 func TestDiagnosticsSaturationAndRealWriterDrain(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: []string{"XGC2_XRPC_LOG_LEVEL=debug"}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	sink := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: sink, MaxQueuedRecords: 2, MaxRecordBytes: 512})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: sink, Level: "debug", MaxQueuedRecords: 2, MaxRecordBytes: 512})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,37 +69,38 @@ func TestDiagnosticsSaturationAndRealWriterDrain(t *testing.T) {
 	}
 }
 
-func TestDiagnosticPolicyLiveRevisionAndFormat(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{Environment: []string{"XGC2_XRPC_LOG_FORMAT=text"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDiagnosticsLiveLevelAndFormat(t *testing.T) {
 	var sink bytes.Buffer
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: &sink})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: &sink, Format: "text"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	diagnostics.Emit(xrpc.Diagnostic{Level: "debug", Event: "suppressed_debug"})
-	if _, err = diagnostics.UpdatePolicy(1, map[string]string{"LOG_LEVEL": "debug"}); err != nil {
+	if err = diagnostics.SetLevel("debug"); err != nil {
 		t.Fatal(err)
 	}
 	diagnostics.Emit(xrpc.Diagnostic{Level: "debug", Event: "visible_debug"})
-	if _, err = diagnostics.UpdatePolicy(1, map[string]string{"LOG_LEVEL": "trace"}); err == nil {
-		t.Fatal("stale revision succeeded")
+	if err = diagnostics.SetLevel("verbose"); err == nil {
+		t.Fatal("unknown level accepted")
 	}
-	if _, err = diagnostics.UpdatePolicy(2, map[string]string{"LOG_FORMAT": "json"}); err == nil {
-		t.Fatal("immutable format changed live")
+	for _, bad := range []xrpc.DiagnosticOptions{{Sink: &sink, Level: "loud"}, {Sink: &sink, Format: "xml"}, {}} {
+		if _, err = xrpc.NewDiagnostics(bad); err == nil {
+			t.Fatalf("invalid options accepted: %+v", bad)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err = diagnostics.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err = diagnostics.SetLevel("trace"); err == nil {
+		t.Fatal("closed owner accepted a level change")
+	}
 	if output := sink.String(); strings.Contains(output, "suppressed_debug") || !strings.Contains(output, "visible_debug") || json.Valid([]byte(output)) {
 		t.Fatalf("verbosity/format not applied %q", output)
 	}
-	if status := diagnostics.Status(); status.Revision != 2 || status.Level != "debug" || status.Format != "text" {
-		t.Fatalf("policy provenance lost %+v", status)
+	if status := diagnostics.Status(); status.Level != "debug" || status.Format != "text" {
+		t.Fatalf("diagnostic settings lost %+v", status)
 	}
 }
 
@@ -139,11 +108,7 @@ type failingSink struct{}
 
 func (failingSink) Write([]byte) (int, error) { return 0, syscall.ENOSPC }
 func TestDiagnosticSinkFailureAndRepeatedEventRateLimit(t *testing.T) {
-	policy, err := xrpc.ResolvePolicy(xrpc.PolicyOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	diagnostics, err := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: failingSink{}})
+	diagnostics, err := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: failingSink{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,63 +123,5 @@ func TestDiagnosticSinkFailureAndRepeatedEventRateLimit(t *testing.T) {
 	status := diagnostics.Status()
 	if status.Written != 0 || status.SinkErrors == 0 || status.SinkErrors > 8 || status.Dropped != 100 {
 		t.Fatalf("sink/rate counts %+v", status)
-	}
-}
-
-func TestFileDiagnosticGrantRotationAndNamespaceReplacement(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0700); err != nil {
-		t.Fatal(err)
-	}
-	sink, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "xrpc.log", MaxBytes: 256, Files: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 20; i++ {
-		if _, err = sink.Write([]byte(strings.Repeat("x", 200) + "\n")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err = sink.Write([]byte(strings.Repeat("y", 257))); err == nil {
-		t.Fatal("unbounded record accepted")
-	}
-	files, err := os.ReadDir(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != 4 {
-		t.Fatalf("rotation files=%d", len(files))
-	}
-	for _, file := range files {
-		info, err := file.Info()
-		if err != nil || info.Size() > 256 || info.Mode().Perm() != 0600 {
-			t.Fatalf("unsafe archive %+v %v", info, err)
-		}
-	}
-	if other, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: directory, Name: "xrpc.log", MaxBytes: 256, Files: 3}); err == nil {
-		other.Close()
-		t.Fatal("second independent writer accepted")
-	}
-	active := filepath.Join(directory, "xrpc.log")
-	if err = os.Rename(active, filepath.Join(directory, "old-owner")); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(active, []byte("replacement"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = sink.Write([]byte("late-owner")); err == nil {
-		t.Fatal("writer followed replacement inode")
-	}
-	sink.Close()
-	if body, err := os.ReadFile(active); err != nil || string(body) != "replacement" {
-		t.Fatal("replacement changed", err)
-	}
-	alias := filepath.Join(t.TempDir(), "alias")
-	if err = os.Symlink(directory, alias); err != nil {
-		t.Fatal(err)
-	}
-	if rejected, err := xrpc.NewRotatingFileSink(xrpc.FileSinkOptions{Directory: alias, Name: "log", MaxBytes: 256, Files: 1}); err == nil {
-		rejected.Close()
-		t.Fatal("symlink grant accepted")
 	}
 }

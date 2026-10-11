@@ -1,11 +1,9 @@
 #include <xgc2/xrpc/json_http.hpp>
 #include <xgc2/xrpc/bootstrap.hpp>
-#include <xgc2/xrpc/runtime_policy.hpp>
 #include <xgc2/xrpc/diagnostics.hpp>
+#include <xgc2/xrpc/method_http.hpp>
 #include <condition_variable>
 #include <mutex>
-#include <span>
-#include <stop_token>
 #ifdef XRPC_CHECK_GRPC
 #include <xgc2/xrpc/grpc.hpp>
 #endif
@@ -20,27 +18,40 @@ int main() {
   } catch (const xgc2::xrpc::BootstrapError &error) {
     if (error.code != xgc2::xrpc::BootstrapErrorCode::InvalidInput) return 8;
   }
-  xgc2::xrpc::RuntimePolicyOptions options;
-#ifdef XRPC_CHECK_GRPC
-  options.capabilities.push_back("grpc");
-#endif
-  const auto policy = xgc2::xrpc::resolve_runtime_policy(options);
-  const auto limits = xgc2::xrpc::http_limits(policy);
+  // The method router (method.hpp comes with the udp component, its http adapter with
+  // this one): a call under /v1/call/ reaches its handler, any other target is left alone.
+  xgc2::xrpc::MethodRouter router;
+  bool echoed = false;
+  router.add("probe.v1/Echo", [&echoed](xgc2::xrpc::MethodRequest request, xgc2::xrpc::MethodReply reply) {
+    echoed = request.body == "{}";
+    reply.complete(request.body);
+  });
+  xgc2::xrpc::HttpRequest routed;
+  routed.method = "POST";
+  routed.target = "/v1/call/probe.v1/Echo";
+  routed.body = "{}";
+  routed.headers.emplace_back("Content-Type", "application/json");
+  if (!xgc2::xrpc::handle_method_call(router, routed, xgc2::xrpc::HttpReply{}) || !echoed) return 11;
+  routed.target = "/v1/describe";
+  if (xgc2::xrpc::handle_method_call(router, routed, xgc2::xrpc::HttpReply{})) return 12;
+  const xgc2::xrpc::HttpLimits limits;
   const auto instance = xgc2::xrpc::new_instance_id();
   xgc2::xrpc::HttpClient client("/unused-installed-sdk-probe.sock", limits, instance);
   client.close();
   if (xgc2::xrpc::diagnostic_code_name(xgc2::xrpc::DiagnosticCode::CallCompleted).empty()) return 6;
-  std::stop_source stop;
+  xgc2::xrpc::StopSource stop;
   stop.request_stop();
   std::mutex mutex;
-  std::unique_lock lock(mutex);
-  std::condition_variable_any condition;
-  if (condition.wait_until(lock, stop.get_token(), std::chrono::steady_clock::now(), [] { return false; })) return 2;
-  const int values[] = {1, 2};
-  if (std::span(values).size() != 2 || limits.connections == 0) return 3;
+  std::unique_lock<std::mutex> lock(mutex);
+  std::condition_variable condition;
+  if (xgc2::xrpc::wait_until(condition, lock, stop.get_token(),
+                             std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                             [] { return false; })) return 2;
+  if (!stop.get_token().stop_requested() || limits.connections == 0) return 3;
 #ifdef XRPC_CHECK_GRPC
-  if (xgc2::xrpc::grpc_limits(policy).inflight == 0) return 4;
-  xgc2::xrpc::GrpcAdmission admission(instance, xgc2::xrpc::grpc_limits(policy));
+  const xgc2::xrpc::GrpcLimits grpc_limits;
+  if (grpc_limits.inflight == 0) return 4;
+  xgc2::xrpc::GrpcAdmission admission(instance, grpc_limits);
   admission.request_stop();
   if (!admission.wait_until(xgc2::xrpc::GrpcClock::now())) return 5;
 #endif

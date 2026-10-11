@@ -27,7 +27,7 @@ func TestNativeGRPCDeadlineAndInstanceFence(t *testing.T) {
 	}
 	server := health.NewServer()
 	server.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-	host, err := Serve(listener, lease, func(registrar grpc.ServiceRegistrar) { healthpb.RegisterHealthServer(registrar, server) }, BoundService("boot-1", time.Second, 4)...)
+	host, err := ServeWithOptions(listener, lease, func(registrar grpc.ServiceRegistrar) { healthpb.RegisterHealthServer(registrar, server) }, HostOptions{InstanceID: "boot-1", MaxCallTime: time.Second, MaxInFlight: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestClientStreamAdmissionIsReleasedOnCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	host, err := Serve(listener, lease, func(r grpc.ServiceRegistrar) { healthpb.RegisterHealthServer(r, health.NewServer()) }, BoundService("boot", time.Second, 4)...)
+	host, err := ServeWithOptions(listener, lease, func(r grpc.ServiceRegistrar) { healthpb.RegisterHealthServer(r, health.NewServer()) }, HostOptions{InstanceID: "boot", MaxCallTime: time.Second, MaxInFlight: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

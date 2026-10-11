@@ -3,7 +3,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -46,7 +45,7 @@ public:
   std::string_view authentication() const noexcept { return authentication_; }
   const Endpoint &endpoint() const noexcept { return endpoint_; }
   const OpaqueGrantHandle &runtime_grant() const noexcept { return runtime_; }
-  std::span<const OpaqueGrantHandle> storage_grants() const noexcept { return storage_; }
+  const std::vector<OpaqueGrantHandle> &storage_grants() const noexcept { return storage_; }
   ServiceRef service_ref(std::string_view instance_id) const;
   // Checks binding metadata and instance syntax. The transport owner must also
   // compare the response's instance metadata with the expected ServiceRef;
@@ -104,7 +103,7 @@ public:
   void consume_tls(const std::function<void(std::string_view cert_pem,
                    std::string_view key_pem, std::string_view ca_pem)> &native) const;
   void apply_authorization(std::vector<std::pair<std::string, std::string>> &headers) const;
-  bool authorize(std::span<const std::string_view> authorization_values,
+  bool authorize(const std::vector<std::string_view> &authorization_values,
                  std::chrono::steady_clock::time_point deadline) const noexcept;
 private:
   struct Impl;

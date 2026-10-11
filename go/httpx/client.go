@@ -30,29 +30,41 @@ const InstanceIDHeader = "X-Xrpc-Instance-ID"
 
 var ErrResponseTooLarge = errors.New("xrpc: HTTP response exceeds byte limit")
 
+// Config is a plain limits struct. A zero limit selects the default named in
+// its comment; nothing is read from the process environment.
 type Config struct {
-	boundAuthorization bool
-	LocalTargetID      string
-	Service            xrpc.ServiceRef
-	DialContext        xrpc.DialContext
-	TLSConfig          *tls.Config
-	TLSForService      func(xrpc.ServiceRef) (*tls.Config, error)
+	LocalTargetID string
+	Service       xrpc.ServiceRef
+	DialContext   xrpc.DialContext
+	TLSConfig     *tls.Config
+	TLSForService func(xrpc.ServiceRef) (*tls.Config, error)
 	// Headers are copied at construction. Wire-owned identity/budget headers
 	// are rejected; authentication remains an explicitly supplied capability.
-	Headers              map[string]string
-	MaxResponseBytes     int64
-	MaxRequestBytes      int64
-	MaxHeaderBytes       int64
-	MaxCallTime          time.Duration
-	HeaderTimeout        time.Duration
-	MaxConnections       int
-	MaxInFlight          int
-	IdleTimeout          time.Duration
-	MaxReferences        int
+	Headers map[string]string
+	// MaxResponseBytes bounds one response body (default xrpc.DefaultMaxMessageBytes).
+	MaxResponseBytes int64
+	// MaxRequestBytes bounds one request body (default xrpc.DefaultMaxMessageBytes).
+	MaxRequestBytes int64
+	// MaxHeaderBytes bounds response headers (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes int64
+	// MaxCallTime caps every call's budget (default xrpc.DefaultCallTimeout).
+	MaxCallTime time.Duration
+	// HeaderTimeout bounds waiting for response headers (default xrpc.DefaultHeaderTimeout).
+	HeaderTimeout time.Duration
+	// MaxConnections bounds connections per reference (default xrpc.DefaultClientConnections).
+	MaxConnections int
+	// MaxInFlight bounds admitted calls (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// IdleTimeout closes idle pooled connections (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// MaxReferences bounds cached references of a Profile (default xrpc.DefaultMaxReferences).
+	MaxReferences int
+	// ReferenceIdleTimeout retires idle cached references (default xrpc.DefaultReferenceIdleTimeout).
 	ReferenceIdleTimeout time.Duration
 	Diagnostics          *xrpc.Diagnostics
 	Metrics              *xrpc.Metrics
 }
+
 type callDeadlineKey struct{}
 
 type Client struct {
@@ -90,28 +102,28 @@ func New(config Config) (*Client, error) {
 		return nil, errors.New("xrpc: response byte limit is too large")
 	}
 	if config.MaxResponseBytes <= 0 {
-		config.MaxResponseBytes = xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES")
+		config.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 	}
 	if config.MaxRequestBytes <= 0 {
-		config.MaxRequestBytes = xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES")
+		config.MaxRequestBytes = xrpc.DefaultMaxMessageBytes
 	}
 	if config.MaxHeaderBytes <= 0 {
-		config.MaxHeaderBytes = xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES")
+		config.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if config.MaxCallTime <= 0 {
-		config.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		config.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if config.HeaderTimeout <= 0 {
-		config.HeaderTimeout = time.Duration(xrpc.DefaultPolicyInteger("HEADER_TIMEOUT_MS")) * time.Millisecond
+		config.HeaderTimeout = xrpc.DefaultHeaderTimeout
 	}
 	if config.MaxConnections <= 0 {
-		config.MaxConnections = int(xrpc.DefaultPolicyInteger("CLIENT_MAX_CONNECTIONS"))
+		config.MaxConnections = xrpc.DefaultClientConnections
 	}
 	if config.MaxInFlight <= 0 {
-		config.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		config.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	if config.IdleTimeout <= 0 {
-		config.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		config.IdleTimeout = xrpc.DefaultIdleTimeout
 	}
 	transport := &http.Transport{Proxy: nil, DisableCompression: true, MaxConnsPerHost: config.MaxConnections, MaxIdleConnsPerHost: config.MaxConnections, MaxIdleConns: config.MaxConnections, IdleConnTimeout: config.IdleTimeout, ResponseHeaderTimeout: config.HeaderTimeout, MaxResponseHeaderBytes: config.MaxHeaderBytes, ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}}
 	owner, closeOwner := context.WithCancel(context.Background())
@@ -224,13 +236,6 @@ func (c *Client) DoStream(ctx context.Context, method, path, requestID, contentT
 }
 
 func (c *Client) doStream(ctx context.Context, method, path, requestID, contentType string, body []byte, headers map[string]string) (*http.Response, error) {
-	if c.config.boundAuthorization {
-		for name := range headers {
-			if strings.EqualFold(name, "Authorization") {
-				return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: caller authorization belongs to bootstrap owner"))
-			}
-		}
-	}
 	if err := validateHeaders(headers); err != nil {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
 	}
@@ -238,8 +243,18 @@ func (c *Client) doStream(ctx context.Context, method, path, requestID, contentT
 	if err != nil {
 		return nil, xrpc.Failure(xrpc.Code(err), xrpc.NotSent, err)
 	}
-	if c == nil || c.client == nil || !validID(requestID) {
-		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: HTTP client and request identity required"))
+	if c == nil || c.client == nil {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: HTTP client required"))
+	}
+	if requestID == "" {
+		generated, err := xrpc.NewRequestID()
+		if err != nil {
+			return nil, xrpc.Failure("internal", xrpc.NotSent, err)
+		}
+		requestID = generated
+	}
+	if !validID(requestID) {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: canonical request identity required"))
 	}
 	if c.owner.Err() != nil {
 		return nil, xrpc.Failure("unavailable", xrpc.NotSent, errors.New("xrpc: HTTP client closed"))
@@ -436,12 +451,23 @@ func (c *Client) CallWithHeaders(ctx context.Context, call xrpc.Call, headers ma
 	if len(call.Payload) > 0 && !json.Valid(call.Payload) {
 		return xrpc.Result{}, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: JSON payload required"))
 	}
-	output, status, _, err := c.DoWithHeaders(ctx, call.Method, call.Path, call.RequestID, "application/json", call.Payload, headers)
+	output, status, header, err := c.DoWithHeaders(ctx, call.Method, call.Path, call.RequestID, "application/json", call.Payload, headers)
 	if err != nil {
 		return xrpc.Result{}, err
 	}
+	instance := header.Get(InstanceIDHeader)
 	if status < 200 || status >= 300 {
-		return xrpc.Result{}, xrpc.Failure(statusCode(status), xrpc.ResponseReceived, fmt.Errorf("HTTP status %d: %s", status, strings.TrimSpace(string(output))))
+		// The answer is delivered with the error: its body can carry the
+		// domain's details.
+		result := xrpc.Result{Status: status, InstanceID: instance}
+		if json.Valid(output) {
+			result.Payload = output
+		}
+		code := envelopeCode(output)
+		if code == "" {
+			code = statusCode(status)
+		}
+		return result, xrpc.Failure(code, xrpc.ResponseReceived, fmt.Errorf("HTTP status %d: %s", status, strings.TrimSpace(string(output))))
 	}
 	if len(output) == 0 {
 		output = []byte("null")
@@ -449,7 +475,32 @@ func (c *Client) CallWithHeaders(ctx context.Context, call xrpc.Call, headers ma
 	if !json.Valid(output) {
 		return xrpc.Result{}, xrpc.Failure("internal", xrpc.ResponseReceived, errors.New("xrpc: response is not JSON"))
 	}
-	return xrpc.Result{Status: status, Payload: output}, nil
+	return xrpc.Result{Status: status, Payload: output, InstanceID: instance}, nil
+}
+
+// envelopeCode returns the error code of a {"error":{"code":...}} envelope, or
+// "" when the body is not one or the code is not a token (lowercase letters,
+// digits and underscores, starting with a letter, at most 64 bytes). Domains may
+// add codes of their own beside the standard vocabulary.
+func envelopeCode(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return ""
+	}
+	code := envelope.Error.Code
+	if code == "" || len(code) > 64 || code[0] < 'a' || code[0] > 'z' {
+		return ""
+	}
+	for i := 1; i < len(code); i++ {
+		if c := code[i]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			return ""
+		}
+	}
+	return code
 }
 func statusCode(status int) string {
 	switch status {
@@ -486,6 +537,12 @@ type Profile struct {
 func NewProfile(config Config) *Profile {
 	if config.Metrics == nil {
 		config.Metrics = &xrpc.Metrics{}
+	}
+	if config.MaxReferences <= 0 {
+		config.MaxReferences = xrpc.DefaultMaxReferences
+	}
+	if config.ReferenceIdleTimeout <= 0 {
+		config.ReferenceIdleTimeout = xrpc.DefaultReferenceIdleTimeout
 	}
 	return &Profile{config: config, clients: refpool.New[xrpc.ServiceRef, *Client](config.MaxReferences, config.ReferenceIdleTimeout, func(c *Client) { c.Close() })}
 }

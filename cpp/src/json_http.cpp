@@ -110,41 +110,4 @@ void JsonHttpHandler::operator()(HttpRequest request, HttpReply raw_reply) const
   typed.deadline = request.deadline;
   handler_(std::move(typed), std::move(reply));
 }
-JsonHttpClient::JsonHttpClient(std::string path, HttpLimits limits, std::string instance, unsigned depth)
-  : limits_(limits), max_depth_(depth), client_(std::move(path), limits, std::move(instance)) {
-  if (!depth) throw std::invalid_argument("JSON nesting limit must be nonzero");
-}
-JsonHttpResponse JsonHttpClient::call(JsonHttpRequest request, Clock::time_point deadline,
-                                     std::stop_token cancellation) {
-  HttpRequest raw;
-  if (request.body) {
-    auto encoded = json_response(*request.body, limits_.request_bytes);
-    if (encoded.status != 200)
-      throw HttpCallError("invalid_argument", Delivery::NotSent, "request cannot be encoded within JSON limit");
-    raw.body = std::move(encoded.body);
-    // Content-Type is a protocol-owned field, never a downstream override.
-    for (const auto &[key, ignored] : request.headers) {
-      (void)ignored;
-      if (equal_ascii(key, "content-type"))
-        throw HttpCallError("invalid_argument", Delivery::NotSent, "Content-Type is managed by JSON-HTTP");
-    }
-    request.headers.emplace_back("Content-Type", "application/json");
-  }
-  raw.method = std::move(request.method);
-  raw.target = std::move(request.target);
-  raw.request_id = std::move(request.request_id);
-  raw.headers = std::move(request.headers);
-  auto response = client_.call(std::move(raw), deadline, cancellation);
-  JsonHttpResponse typed;
-  typed.status = response.status;
-  typed.headers = std::move(response.headers);
-  if (!response.body.empty()) {
-    Json value;
-    if (!json_content_type(typed.headers) ||
-        !parse_json(response.body, value, {limits_.response_bytes, max_depth_}))
-      throw HttpCallError("invalid_response", Delivery::OutcomeUnknown, "invalid JSON-HTTP response");
-    typed.body = std::move(value);
-  }
-  return typed;
-}
 } // namespace xgc2::xrpc

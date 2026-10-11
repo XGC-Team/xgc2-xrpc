@@ -1,13 +1,13 @@
 """Transport primitives; no product state or process supervision."""
 
-from .http import Client, Context, Fault, Host, IncomingStream, Limits, Response, TransportError, multipart
+from .http import Client, Context, Fault, Host, Limits, Response, TransportError, multipart
 from .app import AppRouter, BoundedWebSocketResponse, RawStreamResponse, iter_body, HOST_KEY, DEADLINE_KEY
-from .policy import PolicyError, PolicyConflict, ResolvedPolicy, resolve_policy
-from .raw import RawClient
-from .websocket import BoundedWebSocket, WebSocketClient, relay_websocket
+from .websocket import WebSocketClient
 from .unix import UnixLease
+from .wire import DISPOSITIONS, NOT_SENT, OUTCOME_UNKNOWN, RESPONSE_RECEIVED, new_instance_id
 
-__all__ = ["RawClient", "WebSocketClient", "BoundedWebSocket", "relay_websocket", "HOST_KEY", "DEADLINE_KEY", "IncomingStream", "PolicyError", "PolicyConflict", "ResolvedPolicy", "resolve_policy", "AppRouter", "BoundedWebSocketResponse", "RawStreamResponse", "iter_body", "Runtime", "Endpoint", "ServiceRef", "Client", "Context", "Fault", "Host", "Limits", "Response", "TransportError", "UnixLease", "multipart"]
+__all__ = ["WebSocketClient", "HOST_KEY", "DEADLINE_KEY", "AppRouter", "BoundedWebSocketResponse", "RawStreamResponse", "iter_body", "Runtime", "Endpoint", "ServiceRef", "Client", "Context", "Fault", "Host", "Limits", "Response", "TransportError", "UnixLease", "multipart",
+           "DISPOSITIONS", "NOT_SENT", "OUTCOME_UNKNOWN", "RESPONSE_RECEIVED", "new_instance_id"]
 
 from .reference import Endpoint, ServiceRef
 

@@ -19,8 +19,9 @@ class WireTests(unittest.TestCase):
         corpus = json.loads((FIXTURES / "wire.json").read_text())
         for case in corpus["cases"]:
             with self.subTest(case=case["name"]):
+                # The host hands the metadata check the path of the target, not its query.
                 options = dict(instance_id=corpus["instance_id"], method=case["method"],
-                               path=case["path"], discovery_routes=("/v1/describe",))
+                               path=case["path"].split("?", 1)[0], discovery_routes=("/v1/describe",))
                 try:
                     metadata = validate_request_metadata(case["headers"], **options)
                 except WireError as error:

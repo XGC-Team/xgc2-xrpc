@@ -9,10 +9,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
 const { execFileSync } = require("node:child_process");
-const { HTTPClient, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, resolvePolicy, createHTTPHost } = require("..");
+const { HTTPClient, TransportError, createRPCHost, createBoundHTTPHost, BootstrapBinding, readBootstrapBinding, loadBootstrapInput, Diagnostics, createHTTPHost } = require("..");
 const corpus = require("../../contracts/fixtures/wire.json");
-const env = require("../../contracts/fixtures/environment.json");
-const registry = require("../runtime-policy.json");
 const bootstraps = require("../../contracts/fixtures/bootstrap.json");
 const boot = corpus.instance_id;
 const certDir = fs.mkdtempSync(path.join(os.tmpdir(), "xrpc-node-tls-"));
@@ -46,24 +44,25 @@ test("all shared wire fixtures use the native HTTP parser and gate dispatch", as
     }
   } finally { await fixture.close(); }
 });
-test("shared environment corpus resolves sources/ceilings and rejects unsupported fields", () => {
-  const supported = new Set(registry.fields.filter((f) => !["diagnostics", "grpc"].includes(f.capability)).map((f) => f.name));
-  for (const entry of env.cases) {
-    const options = { environment: entry.environment, defaults: entry.defaults, ceilings: entry.ceilings, capabilities: entry.capabilities };
-    if (entry.error_field) assert.throws(() => resolvePolicy(options), (e) => e.field === entry.error_field, entry.name);
-    else {
-      const policy = resolvePolicy(options);
-      for (const [field,value] of Object.entries(entry.values ?? {})) if (supported.has(field)) assert.equal(policy.fields[field]?.value, value, `${entry.name}:${field}`);
-      for (const [field,source] of Object.entries(entry.sources ?? {})) if (supported.has(field)) assert.equal(policy.fields[field]?.source, source, `${entry.name}:${field}`);
-      assert.equal(policy.revision, 1);
-      assert.ok(!JSON.stringify(policy).includes("not-returned"));
+test("a discovery route takes a query without an instance and the handler sees it", async () => {
+  const seen = [];
+  const fixture = await httpsHost((req, res) => { seen.push(req.url); res.setHeader("Content-Type", "application/json"); res.end('{"ok":true}'); }, { discoveryPaths: ["/v1/describe"] });
+  const ask = (target, instance) => new Promise((resolve, reject) => {
+    const headers = { "X-Request-ID": "probe:1", "X-Xrpc-Timeout-Ms": "1000", ...(instance ? { "X-Xrpc-Instance-ID": instance } : {}) };
+    require("node:https").get(new URL(target, fixture.address), { ca: cert, headers }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); }).on("error", reject);
+  });
+  try {
+    // Core does not know the instance before the first describe.
+    assert.equal(await ask("/v1/describe?wait_ready_ms=250"), 200);
+    assert.deepEqual(seen, ["/v1/describe?wait_ready_ms=250"]);
+    assert.equal(await ask("/v1/describe?wait_ready_ms=250", boot), 200);
+    // The query is no part of the match: it makes no other route and no longer path discovery.
+    for (const target of ["/v1/echo?wait_ready_ms=250", "/v1/describe/more?wait_ready_ms=250", "/v1/other?/v1/describe"]) {
+      assert.equal(await ask(target), 409, target);
     }
-  }
-  assert.throws(() => resolvePolicy(), /snapshot/);
-  const policy = resolvePolicy({ environment: { XGC2_XRPC_HOST_MAX_CONNECTIONS: "2" } });
-  const host = createHTTPHost((_req,res) => res.end(), { policy });
-  assert.throws(() => createHTTPHost(() => {}, { policy, maxConnections: 3 }), /conflicts/);
-  void host.close();
+    assert.equal(await ask("/v1/describe?wait_ready_ms=250", "someone-else"), 409);
+    assert.equal(seen.length, 2);
+  } finally { await fixture.close(); }
 });
 test("one shared client reuses connections and rejects stale/remote references", async () => {
   const fixture = await httpsHost((_req,res) => res.end('{"ok":true}'));
@@ -141,15 +140,29 @@ test("retrying close waits for a previously noncooperative handler", async () =>
   await new Promise((r) => setImmediate(r));
   await fixture.close();
 });
-test("policy conflicts, unsupported Unix host and native timeout overflow fail early", async () => {
-  const policy = resolvePolicy({ environment: { XGC2_XRPC_CALL_TIMEOUT_MS: "60000", XGC2_XRPC_HEADER_TIMEOUT_MS: "45000" } });
-  assert.throws(() => createRPCHost(() => {}, { instanceId: boot, policy, callTimeoutMs: 50000 }), /conflicts/);
+test("explicit limits reach the native server, and invalid limits and raw Unix listens fail early", async () => {
   assert.throws(() => createRPCHost(() => {}, { instanceId: boot, callTimeoutMs: 2147483648 }), /wire maximum|finite/);
-  const host = createRPCHost(() => {}, { instanceId: boot, policy });
+  assert.throws(() => createRPCHost(() => {}, { instanceId: boot, callTimeoutMs: 86400001 }), /wire maximum|finite/);
+  assert.throws(() => createHTTPHost(() => {}, { maxConnections: 0 }), /maxConnections/);
+  assert.throws(() => createHTTPHost(() => {}, { diagnostics: {} }), /Diagnostics owner/);
+  const host = createRPCHost(() => {}, { instanceId: boot, callTimeoutMs: 60000, headerTimeoutMs: 45000 });
   assert.equal(host.server.requestTimeout, 60000);
   assert.equal(host.server.headersTimeout, 45000);
   if ("keepAliveTimeoutBuffer" in host.server) assert.equal(host.server.keepAliveTimeoutBuffer, 0);
-  assert.throws(() => host.server.listen("/tmp/foreign.sock"), /Unix lease/);
+  assert.throws(() => host.server.listen("/tmp/foreign.sock"), /unixPath/);
+  assert.throws(() => host.server.listen({ path: "/tmp/foreign.sock" }), /unixPath/);
+  await assert.rejects(host.listen(), /unixPath/);
+  assert.equal(host.unixPath, null);
+  await host.close();
+});
+test("defaults: 30 s call budget, 5 s header timeout, 1 MiB responses for RPC hosts", async () => {
+  const host = createRPCHost(() => {}, { instanceId: boot });
+  assert.equal(host.server.requestTimeout, 30000);
+  assert.equal(host.server.headersTimeout, 5000);
+  const client = new HTTPClient();
+  assert.deepEqual([client.maxConnections, client.maxReferences, client.maxInFlight, client.maxRequestBytes, client.maxResponseBytes, client.maxHeaderBytes, client.callTimeoutMs, client.idleMs],
+    [16, 64, 32, 1048576, 1048576, 16384, 30000, 30000]);
+  client.close();
   await host.close();
 });
 test("request target, runtime header types and response headers are bounded", async () => {
@@ -288,4 +301,38 @@ test("common bootstrap resolves native TLS/auth grants once and gates domain dis
     assert.equal((await client.call(ref(address),"/v1/echo",{timeoutMs:1000,headers:authorization.headers})).status,200);
     assert.equal(dispatch,1); assert.equal(resolved.length,3);
   } finally { client.close(); await host.close(); }
+});
+test("every call outcome carries one of the three dispositions", async () => {
+  const fixture = await httpsHost((req, res) => {
+    if (req.url === "/status") {
+      res.statusCode = 503;
+      res.setHeader("Content-Type", "application/json");
+      res.end('{"error":{"code":"unavailable","message":"draining"}}');
+    } else if (req.url === "/big") res.end(Buffer.alloc(100));
+    else if (req.url === "/lost") res.socket.destroy();
+    else res.end('{"ok":true}');
+  });
+  const client = new HTTPClient({ localTarget: "local", tls: { ca: cert }, maxResponseBytes: 64 });
+  const options = { timeoutMs: 1000 };
+  try {
+    const ok = await client.call(ref(fixture.address), "/ok", options);
+    assert.equal(ok.disposition, "response_received");
+    assert.equal(ok.status, 200);
+    // An error status is an answer: the caller interprets it, the transport did not fail.
+    const refused = await client.call(ref(fixture.address), "/status", options);
+    assert.equal(refused.disposition, "response_received");
+    assert.equal(refused.status, 503);
+    const streamed = await client.stream(ref(fixture.address), "/ok", options);
+    assert.equal(streamed.disposition, "response_received");
+    streamed.close();
+    // The peer answered and the client refuses the answer.
+    await assert.rejects(client.call(ref(fixture.address), "/big", options), (e) => e instanceof TransportError && e.code === "resource_exhausted" && e.disposition === "response_received");
+    // The request may have run; no usable answer arrived.
+    await assert.rejects(client.call(ref(fixture.address), "/lost", { ...options, method: "POST", json: {} }), (e) => e.disposition === "outcome_unknown");
+    await assert.rejects(client.call(ref(fixture.address, "stale"), "/ok", options), (e) => e.code === "conflict" && e.disposition === "outcome_unknown");
+    // Nothing was sent.
+    await assert.rejects(client.call(ref(fixture.address), "/ok", { ...options, requestId: "not valid" }), (e) => e.code === "invalid_argument" && e.disposition === "not_sent");
+    await assert.rejects(client.call(ref(fixture.address), "/ok", { ...options, signal: AbortSignal.abort() }), (e) => e.code === "cancelled" && e.disposition === "not_sent");
+  } finally { client.close(); await fixture.close(); }
+  assert.throws(() => new TransportError("internal", "maybe", "unclassified"), /disposition/);
 });

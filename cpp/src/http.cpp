@@ -1,5 +1,4 @@
 #include "xgc2/xrpc/http.hpp"
-#include "xgc2/xrpc/runtime_policy.hpp"
 #include "xgc2/xrpc/diagnostics.hpp"
 #include <algorithm>
 #include <boost/asio.hpp>
@@ -100,35 +99,6 @@ bool reserved_header(const std::string &name) {
          beast::iequals(name, "X-Xrpc-Timeout-Ms");
 }
 } // namespace
-namespace {
-void apply_http_limits(HttpLimits &limits, const RuntimePolicy &policy) {
-  limits.connections = policy.integer("HOST_MAX_CONNECTIONS");
-  limits.inflight = policy.integer("HOST_MAX_IN_FLIGHT");
-  limits.header_bytes = policy.integer("MAX_HEADER_BYTES");
-  limits.request_bytes = policy.integer("MAX_REQUEST_BYTES");
-  limits.response_bytes = policy.integer("MAX_RESPONSE_BYTES");
-  limits.request_timeout = std::chrono::milliseconds(policy.integer("CALL_TIMEOUT_MS"));
-  limits.header_timeout = std::chrono::milliseconds(policy.integer("HEADER_TIMEOUT_MS"));
-  limits.idle_timeout = std::chrono::milliseconds(policy.integer("IDLE_TIMEOUT_MS"));
-  limits.shutdown_timeout = std::chrono::milliseconds(policy.integer("SHUTDOWN_TIMEOUT_MS"));
-}
-} // namespace
-HttpLimits::HttpLimits() {
-  static const auto defaults = resolve_runtime_policy(RuntimePolicyOptions{});
-  apply_http_limits(*this, defaults);
-}
-HttpLimits http_limits(const RuntimePolicy &policy) {
-  policy.check_applied({"HOST_MAX_CONNECTIONS", "HOST_MAX_IN_FLIGHT",
-                       "MAX_HEADER_BYTES", "MAX_REQUEST_BYTES",
-                       "MAX_RESPONSE_BYTES", "CALL_TIMEOUT_MS",
-                       "HEADER_TIMEOUT_MS", "IDLE_TIMEOUT_MS",
-                       "SHUTDOWN_TIMEOUT_MS"},
-                       {"host", "http", "rpc", "transport"});
-  HttpLimits limits;
-  apply_http_limits(limits, policy);
-  validate(limits);
-  return limits;
-}
 HttpResponse http_error(int status, const std::string &code,
                         const std::string &message) {
   HttpResponse r;
@@ -302,10 +272,13 @@ class HttpServer::Impl {
         if (request.count("X-Request-ID") == 1 &&
             valid_id(std::string(request["X-Request-ID"])))
           request_id = std::string(request["X-Request-ID"]);
+        // A discovery route is chosen by method and path; its query (for example
+        // wait_ready_ms) is not part of the match.
+        const std::string target(request.target());
         const bool discovery = request.method() == http::verb::get &&
                                std::find(identity.discovery_targets.begin(),
                                          identity.discovery_targets.end(),
-                                         std::string(request.target())) !=
+                                         target.substr(0, target.find('?'))) !=
                                    identity.discovery_targets.end();
         const auto instance_count = request.count("X-Xrpc-Instance-ID");
         if (instance_count > 1)
@@ -833,15 +806,15 @@ public:
     available.notify_all();
   }
   HttpResponse call(HttpRequest request, Clock::time_point deadline,
-                    std::stop_token cancellation) {
-    std::stop_source stop;
+                    StopToken cancellation) {
+    StopSource stop;
     {
       std::unique_lock<std::mutex> guard(admission);
       if (deadline == Clock::time_point::max())
         throw HttpCallError("invalid_argument", Delivery::NotSent,
                             "finite deadline required");
-      if (!available.wait_until(guard, cancellation, deadline,
-                                [this] { return closed || !busy; }) ||
+      if (!wait_until(available, guard, cancellation, deadline,
+                      [this] { return closed || !busy; }) ||
           Clock::now() >= deadline || cancellation.stop_requested())
         throw HttpCallError(cancellation.stop_requested() ? "cancelled"
                                                           : "deadline_exceeded",
@@ -862,11 +835,11 @@ public:
         owner.available.notify_all();
       }
     } release{*this};
-    // std::stop_callback deregistration joins an executing callback before the
-    // next call may use this descriptor. No per-call polling or worker thread.
-    std::stop_callback external_stop(cancellation,
-                                     [stop]() mutable { stop.request_stop(); });
-    std::stop_callback interrupted(stop.get_token(), [this] {
+    // StopCallback deregistration joins an executing callback before the next
+    // call may use this descriptor. No per-call polling or worker thread.
+    StopCallback external_stop(cancellation,
+                               [stop]() mutable { stop.request_stop(); });
+    StopCallback interrupted(stop.get_token(), [this] {
       signal_fd(cancellation_io.native_handle());
     });
     if (request.body.size() > limits.request_bytes ||
@@ -923,7 +896,7 @@ public:
     parser.body_limit(limits.response_bytes);
     if (verb == http::verb::head)
       parser.skip(true);
-    bool done = false, sent = false;
+    bool done = false, sent = false, oversize = false;
     std::string code, detail;
     auto finish = [&](const std::string &c, const std::string &d) {
       if (done)
@@ -957,15 +930,43 @@ public:
           finish("unavailable", e.message());
           return;
         }
-        http::async_read(socket, buffer, parser,
-                         [&](Error read_error, std::size_t) {
-                           if (done)
-                             return;
-                           if (read_error)
-                             finish("unavailable", read_error.message());
-                           else
-                             finish({}, {});
-                         });
+        // Header first: Beast 1.71 loses its body_limit error for a
+        // Content-Length body when one eager read covers header and body, so
+        // the non-eager header read must be the one to enforce the limit.
+        http::async_read_header(socket, buffer, parser, [&](Error header_error,
+                                                            std::size_t) {
+          if (done)
+            return;
+          if (header_error == http::error::body_limit) {
+            // A complete header block announces a body above the limit.
+            oversize = true;
+            finish("resource_exhausted", "response body exceeds the client limit");
+            return;
+          }
+          if (header_error) {
+            finish("unavailable", header_error.message());
+            return;
+          }
+          if (parser.is_done()) {
+            finish({}, {});
+            return;
+          }
+          http::async_read(socket, buffer, parser,
+                           [&](Error read_error, std::size_t) {
+                             if (done)
+                               return;
+                             if (read_error == http::error::body_limit) {
+                               // A chunked or close-delimited body outgrew the
+                               // limit after a complete header block arrived.
+                               oversize = true;
+                               finish("resource_exhausted",
+                                      "response body exceeds the client limit");
+                             } else if (read_error)
+                               finish("unavailable", read_error.message());
+                             else
+                               finish({}, {});
+                           });
+        });
       });
     };
     if (socket.is_open() && Clock::now() - last_used >= limits.idle_timeout)
@@ -1016,8 +1017,11 @@ public:
       throw;
     }
     if (!code.empty())
-      throw HttpCallError(
-          code, sent ? Delivery::OutcomeUnknown : Delivery::NotSent, detail);
+      throw HttpCallError(code,
+                          oversize ? Delivery::ResponseReceived
+                          : sent   ? Delivery::OutcomeUnknown
+                                   : Delivery::NotSent,
+                          detail);
     auto &received = parser.get();
     if (!instance_id.empty() &&
         (received.count("X-Xrpc-Instance-ID") != 1 ||
@@ -1052,9 +1056,9 @@ public:
   net::posix::stream_descriptor cancellation_io;
   beast::flat_buffer buffer;
   std::mutex admission;
-  std::condition_variable_any available;
+  std::condition_variable available;
   bool busy = false, closed = false;
-  std::stop_source active_stop;
+  StopSource active_stop;
   Clock::time_point last_used{};
 };
 HttpClient::HttpClient(std::string path, HttpLimits limits,
@@ -1062,7 +1066,7 @@ HttpClient::HttpClient(std::string path, HttpLimits limits,
     : impl_(new Impl(std::move(path), limits, std::move(instance_id))) {}
 HttpClient::~HttpClient() = default;
 HttpResponse HttpClient::call(HttpRequest request, Clock::time_point deadline,
-                              std::stop_token cancellation) {
+                              StopToken cancellation) {
   return impl_->call(std::move(request), deadline, cancellation);
 }
 void HttpClient::close() noexcept { impl_->close(); }

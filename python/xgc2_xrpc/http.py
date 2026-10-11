@@ -23,79 +23,87 @@ import aiohttp
 import httpx
 from aiohttp import web
 from .unix import UnixLease
-from .wire import WireError, bounded_json_dumps, validate_request_metadata, validate_response_metadata, validate_request_id, timeout_ms_from_seconds, strict_json_loads
-from .policy import resolve_policy, PolicyError, _registry
+from .wire import (DISPOSITIONS, ERROR_STATUS, RESPONSE_RECEIVED, WireError, bounded_json_dumps, code_for_status,
+                   strict_json_loads, timeout_ms_from_seconds, validate_request_id, validate_request_metadata,
+                   validate_response_metadata)
 from .app import HOST_KEY, DEADLINE_KEY, _text_size
 from .runtime import _CALL_OWNER
 
 _ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
 
-_LIMIT_FIELDS={"HOST_MAX_CONNECTIONS":"connections","HOST_MAX_IN_FLIGHT":"in_flight",
-               "MAX_HEADER_BYTES":"header_bytes","MAX_REQUEST_BYTES":"body_bytes",
-               "MAX_RESPONSE_BYTES":"response_bytes","HEADER_TIMEOUT_MS":"header_timeout",
-               "CALL_TIMEOUT_MS":"call_timeout","IDLE_TIMEOUT_MS":"idle_timeout",
-               "SHUTDOWN_TIMEOUT_MS":"shutdown_timeout"}
+_MAX_MILLISECONDS=2147483647
+_MAX_CALL_SECONDS=86400
+CLIENT_CONNECTIONS=16
 
 @dataclass(frozen=True)
 class Limits:
-    connections: int = None
-    in_flight: int = None
-    header_bytes: int = None
-    header_count: int = 64
-    body_bytes: int = None
-    response_bytes: int = None
-    header_timeout: float = None
-    call_timeout: float = None
-    idle_timeout: float = None
-    shutdown_timeout: float = None
-    def __post_init__(self):
-        defaults=resolve_policy({})
-        for field_name,option in _LIMIT_FIELDS.items():
-            if getattr(self,option) is None:
-                value=defaults.value(field_name)
-                object.__setattr__(self,option,value/1000 if field_name.endswith("_MS") else value)
-        for name in ("connections","in_flight","header_bytes","header_count","body_bytes","response_bytes"):
-            if type(getattr(self,name)) is not int:
-                raise ValueError("integer resource limits required")
-        if any(isinstance(v,bool) or not isinstance(v,(int,float)) for v in self.__dict__.values()):
-            raise ValueError("numeric resource limits required")
-        if any(not math.isfinite(v) or v <= 0 for v in self.__dict__.values()):
-            raise ValueError("finite positive limits required")
-        registry=_registry()
-        for name,option in _LIMIT_FIELDS.items():
-            chosen=getattr(self,option)*(1000 if name.endswith("_MS") else 1)
-            if chosen>registry.fields[name].maximum:
-                raise PolicyError(name,"host/client option exceeds registry maximum")
+    """Resource limits for a Host or Client; times are seconds.
 
-    @classmethod
-    def from_policy(cls,policy,*,overrides=None,client=False):
-        values=dict(overrides.__dict__) if overrides is not None else {}
-        fields=policy.fields
-        mapping=dict(_LIMIT_FIELDS)
-        if client:
-            mapping.pop("HOST_MAX_CONNECTIONS")
-            mapping["CLIENT_MAX_CONNECTIONS"]="connections"
-        for field_name,option in mapping.items():
-            field=fields.get(field_name)
-            if field is None:
-                continue
-            if overrides is None or field.source!="sdk_default":
-                values[option]=field.value/1000 if field_name.endswith("_MS") else field.value
-            if field.ceiling is not None and option in values:
-                chosen=values[option]*1000 if field_name.endswith("_MS") else values[option]
-                if chosen>field.ceiling:
-                    raise PolicyError(field_name,"host/client option exceeds declared ceiling")
-        return cls(**values)
+    Defaults: connections 32, in_flight 32, header_bytes 16384, header_count 64,
+    body_bytes and response_bytes 1048576, header_timeout 5, call_timeout 30
+    (at most 86400), idle_timeout 30, shutdown_timeout 5, reference_idle_timeout 30.
+    A Client given no Limits uses connections=16 per reference instead of 32.
+    """
+    connections: int = 32
+    in_flight: int = 32
+    header_bytes: int = 16384
+    header_count: int = 64
+    body_bytes: int = 1048576
+    response_bytes: int = 1048576
+    header_timeout: float = 5.0
+    call_timeout: float = 30.0
+    idle_timeout: float = 30.0
+    shutdown_timeout: float = 5.0
+    reference_idle_timeout: float = 30.0
+    def __post_init__(self):
+        for name in ("connections","in_flight","header_bytes","header_count","body_bytes","response_bytes"):
+            value=getattr(self,name)
+            if type(value) is not int:
+                raise ValueError("integer resource limits required")
+            if not 0<value<=_MAX_MILLISECONDS:
+                raise ValueError("%s must be in 1..%d"%(name,_MAX_MILLISECONDS))
+        for name in ("header_timeout","call_timeout","idle_timeout","shutdown_timeout","reference_idle_timeout"):
+            value=getattr(self,name)
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+                raise ValueError("finite positive limits required")
+            if value*1000>_MAX_MILLISECONDS:
+                raise ValueError("%s exceeds the wire maximum"%name)
+        if self.call_timeout>_MAX_CALL_SECONDS:
+            raise ValueError("call_timeout exceeds 86400 seconds")
+
+def _host_limits(limits):
+    if limits is None:
+        return Limits()
+    if not isinstance(limits,Limits):
+        raise TypeError("Limits required")
+    return limits
+
+def _client_limits(limits):
+    if limits is None:
+        return Limits(connections=CLIENT_CONNECTIONS)
+    if not isinstance(limits,Limits):
+        raise TypeError("Limits required")
+    return limits
 
 class Fault(Exception):
-    def __init__(self, code, message, status=None):
+    """A domain error with a code of the shared vocabulary (or a domain code).
+
+    Raised by handlers, and by a Client when the peer answered with an error:
+    then disposition is "response_received" and status is the HTTP status.
+    """
+    def __init__(self, code, message, status=None, *, disposition=None):
         super().__init__(message)
         self.code = code
-        self.status = status or {"invalid_argument":400,"not_found":404,"conflict":409,"resource_exhausted":429,"deadline_exceeded":504,"cancelled":499,"unavailable":503,"internal":500}.get(code,500)
+        self.status = status or ERROR_STATUS.get(code,500)
+        self.disposition = disposition
 
 class TransportError(Exception):
+    """A call that produced no usable answer; disposition is not_sent,
+    outcome_unknown or response_received (an answer the client refuses)."""
     def __init__(self, message, disposition):
         super().__init__(message)
+        if disposition not in DISPOSITIONS:
+            raise ValueError("disposition must be not_sent, outcome_unknown or response_received")
         self.disposition = self.outcome = disposition
 
 def _maintained_headers(headers, limits):
@@ -132,6 +140,9 @@ class Context:
     deadline: float
     cancelled: threading.Event
     peer_uid: object = None
+    # The query string of a discovery route, without "?" (for example "wait_ready_ms=250");
+    # empty if there is none. Any other route is refused when it carries a query.
+    query: str = ""
     def remaining(self):
         return max(0.0,self.deadline-time.monotonic())
     def check_cancelled(self):
@@ -140,10 +151,13 @@ class Context:
 
 @dataclass
 class Response:
+    """A reply. A Client returns it only for a 2xx answer, with disposition
+    "response_received"; a Host handler may ignore that field."""
     body: object
     status: int = 200
     content_type: str = "application/json"
     headers: dict = field(default_factory=dict)
+    disposition: str = RESPONSE_RECEIVED
     @classmethod
     def json(cls,value,status=200,*,max_bytes=1048576):
         return cls(bounded_json_dumps(value,max_bytes),status)
@@ -278,7 +292,7 @@ class _HttpCallOwner:
 class Host:
     def __init__(self,path,routes,*,runtime,limits=None,reclaim_unreachable=False,allowed_uids=None,instance_id="",discovery_routes=()):
         self.path,self.routes,self.runtime=path,dict(routes),runtime
-        self.limits=Limits.from_policy(runtime.policy,overrides=limits)
+        self.limits=_host_limits(limits)
         self.reclaim_unreachable=reclaim_unreachable
         self.allowed_uids=allowed_uids
         self.instance_id=instance_id
@@ -564,7 +578,9 @@ class Host:
                 _,uid,_=struct.unpack("3i",sock.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
             if self.allowed_uids is not None and uid not in self.allowed_uids:
                 raise Fault("unavailable","peer UID is not authorized")
-            context=Context(request_id,time.monotonic()+budget,threading.Event(),uid)
+            # A discovery route is chosen by method and path; its query is not part of the match.
+            discovery=request.method=="GET" and request.path in self.discovery_routes
+            context=Context(request_id,time.monotonic()+budget,threading.Event(),uid,request.query_string if discovery else "")
             request[DEADLINE_KEY]=context.deadline
             deadline_timer=arm_deadline(context.deadline)
             async def invoke():
@@ -573,7 +589,7 @@ class Host:
                     handler=self.routes.get(("GET",request.path))
                 if handler is None:
                     raise Fault("not_found","unknown domain route")
-                if request.query_string:
+                if request.query_string and not discovery:
                     raise Fault("invalid_argument","query parameters are not part of this route")
                 if request.content_length and request.content_length>self.limits.body_bytes:
                     raise Fault("resource_exhausted","request body exceeds limit")
@@ -631,7 +647,7 @@ class _OwnedHttpStream:
     """Native response cleanup and deadline outlive cancelling waiters."""
     def __init__(self,client,context,deadline):
         self.client,self.context,self.deadline=client,context,deadline
-        self.response=self.borrowed=self.task=self.timer=None
+        self.response=self.task=self.timer=None
         self.close_failure=None
         self.observed_native_close=False
 
@@ -642,8 +658,6 @@ class _OwnedHttpStream:
         return self.response
 
     def expire(self):
-        if self.borrowed is not None:
-            self.borrowed._closed=True
         self.start_close()
 
     def start_close(self):
@@ -705,7 +719,7 @@ class Client:
     """
     def __init__(self,path,*,runtime,limits=None,instance_id="",headers=None):
         self.path,self.runtime,self.instance_id=path,runtime,instance_id
-        self.limits=Limits.from_policy(runtime.policy,overrides=limits,client=True)
+        self.limits=_client_limits(limits)
         self._maintained_headers=_maintained_headers(headers,self.limits)
         self._session=None
         self._retiring_session=None
@@ -713,7 +727,7 @@ class Client:
         self._retiring_transport=None
         self._retiring_transport_task=None
         self._session_reservation=None
-        self._pool_idle=min(self.limits.idle_timeout,runtime.policy.value("CLIENT_REFERENCE_IDLE_TIMEOUT_MS")/1000)
+        self._pool_idle=min(self.limits.idle_timeout,self.limits.reference_idle_timeout)
         self._key=("unix",path,self.limits.connections,self._pool_idle)
         self._origin="http://localhost"
         self._ssl=None
@@ -724,7 +738,7 @@ class Client:
 
     @classmethod
     def from_service(cls,service,*,runtime,local_target,tls_context=None,limits=None,discovery=False,transport_factory=None,headers=None):
-        selected=Limits.from_policy(runtime.policy,overrides=limits,client=True)
+        selected=_client_limits(limits)
         address=service.endpoint.address
         if type(address) is not str or len(address)>selected.header_bytes:
             raise ValueError("bounded service endpoint required")
@@ -750,8 +764,8 @@ class Client:
         return client
 
     async def _acquire_session(self):
-        # HTTP is loop-owned, gRPC sync channels may be created on other
-        # threads. Check and insert under their common capacity lock.
+        # Session capacity is shared with other native owners that may run on
+        # other threads. Check and insert under their common capacity lock.
         if self._closed:
             raise TransportError("client closed","not_sent")
         if self._key in getattr(self.runtime,"_http_poisoned",{}):
@@ -808,7 +822,7 @@ class Client:
             self.runtime.cancel_session(self._session_reservation)
             self._session_reservation=None
 
-    async def call_async(self,path,value=None,*,timeout=2.0,method="POST",request_id=None,consumer=None):
+    async def call_async(self,path,value=None,*,timeout=2.0,method="POST",request_id=None):
         self.runtime.require_loop()
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0:
             raise TransportError("finite positive timeout required","not_sent")
@@ -816,11 +830,11 @@ class Client:
         if not self.runtime._outbound.acquire(blocking=False):
             raise TransportError("runtime call admission full","not_sent")
         try:
-            return await self._call_admitted(path,value,timeout=timeout,method=method,request_id=request_id,consumer=consumer)
+            return await self._call_admitted(path,value,timeout=timeout,method=method,request_id=request_id)
         finally:
             self.runtime._outbound.release()
 
-    async def _call_admitted(self,path,value=None,*,timeout=2.0,method="POST",request_id=None,state=None,consumer=None):
+    async def _call_admitted(self,path,value=None,*,timeout=2.0,method="POST",request_id=None,state=None):
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or timeout<=0:
             raise TransportError("finite positive timeout required","not_sent")
         timeout=min(timeout,self.limits.call_timeout)
@@ -886,7 +900,7 @@ class Client:
                 owned=_OwnedHttpStream(self,stream_request(),state["deadline"])
                 async with owned as response:
                     if sum(len(k)+len(v)+4 for k,v in response.headers.raw)>self.limits.header_bytes or len(response.headers.raw)>self.limits.header_count:
-                        raise TransportError("response headers exceed limit","response_received")
+                        raise TransportError("response headers exceed limit",RESPONSE_RECEIVED)
                     try:
                         validate_response_metadata(response.headers.raw,request_id=request_id,
                                                    instance_id=self.instance_id,discovery=self._discovery)
@@ -894,18 +908,10 @@ class Client:
                         raise TransportError(str(error),"outcome_unknown") from error
                     length=response.headers.get("Content-Length")
                     if length is not None and int(length)>self.limits.response_bytes:
-                        raise TransportError("response exceeds limit","response_received")
-                    if consumer is not None and response.status_code<400:
-                        incoming=IncomingStream(response,self.limits.response_bytes,owner=owned)
-                        owned.borrowed=incoming
-                        try:
-                            return await consumer(incoming)
-                        finally:
-                            incoming._closed=True
-                    data=await IncomingStream(response,self.limits.response_bytes,owner=owned).read()
+                        raise TransportError("response exceeds limit",RESPONSE_RECEIVED)
+                    data=await _read_body(response,self.limits.response_bytes,owned)
                     if response.status_code>=400:
-                        fault=_json(data).get("error",{})
-                        raise Fault(fault.get("code","internal"),fault.get("message","RPC failed"),response.status_code)
+                        raise _answer_fault(response.status_code,data)
                     return Response(data,response.status_code,response.headers.get("Content-Type",""),dict(response.headers))
             invocation=self.runtime.loop.create_task(invoke())
             invocation_cancelled=False
@@ -965,17 +971,6 @@ class Client:
     def json(self,path,value=None,**kwargs):
         return _json(self.call(path,value,**kwargs).body)
 
-    async def consume_async(self,path,consumer,value=None,**kwargs):
-        """Consume a native HTTPX raw response inside the call's owned lifetime."""
-        if not inspect.iscoroutinefunction(consumer):
-            raise TypeError("stream consumer must be async")
-        return await self.call_async(path,value,consumer=consumer,**kwargs)
-
-    def consume(self,path,consumer,value=None,**kwargs):
-        if not inspect.iscoroutinefunction(consumer):
-            raise TypeError("stream consumer must be async")
-        return self.call(path,value,consumer=consumer,**kwargs)
-
     async def close_async(self):
         self.runtime.require_loop()
         self._closed=True
@@ -1017,47 +1012,32 @@ class Client:
         self.close()
 
 
-class IncomingStream:
-    """Native HTTPX response borrowed only during Client.consume[_async]."""
-    def __init__(self,response,max_bytes,*,owner=None):
-        self._response=response
-        self._maximum=max_bytes
-        self._bytes=0
-        self._closed=False
-        self._owner=owner
-        self.status=response.status_code
-        self.headers=response.headers
-        self.content_type=response.headers.get("Content-Type","")
+def _answer_fault(status,data):
+    """The Fault for an error answer: the standard envelope wins, else the status decides."""
+    try:
+        envelope=_json(data).get("error")
+    except (ValueError,AttributeError):
+        envelope=None
+    if not isinstance(envelope,dict):
+        envelope={}
+    code,message=envelope.get("code"),envelope.get("message")
+    return Fault(code if isinstance(code,str) and code else code_for_status(status),
+                 message if isinstance(message,str) and message else "HTTP %d"%status,
+                 status,disposition=RESPONSE_RECEIVED)
 
-    async def iter_raw(self,chunk_size=65536):
-        if self._closed:
-            raise RuntimeError("stream lifetime ended")
-        if type(chunk_size) is not int or chunk_size<=0:
-            raise ValueError("positive chunk size required")
-        maximum=min(chunk_size,self._maximum+1)
-        try:
-            # Native arrivals are yielded immediately. chunk_size bounds each
-            # emitted chunk; it must never become a target to buffer toward.
-            async for chunk in self._response.aiter_raw():
-                if self._closed:
-                    raise RuntimeError("stream lifetime ended")
-                self._bytes+=len(chunk)
-                if self._bytes>self._maximum:
-                    raise TransportError("response exceeds limit","response_received")
-                for offset in range(0,len(chunk),maximum):
-                    if self._closed:
-                        raise RuntimeError("stream lifetime ended")
-                    yield chunk if len(chunk)<=maximum else chunk[offset:offset+maximum]
-        except (OSError,httpx.HTTPError) as error:
-            if self._owner is not None and self._owner.task is None and not self._owner.observed_native_close and self._response.is_closed:
-                self._owner.native_failure(error)
-            raise
-        else:
-            if self._owner is not None and self._response.is_closed:
-                self._owner.observed_native_close=True
-
-    async def read(self):
-        output=bytearray()
-        async for chunk in self.iter_raw():
+async def _read_body(response,maximum,owner):
+    """Read a native HTTPX response under a total byte cap, keeping native cleanup observable."""
+    output=bytearray()
+    try:
+        # Native arrivals are consumed as they come; the cap is checked on every chunk.
+        async for chunk in response.aiter_raw():
+            if len(output)+len(chunk)>maximum:
+                raise TransportError("response exceeds limit",RESPONSE_RECEIVED)
             output.extend(chunk)
-        return bytes(output)
+    except (OSError,httpx.HTTPError) as error:
+        if owner.task is None and not owner.observed_native_close and response.is_closed:
+            owner.native_failure(error)
+        raise
+    if response.is_closed:
+        owner.observed_native_close=True
+    return bytes(output)

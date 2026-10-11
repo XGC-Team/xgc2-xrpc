@@ -1,16 +1,23 @@
 # Python XRPC
 
-Python >=3.10; verified here on Python 3.12.3 with aiohttp 3.14.4,
-HTTPX 0.28.1/httpcore 1.0.9, and optional grpcio 1.84.0. ROS Noetic's system
-Python 3.8 cannot consume this package. A deployment owner must supply a
-supported interpreter/image; changing an SDK import is not deployment proof.
+Python 3.8 or newer (`requires-python >=3.8`; the suite runs on 3.8.10, the
+interpreter of ROS Noetic). Runtime dependencies are pinned exactly:
+`aiohttp==3.10.11`, `httpx==0.28.1` and `httpcore==1.0.9`. There is no gRPC,
+no raw outbound HTTP client and no configuration from the process environment.
+`pip install ./python` installs the package; sources must stay valid Python 3.8.
 
-## Explicit ownership and startup policy
+What it offers: a bounded HTTP/JSON (`http.v1`) host and client over private
+Unix sockets, native aiohttp public edges (TCP) with bounded bodies, streams and
+WebSockets, an HTTPS client, an outbound `WebSocketClient`, Unix endpoint
+ownership, the bootstrap input loader and bounded diagnostics.
+
+## Explicit ownership and plain limits
 
 ```python
-from xgc2_xrpc import Client, Host, Runtime
+from xgc2_xrpc import Client, Host, Limits, Runtime, new_instance_id
 
-runtime = Runtime.from_environment()  # composition root snapshots once
+runtime = Runtime()  # one IO thread and one bounded blocking pool
+boot_id = new_instance_id()
 host = Host(socket_path, routes, runtime=runtime, instance_id=boot_id,
             discovery_routes=("/v1/describe",)).start()
 client = Client(socket_path, runtime=runtime, instance_id=boot_id)
@@ -22,30 +29,33 @@ finally:
     runtime.close()
 ```
 
-`Runtime(policy=resolved_policy)` shares an explicitly resolved policy.
-`Runtime()` uses registry defaults without reading the environment. Startup
-defaults, overrides, capability selection and ceilings use `resolve_policy`;
-there are no environment aliases or per-request environment reads.
-`runtime.effective_policy()` reports value/source/revision/ceilings and actual
-shared Runtime capacities. `policy.update(..., expected_revision=...,
-authorized=True)` applies only declared mutable settings; authentication is
-the existing administrative interface owner's responsibility.
+A route in `discovery_routes` is an explicit unbound GET: it is matched by method and path
+alone, so `GET /v1/describe?wait_ready_ms=250` needs no instance header (Core does not know
+the instance before its first describe), and the query string reaches the handler as
+`Context.query`. Any other route is refused when it carries a query, and a query never makes
+another route a discovery route. (`Host.from_app` handlers read `request.query` themselves.)
 
-Host/client options consume the generated `_runtime_policy.json`; supplied
-environment/deployment values take precedence over role-specific `Limits`.
-The generated asset is packaged in the wheel and owned by the common registry
-generator. No copy of registry defaults is maintained in Python source.
+Limits are plain values with the defaults below; the environment is never read.
+
+| `Limits` field | Default | `Runtime` parameter | Default |
+|---|---|---|---|
+| `connections` | 32 (a `Client` without `limits` uses 16 per reference) | `blocking_workers` | 4 |
+| `in_flight` | 32 | `max_calls` | 32 |
+| `header_bytes`, `header_count` | 16384, 64 | `max_connections` | 32 |
+| `body_bytes`, `response_bytes` | 1048576 | `max_sessions` (client references) | 64 |
+| `header_timeout` | 5.0 s | `shutdown_timeout` | 5.0 s |
+| `call_timeout` (at most 86400) | 30.0 s | `log_level` | `"info"` |
+| `idle_timeout`, `reference_idle_timeout` | 30.0 s | `log_format` | `"json"` |
+| `shutdown_timeout` | 5.0 s | `observer` | none |
+
+Byte and count limits are positive integers up to 2147483647; times are finite
+positive seconds. `Runtime.status()["capacities"]` reports the Runtime values.
 
 One Runtime owns one IO thread, a fixed shared blocking pool, finite scheduled
-work, admitted calls/connections, and shared HTTP/gRPC endpoint capacity.
-Managed gRPC listeners reserve their full native connection cap; HTTP admission
-deducts those reservations from the same Runtime capacity. Reservations are not
-observed connection counts, and failed shutdown keeps them until cleanup succeeds.
-Reservations precede transport construction, including injected Agent
-transport factories. Retiring owners and failed cleanup still consume capacity.
-Per-client/robot handles share endpoint pools; instance generations are fenced
-per call without creating another pool. Synchronous factories and handlers
-must cooperate with their owner; timeout does not imply rollback or termination.
+work, admitted calls and connections, and the shared HTTP endpoint capacity.
+Per-client handles share endpoint pools; instance generations are fenced per
+call without creating another pool. Synchronous factories and handlers must
+cooperate with their owner; timeout does not imply rollback or termination.
 Runtime owns a native asyncio selector loop. At its public readiness seam,
 one-shot same-loop `Future.set_result` callbacks check whether cancellation or
 an earlier event already completed that Future. This handles AnyIO's UDS
@@ -55,6 +65,30 @@ The IO loop's native default executor is this same fixed pool. Native aiohttp
 file-spool and file-response work and native DNS submissions cannot create a
 second untracked default pool. Saturated submissions fail before entering an
 executor queue; running work retains its call and Host lease after cancellation.
+
+## Dispositions and errors
+
+Every call ends in one of three dispositions (`NOT_SENT`, `OUTCOME_UNKNOWN`,
+`RESPONSE_RECEIVED`, tuple `DISPOSITIONS`):
+
+| Disposition | How it surfaces |
+|---|---|
+| `not_sent` | `TransportError`: nothing reached the peer (invalid arguments, closed client, full admission, refused connection). |
+| `outcome_unknown` | `TransportError`: the request may have been processed (deadline, lost connection, answer from another instance or with another request ID). Failed mutations are never replayed. |
+| `response_received` | A 2xx answer returns `Response` (`.disposition`). An error answer raises `Fault` with `.code`, `.status` and `.disposition`, taken from the standard `{"error":{"code","message"}}` envelope or implied by the HTTP status. An answer the client refuses (larger than `response_bytes`, headers over the limit) raises `TransportError(..., "response_received")`. |
+
+The error codes are `invalid_argument`, `not_found`, `conflict`,
+`resource_exhausted`, `deadline_exceeded`, `cancelled`, `unavailable`,
+`internal`, `unauthenticated` (401) and `permission_denied` (403); a handler may
+use domain codes of its own. HTTPX retries and redirects are disabled. Caller
+IDs, canonical timeout metadata and instance fencing share the common wire
+helpers; queue, pool and connection wait consume the same deadline. Native
+header-send tracing conservatively distinguishes `not_sent` from
+`outcome_unknown`. `Client` checks response request-ID correlation and instance
+metadata before consumption, including error replies. Its shared pool has no
+persistent cookie authority. Explicit per-call timeouts are shortened to
+`Limits.call_timeout` before startup and scheduling, for both synchronous and
+asynchronous calls.
 
 ## Native aiohttp public edges
 
@@ -87,13 +121,8 @@ XRPC headers; products retain their authentication and public wire contracts.
 with the actual assigned port, including `address=("127.0.0.1", 0)`; it is `None`
 before start and after the listener stops. Unix listeners return their native
 socket address. Products do not inspect runner/site/server internals.
-
-`Limits` declares `connections`, `in_flight`, `header_bytes`, `header_count`,
-`body_bytes`, `response_bytes`, `header_timeout`, `call_timeout`, `idle_timeout`
-and `shutdown_timeout`. Byte/count limits are positive integers and times are
-finite positive seconds. Environment/deployment policy and declared ceilings
-resolve through the Runtime. `HOST_KEY` and `DEADLINE_KEY` expose the selected
-Host and absolute monotonic request deadline to a native handler.
+`HOST_KEY` and `DEADLINE_KEY` expose the selected Host and absolute monotonic
+request deadline to a native handler.
 
 `request.read()` uses the native body limit. Raw chunked input uses `iter_body`
 to enforce a cumulative byte limit. Raw output uses `RawStreamResponse`, which
@@ -138,8 +167,8 @@ not quiesced during Host shutdown.
 At the absolute deadline a separate owner-loop timer aborts the transport,
 even if a handler delays cancellation cleanup. The call, work and lease remain
 owned until that cleanup actually finishes. This requires the IO loop to run;
-CPU-blocking domain work belongs in the shared pool. Native WS framing/backpressure stays with aiohttp;
-there is no stdlib `HTTPServer` bridge or `edge.py` compatibility module.
+CPU-blocking domain work belongs in the shared pool. Native WS framing and
+backpressure stay with aiohttp.
 
 Native multipart `request.post()` bounds encoded request input and field count;
 it may spool files and decode part encodings. Products own decoded-domain and
@@ -154,99 +183,36 @@ and native Host shutdown tracking. Use an explicitly bounded authenticated
 ingress owner. HTTPX clients retain authenticated HTTPS and injected Agent
 transport support; they reject certificate/hostname verification disablement.
 
-## HTTPX raw response consumption
+## Outbound WebSocket
 
 ```python
-async def consume(stream):
-    async for chunk in stream.iter_raw(65536):
-        await destination.write(chunk)
+from xgc2_xrpc import WebSocketClient
 
-client.consume("/v1/binary", consume, method="GET", timeout=10)
-# On the selected Runtime loop: await client.consume_async(...)
+sockets = WebSocketClient("wss://upstream.example", runtime=runtime,
+                          tls_context=verified_tls)
+
+async def session(socket):
+    await socket.send_str("hello")
+    message = await socket.receive()
+
+sockets.consume("/session", session, timeout=300, max_msg_bytes=160000,
+                total_send_bytes=32000000, total_receive_bytes=1000000)
+# On the selected Runtime loop: await sockets.consume_async(...)
 ```
-
-The consumer runs within the original call budget and owns a borrowed native
-response only until return. Total bytes, native reads and consumer backpressure
-remain under admission. Retaining the wrapper does not extend its lifetime.
-`iter_raw(chunk_size=65536)` yields available native arrivals immediately;
-`chunk_size` is a maximum output fragment size, not a buffering target. Small
-SSE events and MJPEG fragments do not wait for a full chunk or upstream EOF.
-HTTPX retries and redirects are disabled. Caller IDs, canonical timeout metadata
-and instance fencing share the common wire helpers; queue, pool and connection
-wait consume the same deadline. Native header-send tracing conservatively
-distinguishes `not_sent` from `outcome_unknown`. No mutation is replayed.
-`Client` checks response request-ID correlation and instance metadata before
-consumption, including error replies. Its shared pool has no persistent cookie
-authority. Explicit per-call timeouts are shortened by resolved role policy
-before startup/scheduling, for both synchronous and asynchronous calls.
-
-## Public raw outbound HTTP and WS relay
-
-```python
-from xgc2_xrpc import RawClient, WebSocketClient, relay_websocket
-
-outbound = RawClient("https://upstream.example", runtime=runtime,
-                     tls_context=verified_tls)
-
-async def forward(request):
-    async def consume(upstream):
-        reply = RawStreamResponse(max_bytes=outbound.limits.response_bytes,
-                                  status=upstream.status,
-                                  headers={"Content-Type": upstream.content_type})
-        await reply.prepare(request)
-        async for chunk in upstream.iter_raw():
-            await reply.write(chunk)
-        return reply
-    return await outbound.request_async(
-        "/upload", method="POST", content=iter_body(request),
-        headers={"Content-Type": request.content_type},
-        consumer=consume, timeout=10)
-
-websockets = WebSocketClient("wss://upstream.example", runtime=runtime,
-                             tls_context=verified_tls)
-
-async def relay(request):
-    return await relay_websocket(request, websockets, "/session", timeout=300,
-                                 max_msg_bytes=160000,
-                                 total_send_bytes=32000000,
-                                 total_receive_bytes=1000000)
-```
-
-`RawClient.request` is the synchronous counterpart. Raw content is immutable
-bytes or an async iterable of byte buffers; chunk totals are checked before
-copying and the source's real `aclose` remains owned. Raw consumers run for every
-status, including non-JSON errors. Explicit origins accept HTTP/HTTPS; `uds=`
-selects native Unix transport with the supplied HTTP authority. Public requests
-do not add internal XRPC metadata, retry, redirect, cookies or decompression.
-Products select authentication and forwarded headers, including HTTP hop-header
-and content-encoding handling. Equivalent handles share HTTPX endpoint pools.
 
 `WebSocketClient.consume[_async](path, async_consumer, timeout=..., headers=...,
 protocols=..., max_msg_bytes=..., total_send_bytes=..., total_receive_bytes=...)`
-borrows a `BoundedWebSocket` with `receive`, `send_bytes`, `send_str`, `ping`,
-`pong`, and `close`. The message and cumulative limits tighten to role budgets;
-TEXT counts UTF-8 bytes and control payloads are finite. Equivalent handles
-share one native aiohttp session/connector and one Runtime reservation. `uds=`
-supports Unix WS; WSS validates certificate and hostname. Public native trace
-and middleware abort redirects and aiohttp's implicit persistent-GET retry.
-Compression is disabled.
+lends the consumer a socket with `receive`, `send_bytes`, `send_str`, `ping`,
+`pong` and `close`; it is valid only while the consumer runs. The message and
+cumulative limits tighten to the `Limits` budgets; TEXT counts UTF-8 bytes and
+control payloads are finite. Equivalent handles share one native aiohttp
+session/connector and one Runtime reservation. `uds=` supports Unix WS; WSS
+validates certificate and hostname. Public native trace and middleware abort
+redirects and aiohttp's implicit persistent-GET retry. Compression is disabled.
+There is no reconnect or replay.
 
-`relay_websocket` awaits two message-by-message pumps within the Host request;
-query selection and authentication headers stay with the product. It preserves
-the upstream-selected offered subprotocol, binary/text/control payloads and
-valid close reason/code. It creates no payload queue or reconnect loop. Relay
-and Host use the same Runtime; the shorter Host/client deadline closes the
-network while delayed consumer cleanup retains its call and pool ownership.
-Before the relay handler returns or raises, this relay's consumer, pumps and
-native close must actually finish. Thus a product's handler-scoped lease stays
-held during delayed cleanup, including repeated cancellation. Cleanup failure
-retains ownership until the composition owner explicitly retries client close;
-unrelated calls on the same client do not participate in this wait. Standalone
-`WebSocketClient.consume_async` still returns within its caller deadline while
-the SDK retains any unfinished cleanup.
-
-Close both outbound handles before closing their Runtime. Native close failure
-is distinct from quiescence. HTTPX/httpcore public closure traces catch failures
+Close outbound handles before closing their Runtime. Native close failure is
+distinct from quiescence. HTTPX/httpcore public closure traces catch failures
 even during read-error unwinding before a Response exists. Failed HTTP cleanup
 quarantines its shared endpoint and retains the native owner, session capacity
 and any still-running call. Some native wrappers mark closed before awaiting
@@ -260,83 +226,6 @@ checked immutable scalar values. Scratch containers/entries and result space
 are proportional to the output policy, rather than a full oversized domain
 encoding. Concurrent domain mutation may fail or produce a mixed domain
 snapshot; the SDK does not supply domain consistency/transactions.
-
-## Optional typed gRPC
-
-```python
-from xgc2_xrpc.grpc import GrpcHost, aio_channel, channel
-
-grpc_host = GrpcHost(socket_path, runtime=runtime, instance_id=boot_id)
-add_generated_servicer_to_server(servicer, grpc_host.server)
-grpc_host.start()
-
-async def invoke():
-    async with aio_channel(service_ref, runtime=runtime,
-                           local_target=local_target) as transport:
-        stub = GeneratedStub(transport)
-        return await stub.Command(request, timeout=2,
-                                  metadata=(("x-request-id", "caller:operation"),))
-
-result = runtime.run(invoke(), timeout=3)
-```
-
-Native aio hosting supports all four typed RPC shapes and both native async
-and conventional sync generated servicers. Sync domain work uses the same
-fixed Runtime pool as HTTP. Sync response streams have one buffered record.
-`aio_channel` is the preferred request-stream seam: native scheduling uses the
-selected Runtime loop. `channel` supports conventional generated sync stubs;
-grpcio itself creates a producer thread per admitted request stream. Its call
-permit and channel owner remain held until iterator execution and cleanup end.
-Closed channel handles revoke already-created stubs. Channels share a bounded
-cache with HTTP, including constructors and retiring owners.
-
-gRPC stream calls require an actual finite native deadline no longer than the
-Host maximum; native cancellation reaches blocked receive. Missing/duplicate
-IDs, stale instances and invalid deadlines fail before domain dispatch. Calls
-may supply a request ID; native errors after dispatch conservatively expose
-`GrpcTransportError.disposition == "outcome_unknown"` because grpcio provides
-no public header-send trace. Local validation/admission errors are `not_sent`.
-Native retry and wait-for-ready queues are disabled.
-
-Native stop is distinct from actual Python handler/iterator completion.
-Failed/noncooperative cleanup retains permits, channel/Runtime owners and the
-Unix lease lock; a later successful close retries failed iterator cleanup.
-grpc Core can remove the socket pathname during stop while the SDK lifetime
-lock remains exclusive. Path absence alone is not evidence of quiescence.
-
-`GrpcHost(..., max_connections=None)` consumes `HOST_MAX_CONNECTIONS` and the
-Runtime connection capacity. An explicit smaller `max_connections` allocates
-a tighter share for multiple Hosts; allocation exceeding the remaining shared
-capacity fails before binding. The default reserves the whole available role
-cap, so compositions sharing a Runtime should choose their shares explicitly.
-Pinned grpcio 1.84.0 enforces `grpc.max_allowed_incoming_connections` before
-handshaking, including raw connections without an HTTP/2 preface. The SDK's
-single UDS or numeric-address listener reserves this complete cap until successful Host close.
-Closing before `start()` completes the native start/stop lifecycle with domain
-admission closed; native stop alone leaves an unstarted listener FD open in
-this pinned version. Bind-failure cleanup uses this same owned lifecycle.
-
-The native quota applies **per listener**. Additional listeners created directly
-with public `host.server.add_*_port` belong to the caller: each inherits the cap,
-but their aggregate is outside the SDK-managed Runtime reservation. This native
-registration seam must not be used to claim a stronger shared budget.
-`host.status()` reports the cap, reservation and scope; native live connection
-counts are unavailable. `runtime.status().connections` counts HTTP connections;
-`native_reserved_connections` reports gRPC reserved capacity and
-`connection_envelope` sums the two. Concurrent RPC, stream, metadata, message
-and idle limits are separate bounds, not a total process/RSS/FD ceiling.
-Explicit runtime settings that this profile cannot enforce are rejected.
-
-`GrpcHost(path, ...)` owns one private UDS listener. Alternatively,
-`GrpcHost(address=(numeric_ip, port), credentials=native_server_credentials, ...)`
-owns one native TLS listener, with `port=0` allowed for an explicitly ephemeral
-endpoint. DNS listener addresses and missing native credentials are rejected.
-The composition owner supplies credentials from `grpc.ssl_server_credentials`;
-the SDK cannot inspect the TLS provenance of an opaque native ServerCredentials
-object. Native local credentials do not satisfy the network TLS contract.
-The read-only `bound_address` returns the actual endpoint. Connection caps at
-or above `INT_MAX` are rejected before native binding, including an invalid
-explicit value that a resolved environment setting would otherwise replace.
 
 ## Explicit bootstrap input
 
@@ -355,10 +244,9 @@ directory descriptors, without following symlinks; owned 0700 parents and
 single-link 0600 regular files are required. Input is bounded to 16 KiB and
 application depth to 32. Named native TLS/bearer grants are resolved and validated
 before listener or pool construction. Empty local-private grants are valid and
-retain the formal Host's existing Unix lease requirements.
-The maintained credential adapters here expose native HTTP SSL contexts and
-HTTP authorization headers; native gRPC credentials and metadata remain an
-explicit composition step for gRPC owners.
+retain the formal Host's existing Unix lease requirements. The maintained
+credential adapters here expose native HTTP SSL contexts and HTTP authorization
+headers.
 
 ```python
 startup = load_bootstrap_input(owner_input_path, role="client")
@@ -381,30 +269,33 @@ digest comparison. Product method/scope authorization remains in the product.
 ## Diagnostics and limits
 
 `runtime.status()` and `host.status()` expose maintained source-timed state;
-they perform no peer probes. One bounded lazy diagnostic writer emits
-redacted JSON/text to supervisor stderr. The supervisor owns rotation.
-Record/queue size, fixed event counters, rate suppression, saturation/recovery
-and dropped counts are bounded; arbitrary payloads/authentication/path/error
-text never reach the sink or observer. Observers run outside the IO thread.
-A stalled observer/sink can fail finite shutdown and retains its owner.
+they perform no peer probes. One bounded lazy diagnostic writer (`Diagnostics`,
+configured by `Runtime(log_level=..., log_format=...)`) emits redacted JSON or
+text to supervisor stderr. The supervisor owns rotation. Record/queue size,
+fixed event counters, rate suppression, saturation/recovery and dropped counts
+are bounded; arbitrary payloads/authentication/path/error text never reach the
+sink or observer. Observers run outside the IO thread. A stalled observer/sink
+can fail finite shutdown and retains its owner.
 
 Request headers are checked after native parsing; response headers are checked
-after all native app prepare signals and before native serialization. aiohttp's transient parser
-storage includes separate header count and field-size limits. The native
-pipeline queue is 32. Native transport/read buffers and parser-generated errors
-exist before SDK admission/response checks; nominal body/header limits are not
-an exact peak RSS claim. Header/idle timers use a conservative minimum. Native
-HTTPX/httpcore/h11 parsing has its own finite buffers before response policy.
-Caller-owned values, native TLS/grpc buffers and domain allocations remain
-separate from SDK retained buffers.
+after all native app prepare signals and before native serialization. aiohttp's
+transient parser storage includes separate header count and field-size limits.
+The native pipeline queue is 32. Native transport/read buffers and
+parser-generated errors exist before SDK admission/response checks; nominal
+body/header limits are not an exact peak RSS claim. Header/idle timers use a
+conservative minimum. Native HTTPX/httpcore/h11 parsing has its own finite
+buffers before response policy. Caller-owned values, native TLS buffers and
+domain allocations remain separate from SDK retained buffers.
 
-Verification commands (dependencies installed in an isolated location):
+Verification (install the pinned dependencies first, for example
+`pip install --user aiohttp==3.10.11 httpx==0.28.1 httpcore==1.0.9`):
 
 ```sh
-PYTHONPATH=/tmp/xrpc-python-deps:python python3 -m unittest discover -s python/tests -q
-PYTHONPATH=/tmp/xrpc-python-deps:python python3 python/benchmarks/resource_probe.py --calls 500
+PYTHONPATH=python python3 -m unittest discover -s python/tests
+PYTHONPATH=python python3 python/benchmarks/resource_probe.py --calls 500
 ```
 
-These are real Unix/TCP/TLS/native WS/gRPC tests and an isolated load/RSS probe.
-They do not establish live station, physical device, remote Agent/TLS routing,
-multi-language interoperability or sustained production readiness.
+These are real Unix, TCP, TLS and native WebSocket tests and an isolated
+load/RSS probe. They do not establish live station, physical device, remote
+Agent/TLS routing, multi-language interoperability or sustained production
+readiness.

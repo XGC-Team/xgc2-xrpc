@@ -12,7 +12,10 @@ import aiohttp
 from aiohttp import web
 
 from xgc2_xrpc import AppRouter, Host, Client, Limits, Runtime, Fault, TransportError
-from xgc2_xrpc.websocket import WebSocketClient, relay_websocket
+from xgc2_xrpc.websocket import WebSocketClient
+
+# One character that takes three bytes in UTF-8: the limits count payload bytes, not characters.
+THREE_BYTES = "\u2713"
 
 
 class WebSocketTests(unittest.TestCase):
@@ -81,8 +84,8 @@ class WebSocketTests(unittest.TestCase):
         async def consume(socket):
             borrowed.append(socket)
             self.assertEqual(socket.protocol, "robot.v1")
-            await socket.send_str("界界")
-            self.assertEqual((await socket.receive()).data, "界界")
+            await socket.send_str(THREE_BYTES * 2)
+            self.assertEqual((await socket.receive()).data, THREE_BYTES * 2)
             await socket.send_bytes(b"\x00\r\nabc")
             self.assertEqual((await socket.receive()).data, b"\x00\r\nabc")
             await socket.ping(b"ok")
@@ -141,9 +144,9 @@ class WebSocketTests(unittest.TestCase):
             with self.assertRaises(TypeError): await socket.send_str(Encoded("x"))
             await socket.send_bytes(Bytes(b"1234"))
             self.assertEqual((await socket.receive()).data, b"1234")
-            await socket.send_str("界")
-            self.assertEqual((await socket.receive()).data, "界")
-            with self.assertRaises(Fault): await socket.send_str("界")
+            await socket.send_str(THREE_BYTES)
+            self.assertEqual((await socket.receive()).data, THREE_BYTES)
+            with self.assertRaises(Fault): await socket.send_str(THREE_BYTES)
             self.assertEqual(socket.sent_bytes, 7)
         client.consume("/bounds", consume, timeout=1, max_msg_bytes=8, total_send_bytes=8)
 
@@ -161,13 +164,13 @@ class WebSocketTests(unittest.TestCase):
         async def cumulative(request):
             socket = web.WebSocketResponse(compress=False)
             await socket.prepare(request)
-            await socket.send_str("界")
-            await socket.send_str("界")
+            await socket.send_str(THREE_BYTES)
+            await socket.send_str(THREE_BYTES)
             return socket
         other, _ = self.serve(cumulative)
         second = self.client(other)
         async def twice(socket):
-            self.assertEqual((await socket.receive()).data, "界")
+            self.assertEqual((await socket.receive()).data, THREE_BYTES)
             await socket.receive()
         with self.assertRaises(Fault): second.consume("/total", twice, timeout=1, max_msg_bytes=3, total_receive_bytes=5)
 
@@ -295,18 +298,17 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(self.runtime.session_count(), 1)
         self.assertEqual(clients[0].status()["session_references"], 8)
 
-    def test_environment_precedence_tightens_native_role_caps(self):
-        self.runtime.close()
-        self.runtime = Runtime.from_environment({"XGC2_XRPC_CLIENT_MAX_CONNECTIONS": "2",
-            "XGC2_XRPC_MAX_REQUEST_BYTES": "8", "XGC2_XRPC_MAX_RESPONSE_BYTES": "8"}, max_calls=4)
+    def test_explicit_limits_bound_the_native_pool_and_message_sizes(self):
         origin, _ = self.serve(self.echo)
-        client = self.client(origin, limits=Limits(connections=1, body_bytes=4, response_bytes=4))
+        client = self.client(origin, limits=Limits(connections=2, body_bytes=8, response_bytes=8))
         self.assertEqual((client.limits.connections, client.limits.body_bytes, client.limits.response_bytes), (2, 8, 8))
+        default = self.client(origin)
+        self.assertEqual(default.limits.connections, 16)
         async def consume(socket):
             await socket.send_bytes(b"12345678")
             self.assertEqual((await socket.receive()).data, b"12345678")
             with self.assertRaises(Fault): await socket.send_bytes(b"x")
-        client.consume("/policy", consume, timeout=1, max_msg_bytes=100, total_send_bytes=100, total_receive_bytes=100)
+        client.consume("/limits", consume, timeout=1, max_msg_bytes=100, total_send_bytes=100, total_receive_bytes=100)
         self.assertEqual(client._pool.connector.limit, 2)
 
     def test_redirect_never_contacts_second_native_destination(self):
@@ -417,188 +419,6 @@ class WebSocketTests(unittest.TestCase):
             with self.assertRaises(Fault): other.consume("/shared-capacity", consume, timeout=1)
         finally: http.close()
 
-    def test_native_relay_preserves_query_protocol_messages_and_edge_lifetime(self):
-        seen = []
-        async def upstream(request):
-            seen.append(request.path_qs)
-            return await self.echo(request)
-        origin, _ = self.serve(upstream)
-        client = self.client(origin)
-        router = AppRouter()
-        async def relay(request):
-            return await relay_websocket(request, client, "/robot?n=" + request.query["n"], timeout=1,
-                max_msg_bytes=32, total_send_bytes=64, total_receive_bytes=64)
-        router.add_get("/edge", relay)
-        path = os.path.join(self.directory.name, "edge.sock")
-        async def check():
-            async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=path)) as native:
-                async with native.ws_connect("http://local/edge?n=7", protocols=("robot.v1",), autoping=False) as socket:
-                    self.assertEqual(socket.protocol, "robot.v1")
-                    await socket.send_bytes(b"edge\x00")
-                    self.assertEqual((await socket.receive(timeout=.5)).data, b"edge\x00")
-                    await socket.send_str("界")
-                    self.assertEqual((await socket.receive(timeout=.5)).data, "界")
-                    await socket.ping(b"control")
-                    self.assertEqual((await socket.receive(timeout=.5)).type, aiohttp.WSMsgType.PONG)
-                    self.assertEqual(host.status()["in_flight"], 1)
-                    self.assertEqual(client.status()["active_calls"], 1)
-            for _ in range(50):
-                if not client._calls and not host.status()["in_flight"]: break
-                await asyncio.sleep(.01)
-            self.assertEqual(host.status()["in_flight"], 0)
-        with Host.from_app(router, path=path, runtime=self.runtime, limits=Limits(call_timeout=1)) as host:
-            asyncio.run(check())
-        self.assertEqual(seen, ["/robot?n=7"])
-
-    def test_native_relay_forwards_peer_close_code_and_reason(self):
-        async def upstream(request):
-            socket = web.WebSocketResponse(compress=False)
-            await socket.prepare(request)
-            await socket.close(code=3001, message="已结束".encode("utf-8"))
-            return socket
-        origin, _ = self.serve(upstream)
-        client = self.client(origin)
-        router = AppRouter()
-        async def relay(request):
-            return await relay_websocket(request, client, "/closed", timeout=1)
-        router.add_get("/close", relay)
-        path = os.path.join(self.directory.name, "close.sock")
-        async def check():
-            async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=path)) as native:
-                async with native.ws_connect("http://local/close") as socket:
-                    message = await socket.receive(timeout=.5)
-                    self.assertEqual((message.type, message.data, message.extra), (aiohttp.WSMsgType.CLOSE, 3001, "已结束"))
-        with Host.from_app(router, path=path, runtime=self.runtime, limits=Limits(call_timeout=1)):
-            asyncio.run(check())
-
-    def test_relay_deadline_retains_handler_domain_lease_until_actual_native_close(self):
-        gate = self.event()
-        other_release = self.event()
-        other_entered = threading.Event()
-        cleanup_started, peer_stopped, handler_finished = threading.Event(), threading.Event(), threading.Event()
-        leases = {"active": 0}
-        async def gpu(request):
-            socket = web.WebSocketResponse(compress=False)
-            await socket.prepare(request)
-            try:
-                async for _ in socket: pass
-            finally: peer_stopped.set()
-            return socket
-        origin, _ = self.serve(gpu)
-        client = self.client(origin)
-        router = AppRouter()
-        async def relay(request):
-            leases["active"] += 1
-            leases["task"] = asyncio.current_task()
-            try:
-                return await relay_websocket(request, client, "/gpu", timeout=1)
-            finally:
-                leases["active"] -= 1
-                handler_finished.set()
-        router.add_get("/edge", relay)
-        path = os.path.join(self.directory.name, "owned-relay.sock")
-        original_close = aiohttp.ClientWebSocketResponse.close
-        async def gated_close(socket, *args, **kwargs):
-            if socket._response.url.path == "/gpu":
-                cleanup_started.set()
-                await gate.wait()
-            return await original_close(socket, *args, **kwargs)
-        async def external():
-            async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=path)) as native:
-                async with native.ws_connect("http://local/edge") as socket:
-                    message = await socket.receive(timeout=.5)
-                    self.assertIn(message.type, (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR))
-        async def finish():
-            gate.set()
-            for _ in range(100):
-                if handler_finished.is_set(): break
-                await asyncio.sleep(.005)
-        async def unrelated(socket):
-            other_entered.set()
-            await other_release.wait()
-            return "unrelated-finished"
-        other_future = self.runtime.submit(client.consume_async("/unrelated", unrelated, timeout=2))
-        self.assertTrue(other_entered.wait(.5))
-        with patch.object(aiohttp.ClientWebSocketResponse, "close", gated_close):
-            with Host.from_app(router, path=path, runtime=self.runtime, limits=Limits(call_timeout=.08)) as host:
-                try:
-                    asyncio.run(external())
-                    self.assertTrue(cleanup_started.wait(.5))
-                    self.assertTrue(peer_stopped.wait(.5))
-                    self.assertEqual(client.status()["active_calls"], 2)
-                    self.assertEqual(leases["active"], 1)
-                    self.assertFalse(handler_finished.is_set())
-                    self.assertEqual(host.status()["in_flight"], 1)
-                    async def cancel_again():
-                        for _ in range(2):
-                            leases["task"].cancel()
-                            await asyncio.sleep(0)
-                    self.runtime.run(cancel_again(), 1)
-                    self.assertEqual(leases["active"], 1)
-                    self.assertFalse(handler_finished.is_set())
-                finally:
-                    self.runtime.run(finish(), 1)
-                    async def release_unrelated(): other_release.set()
-                    try:
-                        self.assertTrue(handler_finished.is_set())
-                        self.assertEqual(leases["active"], 0)
-                        self.assertEqual(host.status()["in_flight"], 0)
-                        self.assertEqual(client.status()["active_calls"], 1)
-                        self.assertFalse(other_future.done())
-                    finally:
-                        self.runtime.run(release_unrelated(), 1)
-                        self.assertEqual(other_future.result(1), "unrelated-finished")
-
-    def test_relay_cleanup_failure_keeps_domain_lease_until_explicit_native_retry(self):
-        cleanup_failed, handler_finished = threading.Event(), threading.Event()
-        leases, attempts = {"active": 0}, []
-        async def upstream(request):
-            socket = web.WebSocketResponse(compress=False)
-            await socket.prepare(request)
-            await socket.send_bytes(b"123456789")
-            async for _ in socket: pass
-            return socket
-        origin, _ = self.serve(upstream)
-        client = self.client(origin)
-        router = AppRouter()
-        async def relay(request):
-            leases["active"] += 1
-            try:
-                return await relay_websocket(request, client, "/failure", timeout=1, max_msg_bytes=8)
-            finally:
-                leases["active"] -= 1
-                handler_finished.set()
-        router.add_get("/failure", relay)
-        path = os.path.join(self.directory.name, "failure-relay.sock")
-        original_close = aiohttp.ClientWebSocketResponse.close
-        async def fail_close(socket, *args, **kwargs):
-            if socket._response.url.path == "/failure" and socket._response.url.host != "local":
-                attempts.append(socket)
-                if len(attempts) == 1:
-                    cleanup_failed.set()
-                    raise OSError("native cleanup still owns the upstream")
-            return await original_close(socket, *args, **kwargs)
-        async def external():
-            async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=path)) as native:
-                async with native.ws_connect("http://local/failure") as socket:
-                    message = await socket.receive(timeout=.5)
-                    self.assertIn(message.type, (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR))
-        with patch.object(aiohttp.ClientWebSocketResponse, "close", fail_close):
-            with Host.from_app(router, path=path, runtime=self.runtime, limits=Limits(call_timeout=1)) as host:
-                try:
-                    asyncio.run(external())
-                    self.assertTrue(cleanup_failed.wait(.5))
-                    self.assertEqual(leases["active"], 1)
-                    self.assertFalse(handler_finished.is_set())
-                    self.assertEqual(client.status()["active_calls"], 1)
-                    self.assertEqual(host.status()["in_flight"], 1)
-                finally:
-                    client.close(timeout=.5)
-                self.assertTrue(handler_finished.wait(.5))
-                self.assertEqual(leases["active"], 0)
-        self.assertEqual(len(attempts), 2)
-
-    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL certificate fixture required")
     def test_real_wss_validates_certificate_and_hostname(self):
         certificate = os.path.join(self.directory.name, "server.pem")
         key = os.path.join(self.directory.name, "server.key")

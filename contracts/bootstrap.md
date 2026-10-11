@@ -2,10 +2,14 @@
 
 `BootstrapBinding` is the versioned instance input described by
 [`bootstrap.schema.json`](bootstrap.schema.json). It is domain-neutral and
-separate from the `XGC2_XRPC_` runtime-policy snapshot and from product schema
-configuration. Process/application owners inject this bounded value through
-their existing startup mechanism; the SDK does not add certificate environment
-variables, credential discovery, a PKI daemon or another editable product store.
+separate from product schema configuration. Process/application owners inject
+this bounded value through their existing startup mechanism; the SDK does not
+add certificate environment variables, credential discovery, a PKI daemon or
+another editable product store. The input exists for the owners that use it
+(Core's storage host, xsim, the visualizer, Lichtblick and the Python scene and
+calibration services); `limits` and diagnostics are plain options, not part of it.
+Bindings are `http.v1` or `grpc.v1`; a `udp.v1` service authenticates with a key
+ring file instead ([udp-v1.md](udp-v1.md#key-file)).
 
 This input applies to an actual service transport owner. It does not require
 each module, library, data relay or product process to create an endpoint.
@@ -20,8 +24,8 @@ Reject unknown fields, missing/empty handles, duplicate storage grants and
 profile/endpoint mismatches. Unix addresses are absolute canonical paths of at
 most 107 encoded bytes; HTTPS is an authenticated origin with no credentials,
 query, fragment or resource path; native gRPC TLS is a canonical host:port.
-Node supplemental hosts additionally reject Unix bindings before opening a
-listener. They use the same binding with native authenticated HTTPS.
+The Node startup loader accepts authenticated TLS bindings only (its bound host
+is HTTPS); the Node Unix host takes its socket path as the `unixPath` option.
 
 Handles are capabilities supplied by the existing process and managed-file
 owners. They are not filesystem paths, certificate contents or environment
@@ -57,7 +61,7 @@ Their facade may share the same application's execution and diagnostics owner;
 internal invocation is still fenced and finite and never falls back to a
 public unbound edge. The SDK exposes no additional diagnostic or credential
 port. TLS material, secret handles and bootstrap data are excluded from logs
-and effective runtime-policy queries.
+and status snapshots.
 
 ## Actual owner-supplied startup input
 
@@ -68,9 +72,9 @@ the SDK and limited to 32 nesting levels. Products validate it themselves; it
 can reference a managed configuration or asset grant rather than inline large
 scene/robot configuration. It is not another persisted configuration authority.
 
-Formal SDK local-private Unix bindings may have empty `secret_handles` and
-`grants`; they use the existing exclusive private endpoint lease without dummy
-TLS credentials. The supplemental Node host rejects that transport explicitly.
+Local-private Unix bindings may have empty `secret_handles` and `grants`; they
+use the existing exclusive private endpoint lease without dummy TLS credentials.
+The Node loader rejects that transport explicitly (see above).
 
 The existing process owner supplies one `--bootstrap-input /explicit/path`
 argument to its native application. There is no new credential environment
@@ -96,7 +100,7 @@ bearer authorization grant returns both immutable outbound `headers` and an
 inbound `authorize(request, context)` verifier; it rejects duplicate headers
 and compares a fixed-size digest in constant time. This verifier establishes
 the declared transport credential only. Product method/scope authorization
-remains in the product. `createBoundHTTPHost(handler, { ...input, instanceId,
-policy })` uses the TLS grants and requires authorization to return exactly
-`true` while the RPC is still live, before dispatching the domain handler.
+remains in the product. `createBoundHTTPHost(handler, { ...input, instanceId })` uses the TLS grants and
+requires authorization to return exactly `true` while the RPC is still live,
+before dispatching the domain handler.
 The native application still owns listen, readiness, drain and exit.

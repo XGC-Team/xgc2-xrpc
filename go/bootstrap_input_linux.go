@@ -3,6 +3,7 @@ package xrpc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,7 +17,6 @@ import (
 type BootstrapInput struct {
 	binding     BootstrapBinding
 	application json.RawMessage
-	grants      map[string]CredentialGrant
 	credentials *BootstrapCredentials
 }
 
@@ -38,26 +38,49 @@ func (i *BootstrapInput) Credentials() *BootstrapCredentials {
 	}
 	return i.credentials
 }
-func (i *BootstrapInput) ResolveGrant(handle string) (CredentialGrant, error) {
-	if i == nil {
-		return CredentialGrant{}, bootstrapError()
+
+// openPrivateDirectory pins an owned mode0700 directory without following any
+// path symlink.
+func openPrivateDirectory(path string) (*os.File, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, errors.New("xrpc: canonical absolute private directory required")
 	}
-	value, ok := i.grants[handle]
-	if !ok {
-		return CredentialGrant{}, bootstrapError()
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
 	}
-	return value, nil
+	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if part == "" {
+			continue
+		}
+		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		unix.Close(fd)
+		if err != nil {
+			return nil, err
+		}
+		fd = next
+	}
+	var stat unix.Stat_t
+	if err = unix.Fstat(fd, &stat); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	if stat.Uid != uint32(os.Geteuid()) || stat.Mode&0777 != 0700 {
+		unix.Close(fd)
+		return nil, errors.New("xrpc: private directory must be owned mode0700")
+	}
+	return os.NewFile(uintptr(fd), path), nil
 }
 
-// ReadPrivateBootstrapFile pins a regular, single-link, owned mode0600 file
+// readPrivateBootstrapFile pins a regular, single-link, owned mode0600 file
 // below an owned mode0700 final parent. It never follows path symlinks, opens
 // devices/FIFOs for blocking reads, or looks up an implicit credential path.
 // maxBytes must be 1..128KiB; returned material belongs to the caller.
-func ReadPrivateBootstrapFile(path string, maxBytes int) ([]byte, error) {
+func readPrivateBootstrapFile(path string, maxBytes int) ([]byte, error) {
 	if maxBytes < 1 || maxBytes > 128<<10 || len(path) > 4096 || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0) || path == "/" {
 		return nil, bootstrapError()
 	}
-	directory, err := openLogDirectory(filepath.Dir(path))
+	directory, err := openPrivateDirectory(filepath.Dir(path))
 	if err != nil {
 		return nil, bootstrapError()
 	}
@@ -91,62 +114,62 @@ type grantDescriptor struct {
 	TokenFile string `json:"token_file,omitempty"`
 }
 
-func loadGrant(data json.RawMessage) (CredentialGrant, error) {
+func loadGrant(data json.RawMessage) (credentialGrant, error) {
 	var d grantDescriptor
 	if err := strictJSON(data, &d); err != nil {
-		return CredentialGrant{}, err
+		return credentialGrant{}, err
 	}
 	switch d.Kind {
 	case "tls_identity":
 		if !requiredJSON(data, "kind", "cert_file", "key_file") || d.CAFile != "" || d.TokenFile != "" {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		var fields map[string]json.RawMessage
 		_ = json.Unmarshal(data, &fields)
 		if len(fields) != 3 {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
-		cert, err := ReadPrivateBootstrapFile(d.CertFile, 128<<10)
+		cert, err := readPrivateBootstrapFile(d.CertFile, 128<<10)
 		if err != nil {
-			return CredentialGrant{}, err
+			return credentialGrant{}, err
 		}
-		key, err := ReadPrivateBootstrapFile(d.KeyFile, 64<<10)
+		key, err := readPrivateBootstrapFile(d.KeyFile, 64<<10)
 		if err != nil {
-			return CredentialGrant{}, err
+			return credentialGrant{}, err
 		}
 		defer clear(key)
-		return NewTLSIdentityGrant(cert, key)
+		return newTLSIdentityGrant(cert, key)
 	case "tls_trust":
 		if !requiredJSON(data, "kind", "ca_file") {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		var fields map[string]json.RawMessage
 		_ = json.Unmarshal(data, &fields)
 		if len(fields) != 2 {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
-		ca, err := ReadPrivateBootstrapFile(d.CAFile, 128<<10)
+		ca, err := readPrivateBootstrapFile(d.CAFile, 128<<10)
 		if err != nil {
-			return CredentialGrant{}, err
+			return credentialGrant{}, err
 		}
-		return NewTLSTrustGrant(ca)
+		return newTLSTrustGrant(ca)
 	case "bearer":
 		if !requiredJSON(data, "kind", "token_file") {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
 		var fields map[string]json.RawMessage
 		_ = json.Unmarshal(data, &fields)
 		if len(fields) != 2 {
-			return CredentialGrant{}, bootstrapError()
+			return credentialGrant{}, bootstrapError()
 		}
-		token, err := ReadPrivateBootstrapFile(d.TokenFile, 1024)
+		token, err := readPrivateBootstrapFile(d.TokenFile, 1024)
 		if err != nil {
-			return CredentialGrant{}, err
+			return credentialGrant{}, err
 		}
 		defer clear(token)
-		return NewBearerGrant(string(token))
+		return newBearerGrant(string(token))
 	default:
-		return CredentialGrant{}, bootstrapError()
+		return credentialGrant{}, bootstrapError()
 	}
 }
 
@@ -157,7 +180,7 @@ func LoadBootstrapInput(path string, role BootstrapRole) (*BootstrapInput, error
 	if role != BootstrapServer && role != BootstrapClient {
 		return nil, bootstrapError()
 	}
-	data, err := ReadPrivateBootstrapFile(path, MaxBootstrapBytes)
+	data, err := readPrivateBootstrapFile(path, MaxBootstrapBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +197,7 @@ func LoadBootstrapInput(path string, role BootstrapRole) (*BootstrapInput, error
 	if err := strictJSON(data, &document); err != nil || document.SchemaVersion != 1 || document.Grants == nil || len(document.Grants) > 32 {
 		return nil, bootstrapError()
 	}
-	binding, err := ParseBootstrapBinding(document.Binding)
+	binding, err := parseBootstrapBinding(document.Binding)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +208,7 @@ func LoadBootstrapInput(path string, role BootstrapRole) (*BootstrapInput, error
 			return nil, bootstrapError()
 		}
 	}
-	input := &BootstrapInput{binding: binding, application: bytes.Clone(document.Application), grants: make(map[string]CredentialGrant, len(document.Grants))}
+	grants := make(map[string]credentialGrant, len(document.Grants))
 	for handle, descriptor := range document.Grants {
 		if !ValidID(handle) {
 			return nil, bootstrapError()
@@ -194,13 +217,19 @@ func LoadBootstrapInput(path string, role BootstrapRole) (*BootstrapInput, error
 		if err != nil {
 			return nil, err
 		}
-		input.grants[handle] = value
+		grants[handle] = value
 	}
-	input.credentials, err = binding.ResolveCredentials(input.ResolveGrant, role)
+	credentials, err := binding.resolveCredentials(func(handle string) (credentialGrant, error) {
+		value, ok := grants[handle]
+		if !ok {
+			return credentialGrant{}, bootstrapError()
+		}
+		return value, nil
+	}, role)
 	if err != nil {
 		return nil, err
 	}
-	return input, nil
+	return &BootstrapInput{binding: binding, application: bytes.Clone(document.Application), credentials: credentials}, nil
 }
 
 // The opaque application counts container nesting only, independently of the

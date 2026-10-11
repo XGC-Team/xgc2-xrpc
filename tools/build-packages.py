@@ -10,103 +10,137 @@ import shutil
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packaging"))
-from support import ABI, ROOT, digest, elf_info, run, source_files, system_suite, tar_source, utc_now, write_json
-from node_deb import build_node_deb, verify_source_tar
+from support import (ABI, ROOT, cpp_package_set, digest, elf_info, run, source_files, suite_cpp_components,
+                     suite_languages, system_suite, tar_source, utc_now, write_json)
+from node_deb import NODE, TS, build_node_deb, verify_source_tar
+
+LANGUAGES = ("cpp", "go", "node", "python", "rust", "ts")
 
 
-def build_cpp(args, source, work, out, version, sdk_version):
+def copy_link(source, target_directory):
+    target_directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target_directory / source.name, follow_symlinks=False)
+
+
+def build_cpp(args, source, work, out, version, sdk_version, components):
+    """Build the selected components once and split the install into Debian packages.
+
+    Every file a component installs carries the component's name as its CMake install
+    component (and the CMake package files carry `config`), so each package is assembled
+    from exactly the components it ships. Only CMake features of 3.10, the version Ubuntu
+    18.04 ships, are used: no -S/-B, --install or --parallel.
+    """
+    packages = cpp_package_set(components)
     build = work / "cpp-build"
     stage = work / "cpp-stage"
+    build.mkdir()
     multiarch = run(["dpkg-architecture", "-qDEB_HOST_MULTIARCH"], capture=True)
     flags = ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_INSTALL_PREFIX=/usr",
              "-DCMAKE_INSTALL_LIBDIR=lib/" + multiarch, "-DBUILD_TESTING=OFF",
-             "-DXGC2_XRPC_ENABLE_GRPC=" + ("ON" if args.cpp_profile == "grpc" else "OFF"),
-             "-DCMAKE_CXX_COMPILER=" + args.cxx]
+             "-DXGC2_XRPC_COMPONENTS=" + ";".join(components), "-DCMAKE_CXX_COMPILER=" + args.cxx]
     if args.cmake_prefix:
         flags.append("-DCMAKE_PREFIX_PATH=" + ";".join(args.cmake_prefix))
-    run(["cmake", "-S", source, "-B", build] + flags)
-    run(["cmake", "--build", build, "--parallel", str(args.jobs)])
-    run(["cmake", "--install", build], env={"DESTDIR": str(stage)})
-    lib = stage / "usr/lib" / multiarch
-    # Bootstrap is part of the base HTTP ABI: http's retained-parent and
-    # credential setup calls into it at runtime, so ship its SONAME beside
-    # the other non-gRPC libraries and let dpkg-shlibdeps derive OpenSSL.
-    names = {"libxgc2-xrpc1": ["unix", "policy", "diagnostics", "bootstrap", "http", "json_http"]}
-    if args.cpp_profile == "grpc":
-        names["libxgc2-xrpc-grpc1"] = ["grpc"]
-    packages = {}
+    run(["cmake", source] + flags, cwd=build)
+    run(["cmake", "--build", ".", "--", "-j" + str(args.jobs)], cwd=build)
+    for component in list(components) + ["config"]:
+        run(["cmake", "-DCMAKE_INSTALL_COMPONENT=" + component, "-P", "cmake_install.cmake"],
+            cwd=build, env={"DESTDIR": str(stage / component)})
+    lib_relative = Path("usr/lib") / multiarch
+    cmake_relative = lib_relative / "cmake/XgcXrpc"
+    roots = {}
+    accounted = set()
     abi = {}
-    for runtime_name, libraries in names.items():
-        dev_name = runtime_name.removesuffix("1") + "-dev" if hasattr(str, "removesuffix") else runtime_name[:-1] + "-dev"
-        for name in (runtime_name, dev_name):
-            packages[name] = work / "deb-roots" / name
-            (packages[name] / "DEBIAN").mkdir(parents=True)
-            (packages[name] / "usr/lib" / multiarch).mkdir(parents=True)
-        for library in libraries:
-            actual = lib / ("libxgc2_xrpc_" + library + ".so." + sdk_version)
+    shlibs = {}
+    for package in packages:
+        runtime, dev = package["runtime"], package["dev"]
+        generation = ABI["cpp"]["soname"][package["components"][0]]
+        for name in (runtime, dev):
+            roots[name] = work / "deb-roots" / name
+            (roots[name] / "DEBIAN").mkdir(parents=True)
+        shlibs[runtime] = ""
+        for component in package["components"]:
+            installed = stage / component
+            lib = installed / lib_relative
+            actual = lib / ("libxgc2_xrpc_" + component + ".so." + sdk_version)
             info = elf_info(actual, args.distribution, args.architecture)
-            expected_soname = "libxgc2_xrpc_" + library + ".so.1"
+            expected_soname = "libxgc2_xrpc_" + component + ".so." + str(generation)
             if info["soname"] != expected_soname:
                 raise ValueError("unexpected SONAME: " + str(info))
             abi[actual.name] = info
             for file in (actual, lib / expected_soname):
-                shutil.copy2(file, packages[runtime_name] / "usr/lib" / multiarch / file.name, follow_symlinks=False)
-            link = lib / ("libxgc2_xrpc_" + library + ".so")
-            shutil.copy2(link, packages[dev_name] / "usr/lib" / multiarch / link.name, follow_symlinks=False)
-        (packages[runtime_name] / "DEBIAN/shlibs").write_text("".join(
-            "libxgc2_xrpc_" + name + " 1 " + runtime_name + " (>= " + version + ")\n" for name in libraries))
+                copy_link(file, roots[runtime] / lib_relative)
+                accounted.add(file)
+            link = lib / ("libxgc2_xrpc_" + component + ".so")
+            copy_link(link, roots[dev] / lib_relative)
+            accounted.add(link)
+            shlibs[runtime] += "libxgc2_xrpc_%s %d %s (>= %s)\n" % (component, generation, runtime, version)
+            headers = installed / "usr/include/xgc2/xrpc"
+            for header in sorted(headers.glob("*")):
+                copy_link(header, roots[dev] / "usr/include/xgc2/xrpc")
+                accounted.add(header)
+            for cmake in sorted((installed / cmake_relative).glob("*")):
+                copy_link(cmake, roots[dev] / cmake_relative)
+                accounted.add(cmake)
+        if package["root"]:
+            for cmake in sorted((stage / "config" / cmake_relative).glob("*")):
+                copy_link(cmake, roots[dev] / cmake_relative)
+                accounted.add(cmake)
+    everything = {path for path in stage.rglob("*") if path.is_file() or path.is_symlink()}
+    if everything != accounted:
+        raise ValueError("the install tree has files no package takes: " +
+                         ", ".join(sorted(str(p.relative_to(stage)) for p in everything - accounted)))
+    for runtime in shlibs:
+        (roots[runtime] / "DEBIAN/shlibs").write_text(shlibs[runtime])
         # ldconfig is run only when dpkg actually installs/removes the runtime package.
-        (packages[runtime_name] / "DEBIAN/triggers").write_text("activate-noawait ldconfig\n")
-    base_dev = packages["libxgc2-xrpc-dev"]
-    include = base_dev / "usr/include/xgc2/xrpc"
-    include.mkdir(parents=True)
-    for header in (stage / "usr/include/xgc2/xrpc").glob("*"):
-        if header.name != "grpc.hpp":
-            shutil.copy2(header, include / header.name)
-        elif args.cpp_profile == "grpc":
-            grpc_include = packages["libxgc2-xrpc-grpc-dev"] / "usr/include/xgc2/xrpc"
-            grpc_include.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(header, grpc_include / header.name)
-    for cmake in (lib / "cmake/XgcXrpc").glob("*"):
-        owner = "libxgc2-xrpc-grpc-dev" if cmake.name.startswith("XgcXrpcGrpcTargets") else "libxgc2-xrpc-dev"
-        target = packages[owner] / "usr/lib" / multiarch / "cmake/XgcXrpc"
-        target.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cmake, target / cmake.name)
+        (roots[runtime] / "DEBIAN/triggers").write_text("activate-noawait ldconfig\n")
     deps_work = work / "shlibdeps"
     (deps_work / "debian").mkdir(parents=True)
     (deps_work / "debian/control").write_text("Source: xgc2-xrpc\nSection: libs\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\n\n" +
-        "\n".join("Package: " + name + "\nArchitecture: any\n" for name in names))
-    (deps_work / "debian/shlibs.local").write_text("".join((packages[name] / "DEBIAN/shlibs").read_text() for name in names))
+        "\n".join("Package: " + name + "\nArchitecture: any\n" for name in shlibs))
+    (deps_work / "debian/shlibs.local").write_text("".join(shlibs.values()))
+    search = [roots[name] / lib_relative for name in shlibs]
     result = []
-    for name, root in packages.items():
-        if name in names:
-            argv = ["dpkg-shlibdeps", "-O", "-x" + name, "-l" + str(lib)]
-            argv += ["-S" + str(Path(p).resolve()) for p in args.shlibdeps_package_root]
-            argv += ["-l" + str(Path(p).resolve()) for p in args.shlibdeps_library_path]
-            argv += ["-e" + str(lib / ("libxgc2_xrpc_" + item + ".so." + sdk_version)) for item in names[name]]
-            depends = run(argv, cwd=deps_work, capture=True)
-            if not depends.startswith("shlibs:Depends=") or not depends.split("=", 1)[1]:
-                raise ValueError("dpkg-shlibdeps produced no runtime dependencies")
-            depends = depends.split("=", 1)[1]
-        else:
-            runtime_name = name.removesuffix("-dev") + "1" if hasattr(str, "removesuffix") else name[:-4] + "1"
-            depends = runtime_name + " (= " + version + ")"
-            if name == "libxgc2-xrpc-dev":
-                depends += ", nlohmann-json3-dev (>= 3.7)"
-            if name == "libxgc2-xrpc-grpc-dev":
-                depends += ", libxgc2-xrpc-dev (= " + version + "), libgrpc++-dev (>= 1.16), libprotobuf-dev"
-        section = "libs" if name in names else "libdevel"
-        (root / "DEBIAN/control").write_text(
-            "Package: " + name + "\nVersion: " + version + "\nArchitecture: " + args.architecture +
-            "\nMulti-Arch: same\nSection: " + section + "\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\nDepends: " + depends +
-            "\nDescription: XGC2 XRPC " + ("native shared library" if name in names else "C++20 development interface") + "\n Bounded transport SDK; providers own their domain and lifecycle.\n")
-        doc = root / "usr/share/doc" / name
-        doc.mkdir(parents=True)
-        (doc / "copyright").write_text("XGC Team\nLicense: Apache-2.0\nSee /usr/share/common-licenses/Apache-2.0.\n")
-        deb = out / (name + "_" + version + "_" + args.architecture + ".deb")
-        run(["dpkg-deb", "--root-owner-group", "--build", root, deb])
-        result.append({"kind": "deb", "path": deb.name, "package": name, "depends": depends})
+    for package in packages:
+        for name in (package["runtime"], package["dev"]):
+            runtime = name == package["runtime"]
+            if runtime:
+                argv = ["dpkg-shlibdeps", "-O", "-x" + name]
+                argv += ["-l" + str(path) for path in search]
+                argv += ["-S" + str(Path(p).resolve()) for p in args.shlibdeps_package_root]
+                argv += ["-l" + str(Path(p).resolve()) for p in args.shlibdeps_library_path]
+                argv += ["-e" + str(roots[name] / lib_relative / ("libxgc2_xrpc_" + c + ".so." + sdk_version)) for c in package["components"]]
+                depends = run(argv, cwd=deps_work, capture=True)
+                if not depends.startswith("shlibs:Depends=") or not depends.split("=", 1)[1]:
+                    raise ValueError("dpkg-shlibdeps produced no runtime dependencies")
+                depends = depends.split("=", 1)[1]
+            else:
+                depends = ", ".join([package["runtime"] + " (= " + version + ")"] +
+                                    [item.format(version=version) for item in package["dev_depends"]])
+            (roots[name] / "DEBIAN/control").write_text(
+                "Package: " + name + "\nVersion: " + version + "\nArchitecture: " + args.architecture +
+                "\nMulti-Arch: same\nSection: " + ("libs" if runtime else "libdevel") +
+                "\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\nDepends: " + depends +
+                "\nDescription: XGC2 XRPC " + ("native shared library" if runtime else "C++17 development interface") +
+                " (" + ", ".join(package["components"]) + ")\n Bounded transport SDK; providers own their domain and lifecycle.\n")
+            doc = roots[name] / "usr/share/doc" / name
+            doc.mkdir(parents=True)
+            (doc / "copyright").write_text(
+                "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\nFiles: *\nCopyright: XGC Team\n"
+                "License: Apache-2.0\n Licensed under the Apache License, Version 2.0. On Debian systems the full text is in\n"
+                " /usr/share/common-licenses/Apache-2.0.\n")
+            deb = out / (name + "_" + version + "_" + args.architecture + ".deb")
+            run(["dpkg-deb", "--root-owner-group", "--build", roots[name], deb])
+            result.append({"kind": "deb", "path": deb.name, "package": name, "depends": depends})
     return result, abi
+
+
+def pack_npm(directory, out, name, sdk_version):
+    pack = run(["npm", "pack", "--offline", "--ignore-scripts", "--json", "--pack-destination", out],
+               cwd=directory, capture=True)
+    metadata = json.loads(pack)[0]
+    if metadata["name"] != name or metadata["version"] != sdk_version:
+        raise ValueError(name + " manifest version differs from the product version")
+    return metadata["filename"]
 
 
 def main():
@@ -114,8 +148,9 @@ def main():
     parser.add_argument("--output", required=True, type=Path, help="new directory outside the source checkout")
     parser.add_argument("--distribution", choices=ABI["distributions"], required=True)
     parser.add_argument("--architecture", choices=ABI["architectures"], required=True)
-    parser.add_argument("--language", choices=("cpp", "python", "go", "rust", "node"), action="append")
-    parser.add_argument("--cpp-profile", choices=("http", "grpc"), default="grpc")
+    parser.add_argument("--language", choices=LANGUAGES, action="append",
+                        help="default: every language the distribution ships (Bionic: only the C++ udp component)")
+    parser.add_argument("--cpp-components", help="comma-separated C++ components (default: every component of the distribution)")
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--cmake-prefix", action="append", default=[])
@@ -138,7 +173,14 @@ def main():
     actual_arch = run(["dpkg", "--print-architecture"], capture=True)
     if actual_arch != args.architecture:
         raise ValueError("native build architecture must match the requested cell")
-    languages = sorted(set(args.language or ("cpp", "python", "go", "rust", "node")))
+    shipped = suite_languages(args.distribution)
+    languages = sorted(set(args.language or shipped))
+    if not set(languages) <= set(shipped):
+        raise ValueError(args.distribution + " ships only: " + ", ".join(shipped))
+    suite_components = suite_cpp_components(args.distribution)
+    components = args.cpp_components.split(",") if args.cpp_components else suite_components
+    if not set(components) <= set(suite_components):
+        raise ValueError(args.distribution + " ships only the C++ components: " + ", ".join(suite_components))
     if any((args.node_tarball, args.node_tarball_sha256, args.node_source_sha)):
         if not all((args.node_tarball, args.node_tarball_sha256, args.node_source_sha)) or "node" not in languages or args.release_source_sha:
             raise ValueError("pinned Node artifact requires tarball, SHA256 and exact Node commit; local probes only")
@@ -153,8 +195,8 @@ def main():
         source_sha = run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture=True)
         if source_sha != args.release_source_sha or run(["git", "status", "--porcelain"], cwd=ROOT, capture=True):
             raise ValueError("release candidate requires clean exact-source checkout")
-        if languages != ["cpp", "go", "node", "python", "rust"] or args.cpp_profile != "grpc":
-            raise ValueError("release candidate requires all SDKs and native C++ gRPC")
+        if languages != shipped or components != suite_components:
+            raise ValueError("release candidate requires every SDK and C++ component the distribution ships")
         if args.cmake_prefix or args.shlibdeps_package_root or args.shlibdeps_library_path:
             raise ValueError("release toolchains must be installed in the controlled image; local dependency extraction is not release evidence")
         tree = run(["git", "ls-tree", "-rz", source_sha], cwd=ROOT, capture=True)
@@ -189,7 +231,7 @@ def main():
         shutil.copy2(ROOT / name, target)
         inputs[name] = digest(target)
     snapshot_id = hashlib.sha256(json.dumps({"files": inputs, "languages": languages,
-        "cpp_profile": args.cpp_profile, "source_date_epoch": args.source_date_epoch,
+        "cpp_components": components, "source_date_epoch": args.source_date_epoch,
         "node_artifact_override": {"sha256": args.node_tarball_sha256, "source_sha": args.node_source_sha}},
         sort_keys=True).encode()).hexdigest()
     if source_sha:
@@ -200,13 +242,13 @@ def main():
         version = product_version + "+probe." + snapshot_id[:12] + "~" + args.distribution
     evidence = {"schema": "xgc2.xrpc.package-evidence.v1", "created_at": utc_now(),
                 "distribution": args.distribution, "architecture": args.architecture,
-                "version": product_version, "languages": languages, "cpp_profile": args.cpp_profile,
+                "version": product_version, "languages": languages, "cpp_components": components if "cpp" in languages else [],
                 "source_files": inputs, "snapshot_id": snapshot_id, "deb_version": version,
                 "source_date_epoch": args.source_date_epoch,
         "source_sha": source_sha, "release_candidate": bool(source_sha),
                 "artifacts": [], "elf": {}, "trusted_release": False}
     if "cpp" in languages:
-        artifacts, evidence["elf"] = build_cpp(args, source, work, out, version, sdk_version)
+        artifacts, evidence["elf"] = build_cpp(args, source, work, out, version, sdk_version, components)
         evidence["artifacts"] += artifacts
     if "python" in languages:
         run([args.python, "-c", "import sys; assert sys.version_info >= (3,8), 'XRPC requires Python >= 3.8'"])
@@ -240,23 +282,29 @@ def main():
             lock = work / "committed-node-package-lock.json"
             lock.write_text(run(["git", "show", node_sha + ":node/package-lock.json"], cwd=ROOT, capture=True) + "\n")
         else:
-            pack = run(["npm", "pack", "--offline", "--ignore-scripts", "--json", "--pack-destination", out],
-                       cwd=source / "node", capture=True)
-            metadata = json.loads(pack)[0]
-            if metadata["name"] != "@xgc2/xrpc" or metadata["version"] != sdk_version:
-                raise ValueError("Node manifest version differs from product version")
-            name = metadata["filename"]
+            name = pack_npm(source / "node", out, NODE.npm_name, sdk_version)
             lock = source / "node/package-lock.json"
         evidence["artifacts"].append({"kind": "node", "path": name, "node_source_sha": node_sha})
-        evidence["artifacts"].append(build_node_deb(out / name, lock, work, out, version, sdk_version,
+        evidence["artifacts"].append(build_node_deb(NODE, out / name, lock, work, out, version, sdk_version,
                                                    args.source_date_epoch, node_sha))
+    if "ts" in languages:
+        # The package is built TypeScript: install the locked compiler from the npm cache,
+        # compile, then pack. Neither step runs a lifecycle script.
+        typescript = source / "ts"
+        run(["npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=typescript)
+        run(["npm", "run", "build"], cwd=typescript)
+        name = pack_npm(typescript, out, TS.npm_name, sdk_version)
+        evidence["artifacts"].append({"kind": "ts", "path": name, "node_source_sha": source_sha})
+        evidence["artifacts"].append(build_node_deb(TS, out / name, None, work, out, version, sdk_version,
+                                                   args.source_date_epoch, source_sha))
     for artifact in evidence["artifacts"]:
         artifact["sha256"] = digest(out / artifact["path"])
         artifact["bytes"] = (out / artifact["path"]).stat().st_size
     evidence["toolchain"] = {"python": run([args.python, "--version"], capture=True),
                              "cxx": run([args.cxx, "--version"], capture=True).splitlines()[0] if "cpp" in languages else None,
-                             "node": run(["node", "--version"], capture=True) if "node" in languages else None,
-                             "npm": run(["npm", "--version"], capture=True) if "node" in languages else None}
+                             "cmake": run(["cmake", "--version"], capture=True).splitlines()[0] if "cpp" in languages else None,
+                             "node": run(["node", "--version"], capture=True) if {"node", "ts"} & set(languages) else None,
+                             "npm": run(["npm", "--version"], capture=True) if {"node", "ts"} & set(languages) else None}
     if source_sha:
         if run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture=True) != source_sha or run(["git", "status", "--porcelain"], cwd=ROOT, capture=True):
             raise ValueError("source changed while constructing release artifacts")

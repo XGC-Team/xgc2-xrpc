@@ -1,7 +1,8 @@
 """One owned, bounded diagnostic writer for a process Runtime.
 
-The SDK writes structured stderr; the supervisor owns collection and rotation.
-This module opens no files. Sink and observer work run outside transport work.
+The SDK writes structured stderr (level "info" and format "json" unless
+configured); the supervisor owns collection and rotation. This module opens
+no files. Sink and observer work run outside transport work.
 """
 
 import math
@@ -12,7 +13,6 @@ import time
 from collections import deque
 from collections.abc import Mapping
 
-from .policy import ResolvedPolicy
 from .wire import WireError, bounded_json_dumps
 
 
@@ -53,10 +53,12 @@ class Diagnostics:
     actual work finishes. The thread is non-daemon and is never abandoned.
     """
 
-    def __init__(self, policy, observer=None, *, max_records=128,
+    def __init__(self, observer=None, *, level="info", format="json", max_records=128,
                  max_record_bytes=4096, repeat_interval=1.0, stream=None):
-        if not isinstance(policy, ResolvedPolicy):
-            raise TypeError("resolved startup runtime policy required")
+        if level not in _LEVELS:
+            raise ValueError("level must be trace, debug, info, warn or error")
+        if format not in ("json", "text"):
+            raise ValueError("format must be json or text")
         if observer is not None and not callable(observer):
             raise TypeError("diagnostic observer must be callable")
         if type(max_records) is not int or max_records < 1:
@@ -65,9 +67,8 @@ class Diagnostics:
             raise ValueError("diagnostic record byte limit must be at least 256")
         if isinstance(repeat_interval, bool) or not isinstance(repeat_interval, (int, float)) or not math.isfinite(repeat_interval) or repeat_interval <= 0:
             raise ValueError("finite positive diagnostic repetition interval required")
-        self.policy = policy
-        self.format = policy.value("LOG_FORMAT")
-        policy.value("LOG_LEVEL")
+        self.level = level
+        self.format = format
         self.max_records = max_records
         self.max_record_bytes = max_record_bytes
         self.repeat_interval = repeat_interval
@@ -136,8 +137,7 @@ class Diagnostics:
         if type(event) is not str or len(event) > 32 or event not in _EVENTS:
             event = "unclassified"
         copied, redacted = self._fields(fields)
-        level = self.policy.value("LOG_LEVEL")
-        should_log = _LEVELS[_EVENTS[event]] >= _LEVELS[level]
+        should_log = _LEVELS[_EVENTS[event]] >= _LEVELS[self.level]
         now = time.monotonic()
         with self._condition:
             _increment(self._counts, event)
@@ -185,7 +185,7 @@ class Diagnostics:
         # Coalesced transition slots use constant memory outside the data queue.
         fields = {"dropped": self._totals["dropped"], "queue_depth": len(self._queue),
                   "state": "saturated" if event == "diagnostic_saturated" else "recovered"}
-        should_log = _LEVELS[_EVENTS[event]] >= _LEVELS[self.policy.value("LOG_LEVEL")]
+        should_log = _LEVELS[_EVENTS[event]] >= _LEVELS[self.level]
         if not should_log:
             _increment(self._totals, "filtered")
         return event, fields, should_log, time.time_ns()

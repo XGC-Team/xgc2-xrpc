@@ -21,12 +21,7 @@ struct JsonHttpRequest {
   std::string method, target, request_id;
   Headers headers;
   std::optional<Json> body; // no body differs from a JSON null body
-  Clock::time_point deadline{}; // server-supplied; client call's deadline wins
-};
-struct JsonHttpResponse {
-  int status = 200;
-  Headers headers;
-  std::optional<Json> body;
+  Clock::time_point deadline{}; // the host's deadline for this call
 };
 // Copies retain the underlying admission/endpoint lease until actual work
 // ends, including after cancellation. Completion is safe from any thread.
@@ -56,19 +51,5 @@ private:
   Handler handler_;
   JsonLimits request_limits_;
   std::size_t response_bytes_;
-};
-// Reuses HttpClient's connection, identity fence, deadline and cancellation.
-// No retries or replay. Invalid response JSON has an unknown delivery outcome.
-class JsonHttpClient {
-public:
-  explicit JsonHttpClient(std::string socket_path, HttpLimits limits = {},
-                          std::string instance_id = {}, unsigned max_depth = 32);
-  JsonHttpResponse call(JsonHttpRequest, Clock::time_point deadline,
-                         std::stop_token cancellation = {});
-  void close() noexcept { client_.close(); }
-private:
-  HttpLimits limits_;
-  unsigned max_depth_;
-  HttpClient client_;
 };
 } // namespace xgc2::xrpc

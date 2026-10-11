@@ -89,7 +89,7 @@ func TestGRPCForcedCloseRetainsLeaseUntilHandlerReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
-	host, err := grpcx.Serve(listener, lease, func(r grpc.ServiceRegistrar) {
+	host, err := grpcx.ServeWithOptions(listener, lease, func(r grpc.ServiceRegistrar) {
 		r.RegisterService(&grpc.ServiceDesc{ServiceName: "fault.Service", HandlerType: (*interface{})(nil), Methods: []grpc.MethodDesc{{MethodName: "Block", Handler: func(server any, ctx context.Context, decode func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 			var request emptypb.Empty
 			if err := decode(&request); err != nil {
@@ -98,7 +98,7 @@ func TestGRPCForcedCloseRetainsLeaseUntilHandlerReturns(t *testing.T) {
 			next := func(context.Context, any) (any, error) { close(entered); <-release; return &emptypb.Empty{}, nil }
 			return interceptor(ctx, &request, &grpc.UnaryServerInfo{FullMethod: "/fault.Service/Block"}, next)
 		}}}}, struct{}{})
-	})
+	}, grpcx.HostOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

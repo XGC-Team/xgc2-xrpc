@@ -1,13 +1,18 @@
 #include "xgc2/xrpc/grpc.hpp"
 #include "xgc2/xrpc/diagnostics.hpp"
 #include "grpc_fixture.grpc.pb.h"
+#include "google/protobuf/duration.pb.h"
+#include "google/rpc/error_details.pb.h"
+#include "google/rpc/status.pb.h"
 #include <array>
 #include <cassert>
 #include <condition_variable>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sys/socket.h>
@@ -15,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 using namespace xgc2::xrpc;
 using namespace std::chrono_literals;
@@ -50,10 +56,13 @@ struct Service : Fixture::Service {
   std::atomic<unsigned> stream_entries{0};
   std::atomic<unsigned> discovery_entries{0};
   std::atomic<unsigned> malformed_discovery_replies{0};
+  // Lets a test choose the failure an admitted Echo returns.
+  std::function<grpc::Status(GrpcCallScope&)> responder;
   explicit Service(GrpcAdmission& a) : admission(a) {}
   grpc::Status Echo(grpc::ServerContext* context, const Packet* input, Packet* output) override {
     auto call = admission.begin(*context);
     if (!call) return call.status();
+    if (responder) return responder(call);
     if (input->value() == "hold") {
       std::unique_lock lock(mutex); entered = true; cv.notify_all();
       cv.wait(lock, [&] { return release; });
@@ -171,9 +180,22 @@ grpc::Status echo(Host& host, const std::string& value = "hello", std::string in
   GrpcClientCall call(context, std::move(instance), GrpcClock::now() + 2s, {}, "caller.request-1");
   Packet request, response; request.set_value(value);
   auto status = call.invoke([&] { return host.stub->Echo(&context, request, &response); });
-  assert(call.delivery() == GrpcDelivery::OutcomeUnknown);
+  // An OK response that passed the fence is a received response; any failure
+  // here is unmarked, so the outcome stays unknown.
+  assert(call.delivery() == (status.ok() ? Delivery::ResponseReceived : Delivery::OutcomeUnknown));
   if (status.ok()) assert(response.value() == value);
   return status;
+}
+struct Outcome { grpc::Status status; Delivery delivery; };
+// One Echo with the fixed request ID and instance the golden vectors use.
+Outcome echo_outcome(Host& host, std::function<grpc::Status(GrpcCallScope&)> responder) {
+  host.service.responder = std::move(responder);
+  grpc::ClientContext context;
+  GrpcClientCall call(context, "instance-one", GrpcClock::now() + 2s, {}, "caller.request-1");
+  Packet request, response; request.set_value("probe");
+  auto status = call.invoke([&] { return host.stub->Echo(&context, request, &response); });
+  host.service.responder = nullptr;
+  return {status, call.delivery()};
 }
 void multi_service_server_first_reverse_streams() {
   Directory directory;
@@ -188,7 +210,7 @@ void multi_service_server_first_reverse_streams() {
   auto unary_stub = Fixture::NewStub(channel);
   auto first_stub = xgc2::xrpc::test::ReverseOne::NewStub(channel);
   auto second_stub = xgc2::xrpc::test::ReverseTwo::NewStub(channel);
-  std::stop_source cancel_first;
+  StopSource cancel_first;
   grpc::ClientContext first_context, second_context;
   GrpcClientCall first_call(first_context, admission.instance_id(),
       grpc_stream_deadline(limits, GrpcClock::now() + 2s), cancel_first.get_token(), "reverse.first");
@@ -294,7 +316,7 @@ void client_explicit_unary_discovery() {
     assert(call.invoke([&] { return host.stub->Discover(&context, input, &output); }).ok());
     assert(call.response_instance_id() == host.admission.instance_id());
     assert(output.value() == call.response_instance_id());
-    assert(call.delivery() == GrpcDelivery::OutcomeUnknown);
+    assert(call.delivery() == Delivery::ResponseReceived);
   }
   assert(host.service.discovery_entries == 2);
   for (const auto* mode : {"wrong", "empty", "duplicate"}) {
@@ -357,7 +379,7 @@ void client_explicit_unary_discovery() {
     assert(native_status.ok());
     assert(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
     assert(call.response_instance_id().empty());
-    assert(call.delivery() == GrpcDelivery::OutcomeUnknown);
+    assert(call.delivery() == Delivery::OutcomeUnknown);
   }
   assert(host.service.discovery_entries == 2 && host.service.malformed_discovery_replies == 3);
   {
@@ -368,7 +390,7 @@ void client_explicit_unary_discovery() {
     grpc::ClientContext context;
     GrpcClientCall call(context, "", GrpcClock::now() + 1s, {}, "discovery.no-stream-wait", true);
     assert(call.receive_initial_metadata(probe).error_code() == grpc::StatusCode::INVALID_ARGUMENT);
-    assert(probe.waits == 0 && call.delivery() == GrpcDelivery::NotSent);
+    assert(probe.waits == 0 && call.delivery() == Delivery::NotSent);
     assert(call.response_instance_id().empty());
     assert(call.verify_initial_metadata().error_code() == grpc::StatusCode::INVALID_ARGUMENT);
     // No native RPC has run, so sticky rejection must precede native metadata access.
@@ -412,64 +434,27 @@ void client_explicit_unary_discovery() {
   }
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
 }
-void client_only_policy_mapping() {
-  RuntimePolicyOptions options;
-  options.capabilities = {"rpc", "transport"};
-  options.environment = {{"XGC2_XRPC_MAX_REQUEST_BYTES", "4096"},
-      {"XGC2_XRPC_MAX_RESPONSE_BYTES", "8192"}, {"XGC2_XRPC_CALL_TIMEOUT_MS", "1100"},
-      {"XGC2_XRPC_IDLE_TIMEOUT_MS", "2000"}};
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  const auto limits = grpc_client_limits(resolve_runtime_policy(options), {"IDLE_TIMEOUT_MS"});
-  assert(limits.request_bytes == 4096 && limits.response_bytes == 8192);
-  assert(limits.call_timeout == 1100ms && limits.idle_timeout == 2000ms);
-  const auto channel_arguments = grpc_channel_arguments(limits);
-  const auto native_arguments = channel_arguments.c_channel_args();
-  unsigned idle_arguments = 0;
-  for (std::size_t i = 0; i < native_arguments.num_args; ++i) {
-    const auto& argument = native_arguments.args[i];
-    if (std::strcmp(argument.key, "grpc.client_idle_timeout_ms") == 0) {
-      ++idle_arguments;
-      assert(argument.type == GRPC_ARG_INTEGER && argument.value.integer == 2000);
-    }
-  }
-  assert(idle_arguments == 0);
-  auto manual = limits; manual.idle_timeout = 0ms;
-  throws([&] { (void)grpc_channel_arguments(manual); });
+void limits_validation() {
+  // Defaults are valid and documented in grpc.hpp.
+  const GrpcLimits defaults;
+  assert(defaults.connections == 32 && defaults.inflight == 32 &&
+         defaults.streams_per_connection == 32 && defaults.request_bytes == 1048576 &&
+         defaults.response_bytes == 1048576 && defaults.header_bytes == 16384 &&
+         defaults.call_timeout == 30000ms && defaults.idle_timeout == 30000ms &&
+         defaults.shutdown_timeout == 5000ms && defaults.native_threads == 8);
+  Directory directory;
+  (void)make_grpc_unix_channel(directory.socket(), defaults);
+  auto manual = defaults;
+  // The native idle option treats zero and INT_MAX as unlimited or invalid.
+  manual.idle_timeout = 0ms;
+  throws([&] { (void)make_grpc_unix_channel(directory.socket(), manual); });
   manual.idle_timeout = 2147483647ms;
-  throws([&] { (void)grpc_channel_arguments(manual); });
-  RuntimePolicyOptions server_policy;
-  server_policy.capabilities = {"host", "rpc", "transport", "grpc"};
-  server_policy.environment = {{"XGC2_XRPC_IDLE_TIMEOUT_MS", "2147483647"}};
-  throws([&] { (void)grpc_limits(resolve_runtime_policy(server_policy)); });
-  grpc::ServerBuilder server_builder;
-  throws([&] { configure_grpc_server(server_builder, manual); });
-  RuntimePolicyOptions defaults; defaults.capabilities = {"rpc", "transport"};
-  assert(grpc_client_limits(resolve_runtime_policy(defaults)).idle_timeout == 30000ms);
-  options.environment.back().second = "999";
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  options.environment.back().second = "2147483647";
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  options.environment.back().second = "2147483646";
-  assert(grpc_client_limits(resolve_runtime_policy(options), {"IDLE_TIMEOUT_MS"}).idle_timeout == 2147483646ms);
-  options.environment.pop_back();
-  options.environment.push_back({"XGC2_XRPC_HOST_MAX_IN_FLIGHT", "7"});
-  // No declared host owner: a client-only resolver rejects this environment.
-  throws([&] { (void)resolve_runtime_policy(options); });
-  options.capabilities.push_back("host");
-  // In a composed process the declared host owner enforces this field. It
-  // must not overwrite unrelated client limits with the host's admission cap.
-  assert(grpc_client_limits(resolve_runtime_policy(options)).inflight == GrpcLimits{}.inflight);
-  options.environment.pop_back(); options.capabilities = {"rpc", "transport", "grpc"};
-  options.environment.push_back({"XGC2_XRPC_GRPC_MAX_STREAMS_PER_CONNECTION", "5"});
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(options)); });
-  constexpr std::array<std::string_view, 1> applied_streams{"GRPC_MAX_STREAMS_PER_CONNECTION"};
-  assert(grpc_client_limits(resolve_runtime_policy(options), applied_streams).streams_per_connection == 5);
-  options.environment.pop_back();
-  options.ceilings["GRPC_MAX_STREAMS_PER_CONNECTION"] = 32;
-  const auto ceiling_only = resolve_runtime_policy(options);
-  throws([&] { (void)grpc_client_limits(ceiling_only); });
-  constexpr std::array<std::string_view, 1> invalid_owner{"LOG_LEVEL"};
-  throws([&] { (void)grpc_client_limits(resolve_runtime_policy(defaults), invalid_owner); });
+  throws([&] { (void)make_grpc_unix_channel(directory.socket(), manual); });
+  manual = defaults; manual.request_bytes = 0;
+  throws([&] { GrpcAdmission invalid("limits-instance", manual); });
+  manual = defaults; manual.native_threads = 1;
+  throws([&] { GrpcAdmission invalid("limits-instance", manual); });
+  throws([&] { (void)make_grpc_unix_channel("relative.sock", defaults); });
 }
 void unary_metadata_and_limits() {
   GrpcLimits l; l.request_bytes = 256; l.response_bytes = 256;
@@ -500,12 +485,12 @@ void unary_metadata_and_limits() {
   GrpcClientCall a(c1, "instance-one", GrpcClock::now() + 1s);
   GrpcClientCall b(c2, "instance-one", GrpcClock::now() + 1s);
   assert(a.request_id() != b.request_id());
-  std::stop_source stop; stop.request_stop();
+  StopSource stop; stop.request_stop();
   grpc::ClientContext cancelled_context;
   GrpcClientCall cancelled(cancelled_context, "instance-one", GrpcClock::now() + 1s, stop.get_token());
   bool invoked = false;
   assert(cancelled.invoke([&] { invoked = true; return grpc::Status::OK; }).error_code() == grpc::StatusCode::CANCELLED);
-  assert(!invoked && cancelled.delivery() == GrpcDelivery::NotSent);
+  assert(!invoked && cancelled.delivery() == Delivery::NotSent);
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
   assert(::access(host.directory.socket().c_str(), F_OK) != 0);
 }
@@ -600,7 +585,7 @@ void native_stream_deadline_and_cancel() {
   }
   await([&] { return host.admission.stats().inflight_calls == 0; });
   {
-    std::stop_source stop;
+    StopSource stop;
     grpc::ClientContext context;
     GrpcClientCall call(context, "instance-one", GrpcClock::now() + 800ms, stop.get_token());
     assert(call.mark_dispatched().ok());
@@ -619,7 +604,7 @@ void native_stream_deadline_and_cancel() {
 void admission_and_failed_quiescence() {
   GrpcLimits l; l.inflight = 1; l.native_threads = 4;
   Host host(l);
-  std::stop_source stop;
+  StopSource stop;
   grpc::Status held_status;
   std::thread client([&] {
     grpc::ClientContext context;
@@ -776,20 +761,6 @@ void native_thread_quota() {
             << " including " << callers << " caller threads, native cap=" << limits.native_threads << '\n';
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
 }
-void policy_mapping() {
-  RuntimePolicyOptions options;
-  options.capabilities = {"host", "rpc", "transport", "grpc"};
-  options.environment = {{"XGC2_XRPC_HOST_MAX_IN_FLIGHT", "7"},
-                         {"XGC2_XRPC_GRPC_MAX_STREAMS_PER_CONNECTION", "5"},
-                         {"XGC2_XRPC_SHUTDOWN_TIMEOUT_MS", "70"}};
-  const auto limits = grpc_limits(resolve_runtime_policy(options));
-  assert(limits.inflight == 7 && limits.streams_per_connection == 5 && limits.shutdown_timeout == 70ms);
-  options.capabilities.push_back("http");
-  options.environment.push_back({"XGC2_XRPC_HEADER_TIMEOUT_MS", "100"});
-  assert(grpc_limits(resolve_runtime_policy(options)).inflight == 7);
-  options.capabilities = {"host", "rpc", "transport", "grpc"};
-  throws([&] { (void)resolve_runtime_policy(options); });
-}
 void concurrent_stop_and_owner_close() {
   for (unsigned round = 0; round < 8; ++round) {
     Host host;
@@ -814,8 +785,7 @@ void concurrent_stop_and_owner_close() {
 }
 void injected_diagnostics() {
   Directory directory;
-  RuntimePolicyOptions policy_options; policy_options.capabilities = {"diagnostics"};
-  Diagnostics diagnostics(resolve_runtime_policy(policy_options));
+  Diagnostics diagnostics;
   GrpcAdmission admission("diagnostic-instance");
   admission.set_diagnostics(&diagnostics, "fixture");
   Service service(admission);
@@ -848,14 +818,174 @@ void reusable_resources() {
   std::cout << "gRPC reuse FD " << before << " -> " << after << ", one native channel\n";
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
 }
+// google.rpc.Status bytes the Go client library produced for request
+// "caller.request-1" and instance "instance-one" (status.WithDetails with an
+// errdetails.ErrorInfo, deterministic marshal); see go/grpcx/application_error.go.
+std::string from_hex(const std::string& hex) {
+  std::string bytes;
+  for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
+    bytes.push_back(static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+  return bytes;
+}
+const char* go_marked =
+    "0803120e646f6d61696e207265667573616c1a87010a28747970652e676f6f676c65617069732e636f6d2f"
+    "676f6f676c652e7270632e4572726f72496e666f125b0a114150504c49434154494f4e5f4552524f521209"
+    "786763322e787270631a1e0a0a726571756573745f6964121063616c6c65722e726571756573742d311a1b"
+    "0a0b696e7374616e63655f6964120c696e7374616e63652d6f6e65";
+const char* go_with_duration =
+    "080512046b6570741a380a2c747970652e676f6f676c65617069732e636f6d2f676f6f676c652e70726f74"
+    "6f6275662e4475726174696f6e120808011080cab5ee011a87010a28747970652e676f6f676c6561706973"
+    "2e636f6d2f676f6f676c652e7270632e4572726f72496e666f125b0a114150504c49434154494f4e5f4552"
+    "524f521209786763322e787270631a1e0a0a726571756573745f6964121063616c6c65722e726571756573"
+    "742d311a1b0a0b696e7374616e63655f6964120c696e7374616e63652d6f6e65";
+const char* go_wrong_request =
+    "08031201781a7c0a28747970652e676f6f676c65617069732e636f6d2f676f6f676c652e7270632e457272"
+    "6f72496e666f12500a114150504c49434154494f4e5f4552524f521209786763322e787270631a130a0a72"
+    "6571756573745f696412056f746865721a1b0a0b696e7374616e63655f6964120c696e7374616e63652d6f"
+    "6e65";
+void add_info(google::rpc::Status& status, const std::string& domain, const std::string& reason,
+              const std::map<std::string, std::string>& metadata) {
+  google::rpc::ErrorInfo info;
+  info.set_domain(domain); info.set_reason(reason);
+  for (const auto& [key, value] : metadata) (*info.mutable_metadata())[key] = value;
+  status.add_details()->PackFrom(info);
+}
+std::string wire(const google::rpc::Status& status) {
+  std::string bytes; assert(status.SerializeToString(&bytes)); return bytes;
+}
+google::rpc::Status decoded(const grpc::Status& status) {
+  google::rpc::Status result; assert(result.ParseFromString(status.error_details())); return result;
+}
+const std::map<std::string, std::string> ours{{"request_id", "caller.request-1"},
+                                              {"instance_id", "instance-one"}};
+void application_error_marker() {
+  Host host;
+  // The host marks a declared refusal; code, message and the marker survive.
+  auto marked = echo_outcome(host, [](GrpcCallScope& call) {
+    return call.application_error({grpc::StatusCode::INVALID_ARGUMENT, "domain refusal"});
+  });
+  assert(marked.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+  assert(marked.status.error_message() == "domain refusal");
+  assert(marked.delivery == Delivery::ResponseReceived);
+  {
+    const auto envelope = decoded(marked.status);
+    assert(envelope.code() == static_cast<int>(grpc::StatusCode::INVALID_ARGUMENT));
+    assert(envelope.message() == "domain refusal" && envelope.details_size() == 1);
+    google::rpc::ErrorInfo info;
+    assert(envelope.details(0).Is<google::rpc::ErrorInfo>() && envelope.details(0).UnpackTo(&info));
+    assert(envelope.details(0).type_url() == "type.googleapis.com/google.rpc.ErrorInfo");
+    assert(info.domain() == "xgc2.xrpc" && info.reason() == "APPLICATION_ERROR");
+    assert(info.metadata_size() == 2 && info.metadata().at("request_id") == "caller.request-1");
+    assert(info.metadata().at("instance_id") == "instance-one");
+    // The bytes are exactly what the Go library marshals for the same status.
+    assert(marked.status.error_details() == from_hex(go_marked));
+  }
+  // Without the marker the same failure leaves the outcome unknown.
+  auto plain = echo_outcome(host, [](GrpcCallScope&) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "domain refusal");
+  });
+  assert(plain.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+  assert(plain.status.error_details().empty() && plain.delivery == Delivery::OutcomeUnknown);
+  // Bytes produced by the Go implementation are accepted, including with
+  // unrelated details before the marker; a marker for another request is not.
+  for (const auto& [bytes, code, expected] : std::vector<std::tuple<const char*, grpc::StatusCode, Delivery>>{
+           {go_marked, grpc::StatusCode::INVALID_ARGUMENT, Delivery::ResponseReceived},
+           {go_with_duration, grpc::StatusCode::NOT_FOUND, Delivery::ResponseReceived},
+           {go_wrong_request, grpc::StatusCode::INVALID_ARGUMENT, Delivery::OutcomeUnknown}}) {
+    const auto outcome = echo_outcome(host, [&, bytes = bytes, code = code](GrpcCallScope&) {
+      return grpc::Status(code, "from go", from_hex(bytes));
+    });
+    assert(outcome.status.error_code() == code && outcome.delivery == expected);
+  }
+  // Other details are preserved and an existing marker is not duplicated.
+  auto preserved = echo_outcome(host, [](GrpcCallScope& call) {
+    google::rpc::Status envelope;
+    envelope.set_code(static_cast<int>(grpc::StatusCode::NOT_FOUND)); envelope.set_message("kept");
+    google::protobuf::Duration duration; duration.set_seconds(1);
+    envelope.add_details()->PackFrom(duration);
+    add_info(envelope, "example.org", "OTHER", {{"a", "b"}});
+    const auto once = call.application_error({grpc::StatusCode::NOT_FOUND, "kept", wire(envelope)});
+    const auto twice = call.application_error(once);
+    assert(twice.error_details() == once.error_details());
+    return twice;
+  });
+  assert(preserved.delivery == Delivery::ResponseReceived);
+  {
+    const auto envelope = decoded(preserved.status);
+    assert(envelope.details_size() == 3 && envelope.details(0).Is<google::protobuf::Duration>());
+    google::rpc::ErrorInfo other, ours_info;
+    assert(envelope.details(1).UnpackTo(&other) && other.domain() == "example.org");
+    assert(envelope.details(2).UnpackTo(&ours_info) && ours_info.reason() == "APPLICATION_ERROR");
+  }
+  // Statuses the host must not mark.
+  const GrpcCallScope rejected;
+  const grpc::Status refusal(grpc::StatusCode::INVALID_ARGUMENT, "no scope");
+  assert(rejected.application_error(refusal).error_details().empty());
+  auto unchanged = echo_outcome(host, [](GrpcCallScope& call) {
+    assert(call.application_error(grpc::Status::OK).ok());
+    const grpc::Status malformed(grpc::StatusCode::INTERNAL, "bad", "\x08");
+    assert(call.application_error(malformed).error_details() == malformed.error_details());
+    // Valid details, but too large to add a marker within the metadata limit.
+    google::rpc::Status envelope;
+    auto* big = envelope.add_details();
+    big->set_type_url("type.googleapis.com/example.Big");
+    big->set_value(std::string(9000, 'a'));
+    const grpc::Status large(grpc::StatusCode::INTERNAL, "x", wire(envelope));
+    const auto result = call.application_error(large);
+    assert(result.error_details() == large.error_details());
+    return result;
+  });
+  assert(unchanged.delivery == Delivery::OutcomeUnknown);
+  // A client accepts exactly one valid marker; forged or odd shapes do not count.
+  struct Case { const char* name; std::function<void(google::rpc::Status&)> build; grpc::StatusCode code; Delivery expected; };
+  const auto invalid = grpc::StatusCode::INVALID_ARGUMENT;
+  const std::vector<Case> cases{
+      {"valid", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); }, invalid, Delivery::ResponseReceived},
+      {"duplicate", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); }, invalid, Delivery::OutcomeUnknown},
+      {"extra metadata", [](google::rpc::Status& s) { auto m = ours; m["x"] = "y"; add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", m); }, invalid, Delivery::OutcomeUnknown},
+      {"missing instance", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", {{"request_id", "caller.request-1"}}); }, invalid, Delivery::OutcomeUnknown},
+      {"foreign instance", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", {{"request_id", "caller.request-1"}, {"instance_id", "elsewhere"}}); }, invalid, Delivery::OutcomeUnknown},
+      {"reason only", [](google::rpc::Status& s) { add_info(s, "other", "APPLICATION_ERROR", ours); }, invalid, Delivery::OutcomeUnknown},
+      {"domain only", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "OTHER", ours); }, invalid, Delivery::OutcomeUnknown},
+      {"unrelated info", [](google::rpc::Status& s) { add_info(s, "example.org", "OTHER", ours); }, invalid, Delivery::OutcomeUnknown},
+      {"unrelated plus ours", [](google::rpc::Status& s) { add_info(s, "example.org", "OTHER", {}); add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); }, invalid, Delivery::ResponseReceived},
+      {"cancelled", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); }, grpc::StatusCode::CANCELLED, Delivery::OutcomeUnknown},
+      {"deadline", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); }, grpc::StatusCode::DEADLINE_EXCEEDED, Delivery::OutcomeUnknown},
+      {"unauthenticated", [](google::rpc::Status& s) { add_info(s, "xgc2.xrpc", "APPLICATION_ERROR", ours); }, grpc::StatusCode::UNAUTHENTICATED, Delivery::ResponseReceived},
+  };
+  for (const auto& c : cases) {
+    const auto outcome = echo_outcome(host, [&](GrpcCallScope&) {
+      google::rpc::Status envelope;
+      envelope.set_code(static_cast<int>(c.code)); envelope.set_message("forged");
+      c.build(envelope);
+      return grpc::Status(c.code, "forged", wire(envelope));
+    });
+    if (outcome.status.error_code() != c.code || outcome.delivery != c.expected) {
+      std::cerr << "marker case failed: " << c.name << '\n';
+      assert(false);
+    }
+  }
+  // Malformed or truncated details never count, whatever the status code.
+  for (const std::string& bytes : {std::string("\x1a\x05" "ab"), std::string("\x1a\xff\xff\xff\xff\x0f"),
+                                   std::string("\x0a"), std::string("garbage-not-protobuf"),
+                                   std::string("\x1b\x00")}) {
+    const auto outcome = echo_outcome(host, [&](GrpcCallScope&) {
+      return grpc::Status(invalid, "garbage", bytes);
+    });
+    assert(outcome.status.error_code() == invalid && outcome.delivery == Delivery::OutcomeUnknown);
+  }
+  // A marker from a host with another instance identity never matches.
+  assert(host.server.shutdown_until(GrpcClock::now() + 2s));
+}
 int main() {
+  application_error_marker();
   multi_service_server_first_reverse_streams(); explicit_unary_discovery(); client_explicit_unary_discovery();
-  client_only_policy_mapping();
+  limits_validation();
   unary_metadata_and_limits(); typed_streams(); native_stream_deadline_and_cancel();
   admission_and_failed_quiescence(); retained_work_lease();
   graceful_drain_preserves_admitted_result(); stream_budget_rounding_margin();
   replacement_and_connection_cap(); native_idle_connection_cleanup();
   renamed_directory_anchor(); native_thread_quota();
-  policy_mapping(); concurrent_stop_and_owner_close(); injected_diagnostics(); reusable_resources();
+  concurrent_stop_and_owner_close(); injected_diagnostics(); reusable_resources();
   std::cout << "native gRPC unary/streams/fence/cancel/lease passed\n";
 }

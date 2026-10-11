@@ -35,7 +35,7 @@ typedef struct xgc2_xrpc_bytes_v1 {
 
 /* Positive finite caps; each module value must be <= origin baseline.
  * Null bind caps inherit the resolved baseline; values are never clamped.
- * Durations are whole milliseconds. MAX_HEADER_BYTES must be >= 8192;
+ * Durations are whole milliseconds. max_header_bytes must be >= 8192;
  * call_timeout_ms <= 86400000 and all values <= 2147483647. These are host
  * caps, not new Runtime/global-pool allocations. */
 typedef struct xgc2_xrpc_http_caps_v1 {

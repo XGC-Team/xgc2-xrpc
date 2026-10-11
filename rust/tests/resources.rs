@@ -927,23 +927,16 @@ fn async_client_does_not_accept_ready_receipt_after_caller_deadline() {
 }
 
 #[test]
-fn policy_is_applied_to_limits_and_native_pool_bounds() {
-    let policy = xgc2_xrpc::RuntimePolicy::resolve(
-        [
-            ("XGC2_XRPC_CLIENT_MAX_CONNECTIONS", "2"),
-            ("XGC2_XRPC_CLIENT_MAX_REFERENCES", "3"),
-            ("XGC2_XRPC_CALL_TIMEOUT_MS", "40"),
-        ],
-        xgc2_xrpc::PolicyOptions::default(),
-    )
-    .unwrap();
-    policy
-        .check_applied(xgc2_xrpc::HTTP_POLICY_FIELDS.iter().copied())
-        .unwrap();
-    let options = RuntimeOptions::from_policy(&policy).unwrap();
-    assert_eq!(options.max_sessions, 3);
-    let limits = Limits::from_policy(&policy).unwrap();
-    assert_eq!(limits.call_timeout, Duration::from_millis(40));
+fn plain_limits_are_applied_to_limits_and_native_pool_bounds() {
+    let options = RuntimeOptions {
+        max_sessions: 3,
+        ..RuntimeOptions::default()
+    };
+    let limits = Limits {
+        client_connections: 2,
+        call_timeout: Duration::from_millis(40),
+        ..Limits::default()
+    };
     let mut runtime = Runtime::new(options).unwrap();
     let dir = directory();
     let path = dir.path().join("rpc.sock");

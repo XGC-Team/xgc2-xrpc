@@ -5,10 +5,15 @@ const tls = require("node:tls");
 const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 const { Transform } = require("node:stream");
-const { policyOptions } = require("./policy.cjs");
+const { Diagnostics } = require("./diagnostics.cjs");
 const id = /^[A-Za-z0-9._:-]{1,128}$/;
+const DISPOSITIONS = ["not_sent", "outcome_unknown", "response_received"];
+// code is one of the shared XRPC error codes. disposition says what the caller may conclude:
+// not_sent (nothing reached the peer), outcome_unknown (the request may have run, no usable
+// answer arrived) or response_received (the peer answered, but the answer is refused).
 class TransportError extends Error {
   constructor(code, disposition, message, cause) {
+    if (!DISPOSITIONS.includes(disposition)) throw new TypeError("disposition must be not_sent, outcome_unknown or response_received");
     super(message, { cause }); this.name = "TransportError"; this.code = code; this.disposition = disposition;
   }
 }
@@ -74,12 +79,7 @@ function secureClientTLS(input) {
 class HTTPClient {
   #tls;
   constructor(options = {}) {
-    options = policyOptions(options, {
-      CLIENT_MAX_CONNECTIONS: "maxConnections", CLIENT_MAX_REFERENCES: "maxReferences",
-      CLIENT_REFERENCE_IDLE_TIMEOUT_MS: "referenceIdleTimeoutMs", HOST_MAX_IN_FLIGHT: "maxInFlight",
-      MAX_HEADER_BYTES: "maxHeaderBytes", MAX_REQUEST_BYTES: "maxRequestBytes", MAX_RESPONSE_BYTES: "maxResponseBytes",
-      CALL_TIMEOUT_MS: "callTimeoutMs",
-    });
+    if (options.diagnostics != null && !(options.diagnostics instanceof Diagnostics)) throw new TypeError("explicit Diagnostics owner required");
     this.#tls = secureClientTLS(options.tls);
     this.options = Object.freeze({ ...options, tls: undefined });
     this.maxConnections = positive(options.maxConnections, 16, "maxConnections");
@@ -98,7 +98,7 @@ class HTTPClient {
   }
   stats() { return { references: this.pools.size, inFlight: this.active.size, closed: this.closed }; }
   diagnostic(event, fields = {}) {
-    this.options.policy?.diagnostics?.emit(event, { operation: "http_client", ...fields });
+    this.options.diagnostics?.emit(event, { operation: "http_client", ...fields });
   }
   diagnosticFailure(error, fields = {}, admission = false) {
     const event = error.code === "cancelled" ? "cancelled" : error.code === "deadline_exceeded" ? "deadline_exceeded"
@@ -198,7 +198,7 @@ class HTTPClient {
         if (!state.failed) this.diagnostic("call_completed", { ...identity, elapsed_ms: performance.now() - start, in_flight: this.active.size });
         this.diagnosticShutdownComplete();
       };
-      const failure = (code, error) => new TransportError(code, state.sent ? "outcome_unknown" : "not_sent", error.message, error);
+      const failure = (code, error, disposition = state.sent ? "outcome_unknown" : "not_sent") => new TransportError(code, disposition, error.message, error);
       const recordFailure = (error) => {
         if (state.failed || state.finished) return;
         state.failed = true; this.diagnosticFailure(error, { ...identity, elapsed_ms: performance.now() - start });
@@ -270,7 +270,8 @@ class HTTPClient {
           let bytes = 0;
           const bounded = new Transform({ transform: (chunk, encoding, next) => {
             bytes += chunk.length;
-            if (bytes > this.maxResponseBytes) next(failure("resource_exhausted", new Error("response body exceeds limit")));
+            // The peer answered; the client refuses the answer.
+            if (bytes > this.maxResponseBytes) next(failure("resource_exhausted", new Error("response body exceeds limit"), "response_received"));
             else next(null, chunk);
           } });
           state.bounded = bounded;
@@ -283,7 +284,7 @@ class HTTPClient {
           response.once("close", () => { if (!response.complete) bounded.destroy(failure("unavailable", new Error("response closed"))); });
           response.pipe(bounded);
           settled = true;
-          resolve({ status: response.statusCode, headers: response.headers, body: bounded, requestId, close: () => bounded.destroy() });
+          resolve({ disposition: "response_received", status: response.statusCode, headers: response.headers, body: bounded, requestId, close: () => bounded.destroy() });
         });
         req.end(body);
       } catch (error) {
@@ -308,7 +309,7 @@ class HTTPClient {
     const chunks = [];
     try {
       for await (const chunk of response.body) chunks.push(chunk);
-      return { status: response.status, headers: response.headers, body: Buffer.concat(chunks), requestId: response.requestId };
+      return { disposition: "response_received", status: response.status, headers: response.headers, body: Buffer.concat(chunks), requestId: response.requestId };
     } finally { response.close(); }
   }
   close() {

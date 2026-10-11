@@ -116,6 +116,44 @@ class HostTests(unittest.TestCase):
             self.assertEqual(client.call("/value",method="HEAD").body,b"")
             self.assertEqual(client.json("/echo",{},timeout=30,request_id="long-budget")["id"],"long-budget")
 
+    def raw_get(self,target,instance=None):
+        """One raw GET on the Unix socket: (status, body)."""
+        lines=["GET "+target+" HTTP/1.1","Host: fixture","Connection: close","X-Request-ID: probe:1","X-Xrpc-Timeout-Ms: 1000"]
+        if instance is not None:
+            lines.append("X-Xrpc-Instance-ID: "+instance)
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.settimeout(2)
+            peer.connect(self.path)
+            peer.sendall(("\r\n".join(lines)+"\r\n\r\n").encode("ascii"))
+            raw=bytearray()
+            while True:
+                chunk=peer.recv(4096)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+        head,_,body=bytes(raw).partition(b"\r\n\r\n")
+        return int(head.split(b" ",2)[1]),body
+
+    def test_discovery_route_takes_a_query_without_an_instance(self):
+        async def describe(context,request):
+            return {"query":context.query}
+        async def echo(context,request):
+            return {"query":context.query}
+        routes={("GET","/v1/describe"):describe,("GET","/v1/echo"):echo}
+        with self.host(routes,instance_id="boot:7",discovery_routes=("/v1/describe",)):
+            # Core does not know the instance before the first describe: the route is
+            # matched on its path, and the query reaches the handler.
+            status,body=self.raw_get("/v1/describe?wait_ready_ms=250")
+            self.assertEqual((status,json.loads(body)),(200,{"query":"wait_ready_ms=250"}))
+            self.assertEqual(json.loads(self.raw_get("/v1/describe")[1]),{"query":""})
+            self.assertEqual(self.raw_get("/v1/describe?wait_ready_ms=250","boot:7")[0],200)
+            # The query is no part of the match: it makes no other route and no longer path discovery.
+            for target in ("/v1/echo?wait_ready_ms=250","/v1/describe/more?wait_ready_ms=250","/v1/other?/v1/describe"):
+                self.assertEqual(self.raw_get(target)[0],409,target)
+            # A bound route takes no query even with the right instance.
+            self.assertEqual(self.raw_get("/v1/echo?wait_ready_ms=250","boot:7")[0],400)
+            self.assertEqual(self.raw_get("/v1/describe?wait_ready_ms=250","boot:6")[0],409)
+
     def test_trickle_body_and_initial_header_deadlines(self):
         calls=[]
         limits=Limits(connections=2,header_timeout=.08,idle_timeout=.5,call_timeout=.2)

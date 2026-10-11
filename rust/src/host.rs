@@ -314,12 +314,6 @@ async fn dispatch(
                 "exactly one valid X-Request-ID required",
             ));
         }
-        if request.uri().query().is_some() {
-            return Err(Fault::new(
-                "invalid_argument",
-                "query parameters require an explicit edge adapter",
-            ));
-        }
         let size = request
             .headers()
             .iter()
@@ -329,14 +323,22 @@ async fn dispatch(
             return Err(Fault::new("resource_exhausted", "headers exceed limit"));
         }
         let supplied = single(request.headers(), "X-Xrpc-Instance-ID")?;
-        let discovery = request.method() == Method::GET
+        // A discovery route is chosen by method and path alone: its query (for example
+        // wait_ready_ms) is not part of the match and does not make another route one.
+        let discovery_route = request.method() == Method::GET
             && limits
                 .discovery_routes
                 .iter()
-                .any(|p| p == request.uri().path())
-            && supplied.is_none();
+                .any(|p| p == request.uri().path());
+        let discovery = discovery_route && supplied.is_none();
         if !instance.is_empty() && !discovery && supplied != Some(instance) {
             return Err(Fault::new("conflict", "service instance changed"));
+        }
+        if request.uri().query().is_some() && !discovery_route {
+            return Err(Fault::new(
+                "invalid_argument",
+                "query parameters require an explicit edge adapter",
+            ));
         }
         let timeout = single(request.headers(), "X-Xrpc-Timeout-Ms")?
             .ok_or_else(|| Fault::new("invalid_argument", "timeout required"))?;
@@ -368,6 +370,7 @@ async fn dispatch(
         deadline,
         peer_uid: uid,
         method: request.method().clone(),
+        query: request.uri().query().unwrap_or("").to_owned(),
         owner,
         admission: admission.clone(),
     };

@@ -30,23 +30,32 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// DialOptions are plain limits. A zero field selects the default named in its
+// comment; nothing is read from the process environment.
 type DialOptions struct {
-	boundAuthorization bool
-	LocalTargetID      string
-	DialContext        xrpc.DialContext
-	TLSConfig          *tls.Config
-	MaxMessageBytes    int
-	MaxRequestBytes    int
-	MaxResponseBytes   int
+	LocalTargetID string
+	DialContext   xrpc.DialContext
+	TLSConfig     *tls.Config
+	// MaxMessageBytes sets both message limits when MaxRequestBytes or
+	// MaxResponseBytes is zero (default xrpc.DefaultMaxMessageBytes).
+	MaxMessageBytes  int
+	MaxRequestBytes  int
+	MaxResponseBytes int
 	// JSON representation limits are independent of native protobuf wire limits.
 	// Zero selects twice the corresponding finite wire budget.
 	MaxRequestJSONBytes  int
 	MaxResponseJSONBytes int
-	MaxHeaderBytes       uint32
-	MaxCallTime          time.Duration
-	IdleTimeout          time.Duration
-	MaxInFlight          int
-	MaxReferences        int
+	// MaxHeaderBytes bounds received header lists (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes uint32
+	// MaxCallTime caps every call's budget (default xrpc.DefaultCallTimeout).
+	MaxCallTime time.Duration
+	// IdleTimeout closes an idle channel (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// MaxInFlight bounds admitted calls (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// MaxReferences bounds cached references of a Profile (default xrpc.DefaultMaxReferences).
+	MaxReferences int
+	// ReferenceIdleTimeout retires idle cached references (default xrpc.DefaultReferenceIdleTimeout).
 	ReferenceIdleTimeout time.Duration
 	Metadata             metadata.MD
 	Diagnostics          *xrpc.Diagnostics
@@ -55,7 +64,7 @@ type DialOptions struct {
 
 func (o DialOptions) defaults() DialOptions {
 	if o.MaxHeaderBytes == 0 {
-		o.MaxHeaderBytes = uint32(xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES"))
+		o.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if o.Metrics == nil {
 		o.Metrics = &xrpc.Metrics{}
@@ -63,17 +72,17 @@ func (o DialOptions) defaults() DialOptions {
 	if o.MaxRequestBytes <= 0 {
 		o.MaxRequestBytes = o.MaxMessageBytes
 		if o.MaxRequestBytes <= 0 {
-			o.MaxRequestBytes = int(xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES"))
+			o.MaxRequestBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxResponseBytes <= 0 {
 		o.MaxResponseBytes = o.MaxMessageBytes
 		if o.MaxResponseBytes <= 0 {
-			o.MaxResponseBytes = int(xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES"))
+			o.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxCallTime <= 0 {
-		o.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		o.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if o.MaxRequestJSONBytes <= 0 {
 		o.MaxRequestJSONBytes = representationBudget(o.MaxRequestBytes)
@@ -82,7 +91,13 @@ func (o DialOptions) defaults() DialOptions {
 		o.MaxResponseJSONBytes = representationBudget(o.MaxResponseBytes)
 	}
 	if o.IdleTimeout <= 0 {
-		o.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		o.IdleTimeout = xrpc.DefaultIdleTimeout
+	}
+	if o.MaxReferences <= 0 {
+		o.MaxReferences = xrpc.DefaultMaxReferences
+	}
+	if o.ReferenceIdleTimeout <= 0 {
+		o.ReferenceIdleTimeout = xrpc.DefaultReferenceIdleTimeout
 	}
 	return o
 }
@@ -108,7 +123,7 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 	}
 	options = options.defaults()
 	if options.MaxInFlight <= 0 {
-		options.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		options.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	slots := make(chan struct{}, options.MaxInFlight)
 	budget := newDialBudget()
@@ -157,19 +172,29 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 	return grpc.NewClient(target, args...)
 }
 
+// HostOptions are plain limits. A zero field selects the default named in its
+// comment; nothing is read from the process environment.
 type HostOptions struct {
-	// Authorize establishes the injected transport caller grant. Product
-	// method/scope checks remain in its native interceptors.
-	Authorize                                  func(context.Context) bool
-	MaxConnections                             int
-	MaxConcurrentStreams                       uint32
-	MaxMessageBytes                            int
-	MaxRequestBytes, MaxResponseBytes          int
-	MaxHeaderBytes                             uint32
-	MaxInFlight                                int
-	MaxCallTime, IdleTimeout, HandshakeTimeout time.Duration
-	ShutdownTimeout                            time.Duration
-	InstanceID                                 string
+	// MaxConnections bounds accepted connections (default xrpc.DefaultMaxConnections).
+	MaxConnections int
+	// MaxConcurrentStreams bounds streams per connection (default xrpc.DefaultStreamsPerConnection).
+	MaxConcurrentStreams uint32
+	// MaxMessageBytes sets both message limits when MaxRequestBytes or
+	// MaxResponseBytes is zero (default xrpc.DefaultMaxMessageBytes).
+	MaxMessageBytes  int
+	MaxRequestBytes  int
+	MaxResponseBytes int
+	// MaxHeaderBytes bounds received header lists (default xrpc.DefaultMaxHeaderBytes).
+	MaxHeaderBytes uint32
+	// MaxInFlight bounds admitted calls and streams (default xrpc.DefaultMaxInFlight).
+	MaxInFlight int
+	// MaxCallTime caps the caller's budget (default xrpc.DefaultCallTimeout).
+	MaxCallTime time.Duration
+	// IdleTimeout closes idle connections (default xrpc.DefaultIdleTimeout).
+	IdleTimeout time.Duration
+	// HandshakeTimeout bounds connection setup (default xrpc.DefaultHeaderTimeout).
+	HandshakeTimeout time.Duration
+	InstanceID       string
 	// DiscoveryMethods names exact unary description methods. Only an absent
 	// instance is unbound; supplied empty or mismatched instances stay rejected.
 	DiscoveryMethods []string
@@ -183,126 +208,106 @@ func (o HostOptions) defaults() HostOptions {
 		o.Metrics = &xrpc.Metrics{}
 	}
 	if o.MaxConnections <= 0 {
-		o.MaxConnections = int(xrpc.DefaultPolicyInteger("HOST_MAX_CONNECTIONS"))
+		o.MaxConnections = xrpc.DefaultMaxConnections
 	}
 	if o.MaxConcurrentStreams == 0 {
-		o.MaxConcurrentStreams = uint32(xrpc.DefaultPolicyInteger("GRPC_MAX_STREAMS_PER_CONNECTION"))
+		o.MaxConcurrentStreams = xrpc.DefaultStreamsPerConnection
 	}
 	if o.MaxRequestBytes <= 0 {
 		o.MaxRequestBytes = o.MaxMessageBytes
 		if o.MaxRequestBytes <= 0 {
-			o.MaxRequestBytes = int(xrpc.DefaultPolicyInteger("MAX_REQUEST_BYTES"))
+			o.MaxRequestBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxResponseBytes <= 0 {
 		o.MaxResponseBytes = o.MaxMessageBytes
 		if o.MaxResponseBytes <= 0 {
-			o.MaxResponseBytes = int(xrpc.DefaultPolicyInteger("MAX_RESPONSE_BYTES"))
+			o.MaxResponseBytes = xrpc.DefaultMaxMessageBytes
 		}
 	}
 	if o.MaxHeaderBytes == 0 {
-		o.MaxHeaderBytes = uint32(xrpc.DefaultPolicyInteger("MAX_HEADER_BYTES"))
+		o.MaxHeaderBytes = xrpc.DefaultMaxHeaderBytes
 	}
 	if o.MaxInFlight <= 0 {
-		o.MaxInFlight = int(xrpc.DefaultPolicyInteger("HOST_MAX_IN_FLIGHT"))
+		o.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
 	if o.MaxCallTime <= 0 {
-		o.MaxCallTime = time.Duration(xrpc.DefaultPolicyInteger("CALL_TIMEOUT_MS")) * time.Millisecond
+		o.MaxCallTime = xrpc.DefaultCallTimeout
 	}
 	if o.IdleTimeout <= 0 {
-		o.IdleTimeout = time.Duration(xrpc.DefaultPolicyInteger("IDLE_TIMEOUT_MS")) * time.Millisecond
+		o.IdleTimeout = xrpc.DefaultIdleTimeout
 	}
 	if o.HandshakeTimeout <= 0 {
-		o.HandshakeTimeout = time.Duration(xrpc.DefaultPolicyInteger("HEADER_TIMEOUT_MS")) * time.Millisecond
-	}
-	if o.ShutdownTimeout <= 0 {
-		o.ShutdownTimeout = time.Duration(xrpc.DefaultPolicyInteger("SHUTDOWN_TIMEOUT_MS")) * time.Millisecond
+		o.HandshakeTimeout = xrpc.DefaultHeaderTimeout
 	}
 	return o
 }
 
+// Host owns one native gRPC server: its listener, optional endpoint lease and
+// the admitted calls and streams. Done reports accept-loop completion; Drained
+// also waits for domain handlers and lease release.
 type Host struct {
-	server          *grpc.Server
-	lease           *unixlease.Lease
-	listener        *netlimit.Listener
-	once, graceful  sync.Once
-	doneOnce        sync.Once
-	done, drained   chan struct{}
-	err             error
-	mu              sync.Mutex
-	stopping        bool
-	started         bool
-	serving         net.Listener
-	handlers        sync.WaitGroup
-	shutdownTimeout time.Duration
-	options         HostOptions
+	server         *grpc.Server
+	lease          *unixlease.Lease
+	listener       *netlimit.Listener
+	once, graceful sync.Once
+	doneOnce       sync.Once
+	done, drained  chan struct{}
+	err            error
+	mu             sync.Mutex
+	stopping       bool
+	started        bool
+	handlers       sync.WaitGroup
+	options        HostOptions
 }
 
-// Serve uses finite native transport defaults; ServeWithOptions lets the owner
-// configure those limits. Product registration remains generated native gRPC.
-func Serve(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), options ...grpc.ServerOption) (*Host, error) {
-	return ServeWithOptions(listener, lease, register, HostOptions{}, options...)
+func newHost(listener net.Listener, lease *unixlease.Lease, limits HostOptions) *Host {
+	return &Host{listener: netlimit.New(listener, limits.MaxConnections), lease: lease, done: make(chan struct{}), drained: make(chan struct{}), options: limits}
 }
+
+// admit takes one of the host's in-flight slots for a call or stream and
+// accounts for it until the returned release runs. A stopping host and a full
+// host refuse.
+func (h *Host) admit(ctx context.Context, slots chan struct{}) (func(), error) {
+	limits := h.options
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopping {
+		return nil, status.Error(codes.Unavailable, "host stopping")
+	}
+	select {
+	case slots <- struct{}{}:
+	default:
+		limits.Metrics.Reject()
+		limits.Diagnostics.Emit(xrpc.Diagnostic{Level: "warn", Event: "admission_rejected", Service: limits.Service, InstanceID: limits.InstanceID, Category: "resource_exhausted"})
+		return nil, status.Error(codes.ResourceExhausted, "host concurrency exhausted")
+	}
+	h.handlers.Add(1)
+	finishMetric := limits.Metrics.Admit()
+	started := time.Now()
+	return func() {
+		limits.Metrics.Outcome(ctx.Err())
+		limits.Diagnostics.Emit(xrpc.Diagnostic{Level: "debug", Event: "call_finished", Service: limits.Service, InstanceID: limits.InstanceID, ElapsedMS: time.Since(started).Milliseconds()})
+		finishMetric()
+		<-slots
+		h.handlers.Done()
+	}, nil
+}
+
+// ServeWithOptions hosts product-registered native gRPC services on a Unix
+// listener with finite admission, instance fencing and call budgets. Product
+// registration remains generated native gRPC; remote or long-lived sessions
+// use ServeSession. The host reserves the connection idle timeout, so
+// product keepalive parameters do not apply here.
 func ServeWithOptions(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), limits HostOptions, options ...grpc.ServerOption) (*Host, error) {
-	return serveOwned(listener, lease, register, limits, nil, options...)
-}
-
-// EdgeOptions selects a public/domain-owned native gRPC boundary. Streams are
-// bound by an explicit connection-owner lifetime, independent of short internal
-// RPC budgets. Authentication, authorization and peer epochs stay with products.
-type EdgeOptions struct {
-	Limits              HostOptions
-	OwnerStreamLifetime time.Duration
-	ConnectionGrace     time.Duration
-}
-
-// ServeEdgeWithOptions shares native admission, IO and real-work drain with
-// ServeWithOptions while retaining an edge's existing stream/auth contract.
-// OwnerStreamLifetime must be explicit. Native connection aging (including its
-// jitter and grace) is configured to hard-close IO within that upper bound.
-func ServeEdgeWithOptions(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), edge EdgeOptions, options ...grpc.ServerOption) (*Host, error) {
-	if err := edge.validate(); err != nil {
-		return nil, err
-	}
-	return serveOwned(listener, lease, register, edge.Limits, &edge, options...)
-}
-
-func (edge *EdgeOptions) validate() error {
-	if edge.OwnerStreamLifetime <= 0 || edge.OwnerStreamLifetime > 24*time.Hour {
-		return errors.New("xrpc: finite edge owner stream lifetime 1ns..24h is required")
-	}
-	if edge.ConnectionGrace == 0 {
-		edge.ConnectionGrace = min(time.Second, edge.OwnerStreamLifetime/10)
-	}
-	if edge.ConnectionGrace <= 0 || edge.ConnectionGrace >= edge.OwnerStreamLifetime {
-		return errors.New("xrpc: edge connection grace must be positive and below owner lifetime")
-	}
-	return nil
-}
-
-func serveOwned(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), limits HostOptions, edge *EdgeOptions, options ...grpc.ServerOption) (*Host, error) {
-	if register == nil {
-		return nil, errors.New("xrpc: listener and registration required")
-	}
-	host, err := prepareOwned(listener, lease, func(r grpc.ServiceRegistrar) error { register(r); return nil }, limits, edge, options...)
-	if err != nil {
-		return nil, err
-	}
-	go host.Serve()
-	return host, nil
-}
-
-func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar) error, limits HostOptions, edge *EdgeOptions, options ...grpc.ServerOption) (*Host, error) {
 	if listener == nil || register == nil {
 		return nil, errors.New("xrpc: listener and registration required")
 	}
 	if limits.InstanceID != "" && !xrpc.ValidID(limits.InstanceID) {
 		return nil, errors.New("xrpc: invalid host instance identity")
 	}
-	if edge == nil && listener.Addr().Network() != "unix" {
-		if _, ok := listener.(*tlsListener); !ok {
-			return nil, errors.New("xrpc: remote gRPC listener requires TLS")
-		}
+	if listener.Addr().Network() != "unix" {
+		return nil, errors.New("xrpc: internal gRPC hosts serve Unix listeners; use ServeSession for remote listeners")
 	}
 	limits = limits.defaults()
 	limits.DiscoveryMethods = append([]string(nil), limits.DiscoveryMethods...)
@@ -314,60 +319,27 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 		}
 		discovery[method] = true
 	}
-	limited := netlimit.New(listener, limits.MaxConnections)
-	host := &Host{listener: limited, lease: lease, done: make(chan struct{}), drained: make(chan struct{}), shutdownTimeout: limits.ShutdownTimeout, options: limits}
+	host := newHost(listener, lease, limits)
 	slots := make(chan struct{}, limits.MaxInFlight)
 	admit := func(ctx context.Context, method string, stream bool) (func(), error) {
-		if edge == nil {
-			if stream && discovery[method] {
-				return nil, status.Error(codes.InvalidArgument, "discovery must be unary")
-			}
-			if err := validateRequestMetadataFor(ctx, limits.InstanceID, discovery[method]); err != nil {
-				return nil, err
-			}
-			remaining, err := xrpc.Remaining(ctx)
-			if err != nil || stream && remaining > limits.MaxCallTime {
-				return nil, status.Error(codes.InvalidArgument, "finite native caller deadline within host maximum required")
-			}
+		if stream && discovery[method] {
+			return nil, status.Error(codes.InvalidArgument, "discovery must be unary")
 		}
-		host.mu.Lock()
-		defer host.mu.Unlock()
-		if host.stopping {
-			return nil, status.Error(codes.Unavailable, "host stopping")
+		if err := validateRequestMetadataFor(ctx, limits.InstanceID, discovery[method]); err != nil {
+			return nil, err
 		}
-		select {
-		case slots <- struct{}{}:
-		default:
-			limits.Metrics.Reject()
-			limits.Diagnostics.Emit(xrpc.Diagnostic{Level: "warn", Event: "admission_rejected", Service: limits.Service, InstanceID: limits.InstanceID, Category: "resource_exhausted"})
-			return nil, status.Error(codes.ResourceExhausted, "host concurrency exhausted")
+		remaining, err := xrpc.Remaining(ctx)
+		if err != nil || stream && remaining > limits.MaxCallTime {
+			return nil, status.Error(codes.InvalidArgument, "finite native caller deadline within host maximum required")
 		}
-		host.handlers.Add(1)
-		finishMetric := limits.Metrics.Admit()
-		started := time.Now()
-		return func() {
-			limits.Metrics.Outcome(ctx.Err())
-			limits.Diagnostics.Emit(xrpc.Diagnostic{Level: "debug", Event: "call_finished", Service: limits.Service, InstanceID: limits.InstanceID, ElapsedMS: time.Since(started).Milliseconds()})
-			finishMetric()
-			<-slots
-			host.handlers.Done()
-		}, nil
-	}
-	connectionPolicy := keepalive.ServerParameters{MaxConnectionIdle: limits.IdleTimeout}
-	if edge != nil {
-		// grpc-go adds +/-10% age jitter. Divide before multiplying to
-		// avoid overflow and reserve its hard-close grace explicitly.
-		connectionPolicy.MaxConnectionAge = (edge.OwnerStreamLifetime - edge.ConnectionGrace) / 11 * 10
-		connectionPolicy.MaxConnectionAgeGrace = edge.ConnectionGrace
+		return host.admit(ctx, slots)
 	}
 	defaults := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(limits.MaxConcurrentStreams), grpc.MaxRecvMsgSize(limits.MaxRequestBytes), grpc.MaxSendMsgSize(limits.MaxResponseBytes), grpc.MaxHeaderListSize(limits.MaxHeaderBytes),
-		grpc.ConnectionTimeout(limits.HandshakeTimeout), grpc.KeepaliveParams(connectionPolicy),
+		grpc.ConnectionTimeout(limits.HandshakeTimeout), grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: limits.IdleTimeout}),
 		grpc.UnaryInterceptor(func(ctx context.Context, request any, info *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
-			if edge == nil {
-				if _, err := xrpc.Remaining(ctx); err != nil {
-					return nil, status.Error(codes.InvalidArgument, "finite native caller deadline required")
-				}
+			if _, err := xrpc.Remaining(ctx); err != nil {
+				return nil, status.Error(codes.InvalidArgument, "finite native caller deadline required")
 			}
 			ctx, cancel := context.WithTimeout(ctx, limits.MaxCallTime)
 			defer cancel()
@@ -376,19 +348,7 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 				return nil, err
 			}
 			defer release()
-			if edge == nil {
-				ctx = admittedContext(ctx, limits.InstanceID)
-			}
-			if limits.Authorize != nil {
-				allowed := limits.Authorize(ctx)
-				if ctx.Err() != nil {
-					return nil, status.FromContextError(ctx.Err()).Err()
-				}
-				if !allowed {
-					return nil, status.Error(codes.PermissionDenied, "caller authorization rejected")
-				}
-			}
-			result, err := next(ctx, request)
+			result, err := next(admittedContext(ctx, limits.InstanceID), request)
 			if err == nil && ctx.Err() != nil {
 				return nil, status.FromContextError(ctx.Err()).Err()
 			}
@@ -400,18 +360,7 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 				return err
 			}
 			defer release()
-			if edge == nil {
-				stream = &boundedStream{ServerStream: stream, ctx: admittedContext(stream.Context(), limits.InstanceID)}
-			}
-			if limits.Authorize != nil {
-				allowed := limits.Authorize(stream.Context())
-				if stream.Context().Err() != nil {
-					return status.FromContextError(stream.Context().Err()).Err()
-				}
-				if !allowed {
-					return status.Error(codes.PermissionDenied, "caller authorization rejected")
-				}
-			}
+			stream = &boundedStream{ServerStream: stream, ctx: admittedContext(stream.Context(), limits.InstanceID)}
 			err = next(server, &readyStream{ServerStream: stream})
 			if err == nil && stream.Context().Err() != nil {
 				return status.FromContextError(stream.Context().Err()).Err()
@@ -424,18 +373,11 @@ func prepareOwned(listener net.Listener, lease *unixlease.Lease, register func(g
 	args := append(defaults[6:], options...)
 	args = append(args, defaults[:6]...)
 	var err error
-	host.server, err = newOwnedServer(args...)
-	if err != nil {
+	if host.server, err = newOwnedServer(args...); err != nil {
 		return nil, err
 	}
-	if err := register(host.server); err != nil {
-		host.server.Stop()
-		return nil, err
-	}
-	host.serving = limited
-	if edge != nil {
-		host.serving = &edgeDeadlineListener{Listener: limited, lifetime: edge.OwnerStreamLifetime}
-	}
+	register(host.server)
+	go host.serve()
 	return host, nil
 }
 
@@ -452,25 +394,29 @@ func newOwnedServer(options ...grpc.ServerOption) (server *grpc.Server, err erro
 	return grpc.NewServer(options...), nil
 }
 
-type tlsListener struct{ net.Listener }
-
-func ServeTLS(listener net.Listener, register func(grpc.ServiceRegistrar), config *tls.Config, options ...grpc.ServerOption) (*Host, error) {
-	if config == nil || len(config.Certificates) == 0 && config.GetCertificate == nil {
-		return nil, errors.New("xrpc: server TLS identity required")
+// serve runs the accept loop once. A Stop or Shutdown that wins the race
+// against the goroutine start leaves a stopped host that never accepts.
+func (h *Host) serve() {
+	h.mu.Lock()
+	if h.stopping {
+		h.mu.Unlock()
+		return
 	}
-	config = config.Clone()
-	config.MinVersion = max(config.MinVersion, tls.VersionTLS12)
-	return Serve(&tlsListener{listener}, nil, register, append(options, grpc.Creds(credentials.NewTLS(config)))...)
+	h.started = true
+	h.mu.Unlock()
+	err := h.server.Serve(h.listener)
+	h.mu.Lock()
+	if !errors.Is(err, grpc.ErrServerStopped) && !errors.Is(err, net.ErrClosed) {
+		h.err = err
+	}
+	stopping := h.stopping
+	h.doneOnce.Do(func() { close(h.done) })
+	h.mu.Unlock()
+	if !stopping {
+		h.Stop()
+	}
 }
 
-func ServeEdgeTLS(listener net.Listener, lease *unixlease.Lease, register func(grpc.ServiceRegistrar), config *tls.Config, edge EdgeOptions, options ...grpc.ServerOption) (*Host, error) {
-	if config == nil || len(config.Certificates) == 0 && config.GetCertificate == nil {
-		return nil, errors.New("xrpc: server TLS identity required")
-	}
-	cloned := config.Clone()
-	cloned.MinVersion = max(cloned.MinVersion, tls.VersionTLS12)
-	return ServeEdgeWithOptions(listener, lease, register, edge, append(options, grpc.Creds(credentials.NewTLS(cloned)))...)
-}
 func (h *Host) stopAdmission() {
 	h.mu.Lock()
 	h.stopping = true
@@ -539,37 +485,6 @@ func (h *Host) Status() xrpc.TransportStatus {
 	return status
 }
 
-// FiniteUnary rejects missing budgets and bounds admitted handlers. It does
-// not synthesize success when cancellation wins after a domain side effect.
-func FiniteUnary(maximum time.Duration, inFlight int) grpc.UnaryServerInterceptor {
-	if maximum <= 0 {
-		maximum = 30 * time.Second
-	}
-	if inFlight <= 0 {
-		inFlight = 64
-	}
-	slots := make(chan struct{}, inFlight)
-	return func(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		_, err := xrpc.Remaining(ctx)
-		if err != nil {
-			return nil, status.Error(codes.InvalidArgument, "finite caller deadline required")
-		}
-		ctx, cancel := context.WithTimeout(ctx, maximum)
-		defer cancel()
-		select {
-		case slots <- struct{}{}:
-			defer func() { <-slots }()
-		default:
-			return nil, status.Error(codes.ResourceExhausted, "host concurrency exhausted")
-		}
-		result, err := handler(ctx, request)
-		if err == nil && ctx.Err() != nil {
-			return nil, status.FromContextError(ctx.Err()).Err()
-		}
-		return result, err
-	}
-}
-
 // Profile consumes a product-supplied closed protobuf descriptor set. This is
 // a typed method client, not a universal Execute(string,JSON) server endpoint.
 type Profile struct {
@@ -588,6 +503,13 @@ func (p *Profile) prepare(ctx context.Context, call xrpc.Call) (context.Context,
 	}
 	if err := call.Service.ValidateInternal(); err != nil {
 		return ctx, nil, nil, nil, nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
+	}
+	if call.RequestID == "" {
+		id, err := xrpc.NewRequestID()
+		if err != nil {
+			return ctx, nil, nil, nil, nil, xrpc.Failure("internal", xrpc.NotSent, err)
+		}
+		call.RequestID = id
 	}
 	if !xrpc.ValidID(call.RequestID) {
 		return ctx, nil, nil, nil, nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: canonical request identity required"))
@@ -668,14 +590,19 @@ func (p *Profile) Call(ctx context.Context, call xrpc.Call) (xrpc.Result, error)
 		return xrpc.Result{}, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: streaming method requires Observe"))
 	}
 	output := dynamicpb.NewMessage(method.Output())
-	if err = connection.Invoke(ctx, call.Method, input, output); err != nil {
+	var header metadata.MD
+	if err = connection.Invoke(ctx, call.Method, input, output, grpc.Header(&header)); err != nil {
 		return xrpc.Result{}, callError(err)
 	}
 	raw, err := protojson.Marshal(output)
 	if err == nil && len(raw) > p.options.MaxResponseJSONBytes {
 		return xrpc.Result{}, xrpc.Failure("resource_exhausted", xrpc.ResponseReceived, errors.New("xrpc: protobuf JSON output exceeds representation byte budget"))
 	}
-	return xrpc.Result{Payload: raw}, err
+	instance := ""
+	if values := header.Get(InstanceIDMetadata); len(values) == 1 {
+		instance = values[0]
+	}
+	return xrpc.Result{Payload: raw, InstanceID: instance}, err
 }
 func (p *Profile) Observe(ctx context.Context, call xrpc.Call, emit func(xrpc.Result) error) error {
 	ctx, connection, method, input, release, err := p.prepare(ctx, call)

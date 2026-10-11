@@ -1,7 +1,6 @@
 "use strict";
 const { Worker } = require("node:worker_threads");
 const { performance } = require("node:perf_hooks");
-const registry = require("./runtime-policy.json");
 
 const LEVELS = Object.freeze({ trace: 0, debug: 1, info: 2, warn: 3, error: 4 });
 const EVENTS = Object.freeze({
@@ -17,8 +16,6 @@ const NUMBERS = Object.freeze(["elapsed_ms", "budget_ms", "connections", "in_fli
 const CATEGORIES = new Set(["invalid_argument", "not_found", "conflict", "resource_exhausted", "deadline_exceeded", "cancelled", "unavailable", "internal", "not_sent", "outcome_unknown"]);
 const STATES = new Set(["starting", "running", "closing", "closed", "saturated", "recovered", "failed"]);
 const TOKEN = /^[A-Za-z0-9._:-]{1,128}$/;
-const DEFAULT_LEVEL = registry.fields.find((field) => field.name === "LOG_LEVEL").default;
-const DEFAULT_FORMAT = registry.fields.find((field) => field.name === "LOG_FORMAT").default;
 function increment(object, field, amount = 1) { object[field] = Math.min(Number.MAX_SAFE_INTEGER, object[field] + amount); }
 function positive(name, value, minimum, maximum) {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw new RangeError(`${name}: finite integer in ${minimum}..${maximum} required`);
@@ -32,12 +29,11 @@ class DiagnosticSinkError extends Error {
 }
 
 // This object is explicitly created once by the process composition root and
-// passed to its shared policy. There is no ambient owner or file allocation.
-// Worker ACKs release admission only after a complete write (or a counted
-// failure), so the cross-thread message channel cannot become a hidden queue.
+// passed to its hosts and clients as the `diagnostics` option. There is no
+// ambient owner or file allocation. Worker ACKs release admission only after a
+// complete write (or a counted failure), so the cross-thread message channel
+// cannot become a hidden queue.
 class Diagnostics {
-  #policy = null;
-  #used = false;
   #worker = null;
   #state = "running";
   #exited = false;
@@ -53,29 +49,26 @@ class Diagnostics {
   #repeated = Object.fromEntries(Object.keys(EVENTS).map((name) => [name, 0]));
   #counts = Object.fromEntries(Object.keys(EVENTS).map((name) => [name, 0]));
   #totals = { admitted: 0, written: 0, filtered: 0, dropped: 0, rateSuppressed: 0, redactedFields: 0, sinkFailures: 0, workerFailures: 0, saturations: 0, recoveries: 0 };
+  #minimumLevel;
+  #outputFormat;
   #capacity;
   #recordBytes;
   #closeMs;
   #repeatMs;
 
-  constructor({ sink, maxPendingRecords = 128, maxRecordBytes = 2048, closeTimeoutMs = 5000, repeatIntervalMs = 1000 } = {}) {
+  // level: "trace" | "debug" | "info" | "warn" | "error", default "info".
+  // format: "json" | "text", default "json".
+  constructor({ sink, level = "info", format = "json", maxPendingRecords = 128, maxRecordBytes = 2048, closeTimeoutMs = 5000, repeatIntervalMs = 1000 } = {}) {
     if (!sink || sink.kind !== "supervisor_stderr" || sink.rotationOwner !== "supervisor") throw new TypeError("explicit supervisor_stderr sink with supervisor rotation owner required");
+    if (typeof level !== "string" || !Object.hasOwn(LEVELS, level)) throw new RangeError("level must be trace, debug, info, warn or error");
+    if (format !== "json" && format !== "text") throw new RangeError("format must be json or text");
+    this.#minimumLevel = level;
+    this.#outputFormat = format;
     this.#capacity = positive("maxPendingRecords", maxPendingRecords, 1, 4096);
     this.#recordBytes = positive("maxRecordBytes", maxRecordBytes, 256, 65536);
     this.#closeMs = positive("closeTimeoutMs", closeTimeoutMs, 1, 2147483647);
     this.#repeatMs = positive("repeatIntervalMs", repeatIntervalMs, 1, 2147483647);
   }
-
-  // Called by the startup resolver. Reusing this sink with another resolved
-  // policy would create conflicting process owners and is rejected.
-  _bindPolicy(policy) {
-    if (this.#policy === policy) return;
-    if (this.#policy || this.#used || this.#state !== "running") throw new TypeError("diagnostics must be bound once before first emission");
-    if (!policy?.fields?.LOG_LEVEL || !policy.fields.LOG_FORMAT || !Object.hasOwn(LEVELS, policy.fields.LOG_LEVEL.value) || !["json", "text"].includes(policy.fields.LOG_FORMAT.value)) throw new TypeError("resolved diagnostic policy required");
-    this.#policy = policy;
-  }
-  #level() { return this.#policy?.fields.LOG_LEVEL.value ?? DEFAULT_LEVEL; }
-  #format() { return this.#policy?.fields.LOG_FORMAT.value ?? DEFAULT_FORMAT; }
 
   #fields(input) {
     const out = {};
@@ -105,7 +98,7 @@ class Diagnostics {
     const base = { time_unix_ms: Date.now(), severity: EVENTS[event], event };
     const names = Object.keys(fields); // At most the fixed whitelist size.
     for (;;) {
-      const line = this.#format() === "json" ? JSON.stringify({ ...base, ...fields }) + "\n"
+      const line = this.#outputFormat === "json" ? JSON.stringify({ ...base, ...fields }) + "\n"
         : `${base.time_unix_ms} ${base.severity} ${event}` + Object.entries(fields).map(([name, value]) => ` ${name}=${JSON.stringify(value)}`).join("") + "\n";
       if (Buffer.byteLength(line) <= this.#recordBytes) return line;
       // Inputs are already bounded primitives. Trimming preserves the stable
@@ -167,17 +160,16 @@ class Diagnostics {
       if (!(flag === "saturation" ? this.#pendingSaturation : this.#pendingRecovery)) continue;
       if (this.#pending.size >= this.#capacity || this.#exited || this.#failed) return;
       if (flag === "saturation") this.#pendingSaturation = false; else this.#pendingRecovery = false;
-      if (LEVELS[EVENTS[event]] < LEVELS[this.#level()]) { increment(this.#totals, "filtered"); continue; }
+      if (LEVELS[EVENTS[event]] < LEVELS[this.#minimumLevel]) { increment(this.#totals, "filtered"); continue; }
       this.#enqueue(event, { dropped: this.#totals.dropped, queue_depth: this.#pending.size, state: flag === "saturation" ? "saturated" : "recovered" });
     }
   }
 
   emit(event, input) {
-    this.#used = true;
     if (typeof event !== "string" || !Object.hasOwn(EVENTS, event)) event = "unclassified";
     increment(this.#counts, event);
     if (this.#state !== "running" || this.#failed) { increment(this.#totals, "dropped"); return false; }
-    if (LEVELS[EVENTS[event]] < LEVELS[this.#level()]) { increment(this.#totals, "filtered"); return true; }
+    if (LEVELS[EVENTS[event]] < LEVELS[this.#minimumLevel]) { increment(this.#totals, "filtered"); return true; }
     const now = performance.now();
     if (LEVELS[EVENTS[event]] >= LEVELS.warn && now - this.#last[event] < this.#repeatMs) {
       increment(this.#repeated, event); increment(this.#totals, "rateSuppressed"); return true;
@@ -202,8 +194,7 @@ class Diagnostics {
       workerAlive: !!this.#worker && !this.#exited, pendingRecords: this.#pending.size,
       queueCapacity: this.#capacity, maxRecordBytes: this.#recordBytes,
       identityFieldByteLimit: 128, identityFieldCountLimit: IDENTITIES.length,
-      saturated: this.#saturated, level: this.#level(), format: this.#format(),
-      policyRevision: this.#policy?.revision ?? null,
+      saturated: this.#saturated, level: this.#minimumLevel, format: this.#outputFormat,
       eventCounts: Object.freeze({ ...this.#counts }), repeatPending: Object.freeze({ ...this.#repeated }),
       ...this.#totals,
       sink: Object.freeze({ backend: "supervisor_stderr", rotationOwner: "supervisor", opensFiles: false }),

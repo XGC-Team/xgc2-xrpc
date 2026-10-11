@@ -1,7 +1,8 @@
 # Native C++ gRPC integration
 
-The optional `XgcXrpc::grpc` target uses Linux, C++20 and native gRPC >= 1.16.
-Build with `-DXGC2_XRPC_ENABLE_GRPC=ON`; installed consumers request
+The optional `XgcXrpc::grpc` target uses Linux, C++17 and native gRPC >= 1.16.
+Build with `-DXGC2_XRPC_COMPONENTS="unix;diagnostics;grpc"` (or add `grpc` to any larger
+list); installed consumers request
 `find_package(XgcXrpc REQUIRED COMPONENTS grpc)`. HTTP-only consumers retain
 their ordinary Unix/HTTP targets without a gRPC link dependency. Product
 Protobuf methods, generated services/stubs, payload validation and domain
@@ -89,38 +90,57 @@ observe that deadline. Scope must die before `ServerContext`; permits do not
 keep or dereference a destroyed native context. Do not spawn detached work
 without a retained permit and an owned shutdown/join path.
 
-`configure_grpc_server(builder, limits)` supplies the same native limits to an
-authenticated remote server. The remote owner supplies credentials, route,
-connection admission and teardown. `GrpcAdmission` is also reusable there.
-The helper covers synchronous generated services; raw async CQ handlers need
-separate completion-tag ownership and are not admitted through this API.
+`GrpcAdmission` is reusable by an authenticated remote server too: its owner builds the
+native `ServerBuilder` and supplies credentials, route, connection admission and
+teardown; the SDK exposes no builder helper for it. The admission covers synchronous
+generated services; raw async CQ handlers need separate completion-tag ownership and are
+not admitted through this API.
+
+### Application errors
+
+A host marks a failure that its domain declares, as `contracts/runtime.md` describes. Wrap
+the status an admitted call returns:
+
+```cpp
+return call.application_error({grpc::StatusCode::FAILED_PRECONDITION, "revision is stale"});
+```
+
+`GrpcCallScope::application_error(status)` returns the status with one
+`google.rpc.ErrorInfo` detail added (`domain = "xgc2.xrpc"`, `reason =
+"APPLICATION_ERROR"`, metadata `request_id` and `instance_id` of this call), in the
+`google.rpc.Status` carried by the `grpc-status-details-bin` trailer. The code, the
+message and any details the status already had are kept. An OK status, a rejected scope,
+malformed existing details or details too large for the metadata limit come back
+unchanged, and calling it twice adds one marker. Use it for declared refusals, not for
+transport, cancellation or unexpected handler failures, and do not read a marker as
+rollback or safe replay.
+
+The three messages involved (`Status`, `Any`, `ErrorInfo`) are written and parsed as
+protobuf wire format in `grpc.cpp` instead of being generated. `libgrpc++_error_details`
+and other googleapis code register `google.rpc.Status` in the process-wide descriptor
+pool, and a second copy of it inside this library would abort any process that loads both.
+The tests compile the minimal googleapis messages (`tests/proto/google/rpc`, Apache-2.0,
+reduced to `Status` and `ErrorInfo`) and check every byte against the generated classes
+and against bytes produced by the Go library's `status.WithDetails`; the Go client in turn
+reports `response_received` for a failure marked by this host.
 
 ## Client integration
 
 Reuse `make_grpc_unix_channel(path, limits)` and generated stubs for a local
-ServiceRef. This helper accepts only an absolute local Unix path. A remote
-owner creates its authenticated channel using `grpc_channel_arguments(limits)`;
-it must not send a remote Unix pathname to the local dialer.
+ServiceRef. This helper accepts only an absolute local Unix path and applies the
+message-size and metadata limits of `GrpcLimits` (`request_bytes` for sending,
+`response_bytes` for receiving, `header_bytes`) and disables native retries. A remote
+owner creates its own authenticated channel with equivalent arguments; it must not send
+a remote Unix pathname to the local dialer.
 
-`grpc_client_limits(policy)` projects a client policy with `rpc` and `transport`
-capabilities without requiring `host`. It maps message sizes, finite caller
-budget and header limits; use its call budget when creating each `GrpcClientCall`
-or paired stream deadline. The native baseline provides server idle eviction,
-not client idle channel eviction. A selected `IDLE_TIMEOUT_MS` therefore fails
-client projection unless its owner actually retires idle channels and declares
-that field in `owner_applied`. Channel arguments never claim to enforce it.
-Host policy fields in a composed process remain with their host owner.
-
-`GRPC_MAX_STREAMS_PER_CONNECTION` controls incoming server streams; it does not
-cap outgoing native client calls. An explicit override or ceiling therefore
-fails the default client projection. A client owner that counts and bounds
-**all** concurrent calls/streams may declare that field with
-`grpc_client_limits(policy, {"GRPC_MAX_STREAMS_PER_CONNECTION"})`, check its fixed
-population against the returned limit, and enforce the bound before opening
-native calls. Merely declaring the field does not create a semaphore or native
-client cap. A paired-stream owner must include overlapping registration,
-replacement and other calls in this accounting. Client pools/reference
-registries retain their separate owners.
+Choose the finite call budget when creating each `GrpcClientCall` or paired stream
+deadline. The native baseline provides server idle eviction, not client idle channel
+eviction, so `GrpcLimits::idle_timeout` has no client-side effect and channel lifetime
+belongs to the channel's owner. `GrpcLimits::streams_per_connection` controls incoming
+server streams; it does not cap outgoing native client calls. A client owner that bounds
+**all** concurrent calls/streams must count and enforce that itself before opening native
+calls, including overlapping registration, replacement and other calls in a paired-stream
+design. Client pools and reference registries retain their separate owners.
 
 For an owner's reverse Register/Control/Work connection, validate its typed
 ServiceRef first, reuse one channel, and take the same reference incarnation
@@ -128,7 +148,7 @@ for every bound call's instance metadata. Register is an ordinary unary
 `invoke`; Control and Work each use `mark_dispatched`, then
 `receive_initial_metadata` before payload. Keep both native contexts and call
 scopes alive through their reader/writer joins and `Finish`. A 30-second
-ceiling is finite at the native layer: use the earlier caller/policy budget
+ceiling is finite at the native layer: use the earlier of the caller and host budgets
 for Register and `grpc_stream_deadline(limits, GrpcClock::now() + 30s)` for
 each stream. The stream helper also reserves native timeout-rounding margin,
 so the actual deadline is slightly earlier than that ceiling. Session renewal
@@ -154,16 +174,25 @@ alive through stream completion. The context must be fresh, with no duplicate
 XRPC metadata supplied by the caller. An omitted request ID is generated with
 the Unix library's random incarnation generator, independently of local
 client counters. The finite caller deadline includes setup/native queue wait.
-`std::stop_token` installs a synchronized callback calling native `TryCancel`.
+`StopToken` (`xgc2/xrpc/stop.hpp`) installs a synchronized callback calling native
+`TryCancel`; destroying the call scope deregisters it and waits for a running callback.
 Destroy the call scope before destroying its context.
 
-`delivery()` is `NotSent` for pre-dispatch validation or cancellation. After
-`mark_dispatched`/`invoke` it is conservatively `OutcomeUnknown`, including
-connection failures: the native API does not expose exact transmitted bytes
-or domain effects. Never infer rollback from cancellation. Native retries are
-disabled on helper-created channels; the SDK does not replay mutations.
-`verify` rejects malformed/mismatched successful response identity and retains
-native transport failures when no response metadata arrived.
+`delivery()` reports what the caller can know, with the same three values as every other
+client (`Delivery`): `NotSent` for pre-dispatch validation or cancellation. After
+`mark_dispatched`/`invoke` it is conservatively `OutcomeUnknown`, including connection
+failures: the native API does not expose exact transmitted bytes or domain effects. It
+becomes `ResponseReceived` once `verify(status)` has seen a response of this call from the
+expected instance: an OK status, or an unsuccessful status that carries the single valid
+`APPLICATION_ERROR` marker whose `request_id` and `instance_id` match this request and the
+verified response instance. The status code and the instance metadata alone are not
+enough: a local receive-size failure after a committed mutation looks the same as an
+application quota rejection. A missing, duplicate or invalid marker, a marker on a
+`CANCELLED` or `DEADLINE_EXCEEDED` status, and malformed details leave the call
+`OutcomeUnknown`; details of other types are ignored. Never infer rollback from
+cancellation. Native retries are disabled on helper-created channels; the SDK does not
+replay mutations. `verify` rejects malformed/mismatched successful response identity and
+retains native transport failures when no response metadata arrived.
 
 ## Ownership, shutdown and resource limits
 
@@ -233,18 +262,14 @@ the lease. Destruction waits for actual quiescence: a handler
 that ignores cancellation or a never-released permit can block it. A timeout
 does not make releasing a live endpoint lease safe.
 
-`GrpcLimits` common defaults come from the generated shared registry through
-`RuntimePolicy`. `grpc_limits(policy)` maps host, RPC, transport and gRPC fields;
-optional selected `MAX_HEADER_BYTES` maps to native metadata limits. Default
-policy resolution should select `host`, `rpc`, `transport`, `grpc`; include `http` only when
-selecting that optional metadata setting. A standalone gRPC policy rejects
-HTTP-only overrides during resolution. In a composed process policy, HTTP and
-diagnostics fields belong to their declared owners; this adapter checks applied
-fields only for `host`, `rpc`, `transport` and `grpc`. Explicit unenforced fields
-in those owned capabilities fail via `check_applied`. Client-pool/registry
-ownership remains separate. `native_threads` and
-`native_memory_bytes` are explicit immutable bootstrap limits without new env
-aliases. Keep the resolved policy for effective-source inspection.
+`GrpcLimits` is a plain struct whose default member values are the defaults: 32
+connections, 32 in flight, 32 streams per connection, 1 MiB request and response
+messages, 16 KiB metadata, 30 s call, 30 s idle and 5 s shutdown budgets, 8 native
+threads and a 16 MiB native memory target. The owner sets what it needs;
+`GrpcAdmission` and `make_grpc_unix_channel` validate the struct and throw
+`std::invalid_argument` for an unusable one (for example an idle timeout of zero or of
+`INT_MAX`, which the native option treats as unlimited). There are no environment-variable
+overrides, and `native_threads` and `native_memory_bytes` are explicit immutable limits.
 
 An optional owner-supplied `Diagnostics` sink can be installed on admission with
 `set_diagnostics` before serving. It must outlive the host and retained work.
@@ -261,41 +286,37 @@ It covers request/response fencing, absent/long stream deadlines, native blocked
 receive cancellation/deadline, message caps, canceled noncooperative handlers,
 retained work, bounded failed shutdown and lease reacquisition, replacement
 socket/parent cleanup, connection overload, idle preface teardown, native thread
-quota, policy mapping, and 1,100 calls on one reused channel with stable FD count.
+quota, limits validation, and 1,100 calls on one reused channel with stable FD count.
 Tests also cover graceful admitted-result preservation, conservative matching
 stream budgets, cross-thread stop during owner close, and injected redacted
 lifecycle diagnostics.
 The shared-host test registers multiple generated services on one listener and
 channel, opens two server-first bidirectional streams, checks both initial
 fences before payload, shares global admission with unary calls, and releases
-slots through native cancellation/deadline. Discovery and client policy tests
-cover the explicit unary exemption and rejection of unenforced client settings.
-These are transport evidence, not robot-domain or deployment ABI acceptance.
+slots through native cancellation/deadline. Discovery tests cover the explicit unary
+exemption. The application-error tests cover the marker bytes (against generated
+`google.rpc.Status`/`ErrorInfo` and against bytes the Go library produced), preservation
+of other details, idempotence, every forged or odd shape a client must refuse, and the
+three dispositions. These are transport evidence, not robot-domain or deployment ABI
+acceptance.
 
 ## Dependency toolchain and component packaging
 
-The validated native build is Ubuntu Noble amd64, GCC 13.3, C++20,
-Boost 1.83, gRPC 1.51.1 (`1.51.1-4.1build5`) and Protobuf 3.21.12.
-The isolated dependency prefix used for verification is
-`/tmp/sol10-grpc-prefix/usr`; it was extracted from official distribution
-packages. Builds require its CMake prefix and native library search paths;
-runtime scratch consumers need its native library path as well. No host
-package installation or running-container mutation was required.
-The [baseline handoff](validation/2026-10-09-sol10.md) records the exact
-configuration and sanitizer/deployment boundaries.
+The component builds with g++ 9.4 and with clang++-10 on Ubuntu 20.04 (Focal), against the
+distribution's gRPC 1.16.1 and Protobuf 3.6.1, and the whole `xrpc_cpp_grpc` test passes
+with both (and with g++ under AddressSanitizer and UBSan). Dependencies are discovered
+through their distribution pkg-config interface; a newer gRPC CMake config is not
+required. The accepted-fd server, native resource quota, finite calls and installed consumer
+(`packaging/probes/cpp`, `-DXRPC_CHECK_GRPC=ON`) are exercised on this baseline. Newer gRPC
+releases (the design notes below cite 1.51) and Jammy/Noble builds were not rebuilt in
+this round. Each distribution is built on its own image; one distribution's ELF is not
+relabeled for another.
 
-Focal's controlled Clang10/libstdc++10.5 route supports HTTP and native gRPC
-with the distribution's gRPC1.16.1 and Protobuf3.6.1. The native resource quota,
-accepted-fd server, finite calls and installed consumer are exercised on this
-baseline. Dependencies are discovered through their distribution pkg-config
-interface; a newer gRPC CMake config is not required. Noble ELF is not relabeled
-as Focal.
-An explicit installed `COMPONENTS grpc` imports unix/policy/diagnostics and
-native gRPC dependencies, with no HTTP target/library requirement. An explicit
-`COMPONENTS policy` requires only the policy component. Use those component
-declarations for a reduced installation prefix. Calling `find_package` without
-components imports the basic unix/policy/diagnostics/http set. HTTP consumers
-do not search/link native gRPC unless they request its component.
+An explicit installed `COMPONENTS grpc` imports unix/diagnostics and the native gRPC
+dependencies, with no HTTP target/library requirement. Calling `find_package` without
+components imports whichever of the basic unix/diagnostics/bootstrap/http/udp components
+the installation provides. HTTP consumers do not search/link native gRPC unless they
+request its component.
 
 Implementation references: [native accepted-fd API](https://raw.githubusercontent.com/grpc/grpc/v1.51.1/include/grpcpp/server_posix.h),
 [native resource quota](https://raw.githubusercontent.com/grpc/grpc/v1.51.1/include/grpcpp/resource_quota.h),
