@@ -10,6 +10,9 @@ export interface StreamEvent {
   data: string;
   /** The frame's own `id:` (the resume cursor after this event), if it had one. */
   id: string | undefined;
+  /** Only in onEvents batches: a frame carrying a cursor and no event/data.
+   * It commits the cursor without invoking an application event callback. */
+  cursorOnly?: true;
 }
 
 export interface BackoffOptions {
@@ -41,6 +44,17 @@ export interface EventsOptions {
    * go here only when their dedicated callback is missing.
    */
   onEvent: (event: StreamEvent) => void | Promise<void>;
+  /** Optional ordered delivery in bounded groups from a single read. Awaited
+   * before reading more bytes. Dedicated reset/closing callbacks are barriers.
+   * Includes cursor-only frames as message entries. Unlike onEvent, an empty
+   * id is preserved so batch owners can commit cursor clearing after applying.
+   * When absent, the original per-event delivery path is unchanged. */
+  onEvents?: (events: readonly StreamEvent[]) => void | Promise<void>;
+  /** Maximum events passed to onEvents. Default 128. */
+  maxEventsPerBatch?: number;
+  /** UTF-16 character budget for one batch, default 65536. A legal event larger
+   * than this budget is delivered alone (the maxEventChars ceiling still applies). */
+  maxBatchChars?: number;
   /**
    * `event: reset`: the server no longer has the cursor, so the client's state
    * is stale. The client forgets the cursor (or takes the reset frame's `id`),
@@ -94,7 +108,12 @@ export async function events(url: string | URL, options: EventsOptions): Promise
   const maxMs = positiveInteger(options.backoff?.maxMs, 5000, "backoff.maxMs");
   const random = options.backoff?.random ?? Math.random;
   const idleMs = options.idleTimeoutMs === 0 ? 0 : positiveInteger(options.idleTimeoutMs, DEFAULT_IDLE_MS, "idleTimeoutMs");
+  positiveInteger(options.maxEventsPerBatch, 128, "maxEventsPerBatch");
+  positiveInteger(options.maxBatchChars, 65_536, "maxBatchChars");
   const maxChars = positiveInteger(options.maxEventChars, DEFAULT_MAX_BYTES, "maxEventChars");
+  if (options.onEvents !== undefined && typeof options.onEvents !== "function") {
+    throw new XrpcError("invalid_argument", "onEvents must be a function", "not_sent");
+  }
   if (typeof options.onEvent !== "function") {
     throw new XrpcError("invalid_argument", "onEvent is required", "not_sent");
   }
@@ -231,10 +250,16 @@ async function attempt(
       }
       clearTimeout(idle);
       if (chunk.done) break;
-      for (const frame of parser.feed(decoder.decode(chunk.value, { stream: true }))) {
-        closing = (await deliver(frame, cursor, options)) || closing;
-        if (user?.aborted) return { established, error: undefined };
+      const frames = parser.feed(decoder.decode(chunk.value, { stream: true }));
+      if (options.onEvents) {
+        closing = (await deliverBatch(frames, cursor, options)) || closing;
+      } else {
+        for (const frame of frames) {
+          closing = (await deliver(frame, cursor, options)) || closing;
+          if (user?.aborted) return { established, error: undefined };
+        }
       }
+      if (user?.aborted) return { established, error: undefined };
     }
     return {
       established,
@@ -263,6 +288,51 @@ async function deliver(frame: SseFrame, cursor: Cursor, options: EventsOptions):
   else if (type === "closing" && options.onClosing) await options.onClosing(event);
   else await options.onEvent(event);
   return type === "closing";
+}
+
+/** Same framing/control semantics as deliver, with bounded ordinary groups. */
+async function deliverBatch(frames: SseFrame[], cursor: Cursor, options: EventsOptions): Promise<boolean> {
+  const limit = options.maxEventsPerBatch ?? 128;
+  let closing = false;
+  let pending: StreamEvent[] = [];
+  let pendingChars = 0;
+  const charLimit = options.maxBatchChars ?? 65_536;
+  let lastCursor = cursor.value;
+  const flush = async () => {
+    if (options.signal?.aborted) { pending = []; pendingChars = 0; return; }
+    if (pending.length === 0) return;
+    await options.onEvents!(pending);
+    cursor.value = lastCursor;
+    pending = [];
+    pendingChars = 0;
+  };
+  for (const frame of frames) {
+    if (options.signal?.aborted) break;
+    const type = frame.event || "message";
+    if ((type === "reset" && options.onReset) || (type === "closing" && options.onClosing)) {
+      await flush();
+      if (options.signal?.aborted) break;
+      closing = (await deliver(frame, cursor, options)) || closing;
+      lastCursor = cursor.value;
+      continue;
+    }
+    const chars = (frame.data?.length ?? 0) + (frame.event?.length ?? 0) + (frame.id?.length ?? 0);
+    if (pending.length && pendingChars + chars > charLimit) {
+      await flush();
+      if (options.signal?.aborted) break;
+    }
+    // Include cursor-only frames in the batch as message events. Clients using
+    // onEvents can then commit their cursor only after earlier events applied.
+    pendingChars += chars;
+    pending.push({ event: type, data: frame.data ?? "", id: frame.id,
+      ...(frame.event === undefined && frame.data === undefined ? { cursorOnly: true as const } : {}) });
+    if (type === "reset") lastCursor = undefined;
+    if (frame.id !== undefined) lastCursor = frame.id || undefined;
+    closing = type === "closing" || closing;
+    if (pending.length === limit || pendingChars >= charLimit) await flush();
+  }
+  await flush();
+  return closing;
 }
 
 async function boundedText(response: Response, limit: number): Promise<string> {

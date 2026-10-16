@@ -586,3 +586,125 @@ test("a cursor that cannot be a header value is refused instead of crashing", as
     await server.close();
   }
 });
+
+test("optional batches are bounded, await backpressure, and preserve reset/closing barriers", async () => {
+  const abort = new AbortController();
+  const seen = [];
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const encoder = new TextEncoder();
+  let pulls = 0;
+  const chunks = [
+    [frame({ id: "1", event: "update", data: "one" }), frame({ id: "2", event: "update", data: "two" }),
+      frame({ id: "3", event: "reset", data: "{}" }), frame({ id: "4", event: "update", data: "four" }),
+      frame({ id: "5", event: "closing", data: "{}" })].join(""),
+    frame({ id: "6", event: "update", data: "six" }),
+  ];
+  const body = new ReadableStream({
+    pull(controller) {
+      pulls++;
+      if (chunks.length) controller.enqueue(encoder.encode(chunks.shift()));
+      else controller.close();
+    },
+  }, { highWaterMark: 0 });
+  const done = events("https://example.test/events", {
+    signal: abort.signal,
+    fetch: async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+    onEvent: () => assert.fail("batch path must not call onEvent"),
+    maxEventsPerBatch: 2,
+    onEvents: async batch => {
+      seen.push(batch.map(item => item.id));
+      if (seen.length === 1) await pending;
+      if (batch.at(-1).id === "6") abort.abort();
+    },
+    onReset: event => { seen.push(`reset:${event.id}`); },
+    onClosing: event => { seen.push(`closing:${event.id}`); },
+  });
+  await until(() => seen.length === 1);
+  assert.equal(pulls, 1, "no second read before the batch callback is acknowledged");
+  assert.deepEqual(seen, [["1", "2"]]);
+  release(); await done;
+  assert.deepEqual(seen, [["1", "2"], "reset:3", ["4"], "closing:5", ["6"]]);
+});
+
+test("batch character budget sends an oversized legal event alone without dropping it", async () => {
+  const abort = new AbortController();
+  const batches = [];
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({ start(controller) {
+    controller.enqueue(encoder.encode(["a", "b", "c".repeat(30), "d", "e"].map((data, index) => frame({ id: String(index), event: "x", data })).join("")));
+  }});
+  await events("https://example.test/events", {
+    signal: abort.signal, maxBatchChars: 10,
+    fetch: async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+    onEvent: () => assert.fail("batch path must not call onEvent"),
+    onEvents: batch => { batches.push(batch.map(item => item.data)); if (batch.at(-1).id === "4") abort.abort(); },
+  });
+  assert.deepEqual(batches, [["a", "b"], ["c".repeat(30)], ["d", "e"]]);
+});
+
+test("batches preserve cursor-only and empty-id commits and reset fallback clears the cursor", async () => {
+  const abort = new AbortController();
+  const requests = [];
+  const seen = [];
+  const encoder = new TextEncoder();
+  await events("https://example.test/events", {
+    signal: abort.signal, after: "old:8", backoff: FAST,
+    fetch: async (_url, init) => {
+      requests.push(new Headers(init.headers).get("Last-Event-ID"));
+      if (requests.length === 2) { abort.abort(); throw new Error("done"); }
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(encoder.encode("id: prefix:9\n\nid: \n\nevent: reset\ndata: {}\n\n")); controller.close();
+      }}), { headers: { "Content-Type": "text/event-stream" } });
+    },
+    onEvent: () => assert.fail("batch path must not call onEvent"),
+    onEvents: batch => { seen.push(...batch); },
+  });
+  assert.deepEqual(requests, ["old:8", null]);
+  assert.deepEqual(seen.map(item => [item.event, item.id]), [["message", "prefix:9"], ["message", ""], ["reset", undefined]]);
+});
+
+test("rejecting a batch cancels the reader, delivers no suffix, and never reconnects", async () => {
+  const failure = new Error("apply failed");
+  let canceled = false;
+  let callbacks = 0;
+  const encoder = new TextEncoder();
+  await assert.rejects(events("https://example.test/events", {
+    maxEventsPerBatch: 1,
+    fetch: async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(encoder.encode(frame({ id: "1", data: "one" }) + frame({ id: "2", data: "two" }))); },
+      cancel() { canceled = true; },
+    }), { headers: { "Content-Type": "text/event-stream" } }),
+    onEvent: () => assert.fail("batch path must not call onEvent"),
+    onEvents: () => { callbacks++; throw failure; },
+  }), error => error === failure);
+  assert.equal(callbacks, 1);
+  assert.equal(canceled, true);
+});
+
+test("cancellation during batch collection discards pending frames before the final flush", async () => {
+  const abort = new AbortController();
+  let collecting = false;
+  let checks = 0;
+  // Deterministically expose cancellation between collection of the first and
+  // second frame. This is an AbortSignal boundary test, independent of station.
+  const nativeAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+  Object.defineProperty(abort.signal, "aborted", { configurable: true, get() {
+    if (collecting && ++checks === 2) abort.abort();
+    return nativeAborted.call(abort.signal);
+  }});
+  const encoder = new TextEncoder();
+  let callbacks = 0;
+  await events("https://example.test/events", {
+    signal: abort.signal,
+    fetch: async () => {
+      collecting = true;
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(encoder.encode(frame({ id: "1", data: "one" }) + frame({ id: "2", data: "two" })));
+      }}), { headers: { "Content-Type": "text/event-stream" } });
+    },
+    onEvent: () => assert.fail("batch path must not call onEvent"),
+    onEvents: () => { callbacks++; },
+  });
+  assert.equal(callbacks, 0);
+});
