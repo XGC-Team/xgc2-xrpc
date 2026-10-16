@@ -36,8 +36,13 @@ const (
 // events on the returned channel, resuming from after (empty: from the
 // source's start). When the connection drops, the server announces EventClosing
 // or a transient error occurs, it reconnects with full-jitter backoff
-// (500 ms .. 5 s) and resumes from the last event id it saw. EventReset is
-// delivered to the consumer and clears the cursor; EventClosing is consumed.
+// (500 ms .. 5 s) and resumes from the id of the last complete frame. An
+// id-only frame moves that cursor without a delivery. EventReset is delivered:
+// an id on the frame becomes the cursor, and a reset with no id clears it.
+// EventClosing is consumed and its id is kept. A caller-supplied cursor that
+// fails ValidCursor is rejected before a request is sent. An adopted frame id
+// that fails ValidCursor, other than a field containing NUL, ends the
+// subscription. A NUL inside an id field is ignored and the previous cursor stays.
 // The channel is closed when ctx ends. A failure that retrying cannot fix (the
 // server answers 4xx, or its certificate does not verify) is returned by
 // SubscribeEvents itself when it happens on the first connection, and later
@@ -256,27 +261,33 @@ func (s *subscription) read(ctx context.Context, st *stream) error {
 	var eventType string
 	var data []string
 	hasData := false
+	sawID := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		switch {
 		case line == "":
-			if hasData {
+			// A reset with no id of its own drops the cursor carried in from
+			// earlier frames. An id on the reset frame, including an empty one,
+			// is the new cursor.
+			if eventType == EventReset && !sawID {
+				id = ""
+			}
+			if eventType == EventClosing {
+				s.cursor = id
+				return nil
+			}
+			if hasData || eventType == EventReset {
 				event := Event{ID: id, Type: eventType, Data: []byte(strings.Join(data, "\n"))}
-				switch eventType {
-				case EventClosing:
-					return nil
-				case EventReset:
-					id = ""
-					event.ID = ""
-				}
 				s.cursor = id
 				select {
 				case s.out <- event:
 				case <-ctx.Done():
 					return nil
 				}
+			} else if sawID {
+				s.cursor = id
 			}
-			eventType, data, hasData = "", nil, false
+			eventType, data, hasData, sawID = "", nil, false, false
 		case strings.HasPrefix(line, ":"):
 			// A comment: the heartbeat.
 		default:
@@ -288,9 +299,17 @@ func (s *subscription) read(ctx context.Context, st *stream) error {
 			case "data":
 				data, hasData = append(data, value), true
 			case "id":
-				if !strings.Contains(value, "\x00") {
-					id = value
+				// SSE ignores an id field that contains NUL. Any other value
+				// that cannot be sent as Last-Event-ID cannot be resumed, so
+				// retrying would spin.
+				if strings.Contains(value, "\x00") {
+					break
 				}
+				if !ValidCursor(value) {
+					return xrpc.Failure("invalid_argument", xrpc.ResponseReceived, errors.New("xrpc: event cursor cannot be sent as a header"))
+				}
+				id = value
+				sawID = true
 			}
 		}
 	}

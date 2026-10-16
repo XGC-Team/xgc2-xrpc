@@ -234,6 +234,8 @@ func TestServeEventsRejectsBadRequests(t *testing.T) {
 		{"long cursor", http.MethodGet, map[string]string{"Last-Event-ID": strings.Repeat("x", MaxCursorBytes+1)}, "", http.StatusBadRequest},
 		{"long query cursor", http.MethodGet, nil, "?after=" + strings.Repeat("x", MaxCursorBytes+1), http.StatusBadRequest},
 		{"NUL in cursor", http.MethodGet, nil, "?after=a%00b", http.StatusBadRequest},
+		{"control in cursor", http.MethodGet, nil, "?after=a%01b", http.StatusBadRequest},
+		{"DEL in cursor", http.MethodGet, nil, "?after=%7F", http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		request, _ := http.NewRequest(c.method, server.URL+"/events"+c.query, nil)

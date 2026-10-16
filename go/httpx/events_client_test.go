@@ -211,6 +211,88 @@ func TestSubscribeEventsConsumesClosingAndReconnects(t *testing.T) {
 	}
 }
 
+// The resume cursor is the id of the last complete frame, including a frame
+// that carries only an id, a reset frame's id, and a closing frame's id. An
+// empty id clears it. None of those frames may be dropped on the way to the
+// next Last-Event-ID.
+func TestSubscribeEventsResumesFromTheLastFrameID(t *testing.T) {
+	var step atomic.Int32
+	var mu sync.Mutex
+	var cursors []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cursors = append(cursors, r.Header.Get("Last-Event-ID"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		switch step.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("id: 1\ndata: a\n\nid: 4\n\n"))
+		case 2:
+			_, _ = w.Write([]byte("id:\n\n"))
+		case 3:
+			_, _ = w.Write([]byte("id: 50\nevent: reset\ndata: {}\n\n"))
+		case 4:
+			_, _ = w.Write([]byte("id: 51\ndata: b\n\nid: 60\nevent: closing\ndata: {}\n\n"))
+		default:
+			_, _ = w.Write([]byte("id: 61\ndata: c\n\n"))
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		w.(http.Flusher).Flush()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := subscribe(t, ctx, server, "")
+	if event := next(t, events); event.ID != "1" || event.Type != "" || string(event.Data) != "a" || event.Err != nil {
+		t.Fatalf("first event: %+v", event)
+	}
+	reset := next(t, events)
+	if reset.Type != EventReset || reset.ID != "50" || string(reset.Data) != "{}" || reset.Err != nil {
+		t.Fatalf("reset: %+v", reset)
+	}
+	if event := next(t, events); event.ID != "51" || string(event.Data) != "b" || event.Err != nil {
+		t.Fatalf("after reset: %+v", event)
+	}
+	if event := next(t, events); event.ID != "61" || string(event.Data) != "c" || event.Err != nil {
+		t.Fatalf("after closing: %+v", event)
+	}
+	cancel()
+	closed(t, events)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(cursors) != 5 || cursors[0] != "" || cursors[1] != "4" || cursors[2] != "" || cursors[3] != "50" || cursors[4] != "60" {
+		t.Fatalf("resume cursors %q", cursors)
+	}
+}
+
+func TestSubscribeEventsStopsWhenTheResumeIDCannotBeSent(t *testing.T) {
+	var connections atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connections.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("id: \x01\ndata: a\n\n"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := subscribe(t, ctx, server, "")
+	final := next(t, events)
+	var failure *xrpc.CallError
+	if final.Err == nil || !errors.As(final.Err, &failure) || failure.Code != "invalid_argument" || failure.Disposition != xrpc.ResponseReceived {
+		t.Fatalf("final event %+v", final)
+	}
+	closed(t, events)
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("reconnected %d times after a cursor that cannot be a header", got)
+	}
+}
+
 func TestSubscribeEventsParsesLikeAnEventSource(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -397,6 +479,8 @@ func TestSubscribeEventsValidatesArguments(t *testing.T) {
 	bad("relative path", nil, good, "events", "")
 	bad("scheme-relative path", nil, good, "//host/events", "")
 	bad("cursor with newline", nil, good, "/events", "a\nb")
+	bad("cursor with control", nil, good, "/events", "\x01")
+	bad("cursor with delete", nil, good, "/events", "\x7f")
 	bad("cursor too long", nil, good, "/events", strings.Repeat("x", MaxCursorBytes+1))
 	bad("client with a timeout", &http.Client{Timeout: time.Second}, good, "/events", "")
 	cancelled, cancel := context.WithCancel(ctx)

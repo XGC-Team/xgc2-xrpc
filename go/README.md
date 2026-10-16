@@ -241,7 +241,9 @@ type EventSource interface {
 }
 ```
 
-The cursor `after` is an opaque string (at most 1024 bytes, no CR/LF/NUL).
+The cursor `after` is checked with `ValidCursor` (at most 1024 bytes; each byte
+is tab, 0x20–0x7E, or 0x80–0xFF). An SSE `id` field that contains NUL is ignored
+and does not fail the stream.
 Frames are `id: <cursor>\nevent: <type>\ndata: <json>\n\n`; an idle stream
 carries `: hb` comments every 15 s (`EventsOptions.Heartbeat`). The client
 resumes with `Last-Event-ID` (or `?after=` where a header is impossible; the

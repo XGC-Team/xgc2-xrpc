@@ -94,9 +94,24 @@ func drainSignal(r *http.Request) <-chan struct{} {
 	return signal
 }
 
-// ValidCursor reports whether cursor can travel as Last-Event-ID or ?after=.
+// ValidCursor reports whether a request cursor or an emitted id is acceptable
+// to the Go server and client. Each byte must be tab, 0x20-0x7E, or 0x80-0xFF,
+// and the string at most MaxCursorBytes. ASCII controls other than tab, and
+// DEL, fail, including NUL. The check reads UTF-8 bytes, so U+0080 and above
+// pass. TypeScript isHeaderValue is a different predicate: UTF-16 code units,
+// no 1024-byte cap, and it rejects U+0100 and above. An SSE id field that
+// contains NUL is ignored by the client before this function is applied.
 func ValidCursor(cursor string) bool {
-	return len(cursor) <= MaxCursorBytes && !strings.ContainsAny(cursor, "\x00\r\n")
+	if len(cursor) > MaxCursorBytes {
+		return false
+	}
+	for i := 0; i < len(cursor); i++ {
+		b := cursor[i]
+		if (b < 0x20 && b != '\t') || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // ServeEvents serves an event stream over w: SSE frames
@@ -307,7 +322,7 @@ func (s *eventWriter) finish() {
 }
 
 func formatEvent(event Event) (string, error) {
-	if len(event.Data) == 0 || strings.ContainsAny(event.ID, "\x00\r\n") || strings.ContainsAny(event.Type, "\r\n") || event.Type == EventReset || event.Type == EventClosing || len(event.ID) > MaxCursorBytes {
+	if len(event.Data) == 0 || !ValidCursor(event.ID) || strings.ContainsAny(event.Type, "\r\n") || event.Type == EventReset || event.Type == EventClosing {
 		return "", fmt.Errorf("%w: id %q type %q with %d data bytes", ErrInvalidEvent, truncate(event.ID), truncate(event.Type), len(event.Data))
 	}
 	var frame strings.Builder
