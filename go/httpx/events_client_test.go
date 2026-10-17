@@ -68,14 +68,25 @@ type limited struct {
 	max int
 }
 
-func (l limited) Subscribe(ctx context.Context, after string, emit func(Event) error) error {
+func (l limited) Subscribe(ctx context.Context, after string, emit func([]Event) error) error {
 	sent := 0
-	return l.EventSource.Subscribe(ctx, after, func(event Event) error {
-		if sent == l.max {
+	return l.EventSource.Subscribe(ctx, after, func(batch []Event) error {
+		remaining := l.max - sent
+		if remaining <= 0 {
 			return context.Canceled
 		}
-		sent++
-		return emit(event)
+		prefix := batch
+		if len(prefix) > remaining {
+			prefix = prefix[:remaining]
+		}
+		if err := emit(prefix); err != nil {
+			return err
+		}
+		sent += len(prefix)
+		if len(prefix) < len(batch) {
+			return context.Canceled
+		}
+		return nil
 	})
 }
 

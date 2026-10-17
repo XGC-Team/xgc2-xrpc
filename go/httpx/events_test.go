@@ -48,7 +48,7 @@ func (j *journal) forget(n int) {
 	j.first += n
 }
 
-func (j *journal) Subscribe(ctx context.Context, after string, emit func(Event) error) error {
+func (j *journal) Subscribe(ctx context.Context, after string, emit func([]Event) error) error {
 	j.subscribers.Add(1)
 	defer j.subscribers.Add(-1)
 	next := 0 // index into events of the next event to send
@@ -74,8 +74,8 @@ func (j *journal) Subscribe(ctx context.Context, after string, emit func(Event) 
 		next += len(pending)
 		wake := j.wake
 		j.mu.Unlock()
-		for _, event := range pending {
-			if err := emit(event); err != nil {
+		if len(pending) > 0 {
+			if err := emit(pending); err != nil {
 				return err
 			}
 		}
@@ -87,10 +87,10 @@ func (j *journal) Subscribe(ctx context.Context, after string, emit func(Event) 
 	}
 }
 
-func emitUnlocked(mu *sync.Mutex, emit func(Event) error, event Event) error {
+func emitUnlocked(mu *sync.Mutex, emit func([]Event) error, event Event) error {
 	mu.Unlock()
 	defer mu.Lock()
-	return emit(event)
+	return emit([]Event{event})
 }
 
 func eventServer(t *testing.T, source EventSource, options EventsOptions) *httptest.Server {
@@ -282,8 +282,8 @@ func TestServeEventsNeedsAStreamingWriter(t *testing.T) {
 
 type invalidSource struct{ event Event }
 
-func (s invalidSource) Subscribe(ctx context.Context, after string, emit func(Event) error) error {
-	return emit(s.event)
+func (s invalidSource) Subscribe(ctx context.Context, after string, emit func([]Event) error) error {
+	return emit([]Event{s.event})
 }
 
 func TestServeEventsRejectsInvalidEvents(t *testing.T) {

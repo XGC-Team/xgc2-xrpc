@@ -51,13 +51,14 @@ var ErrInvalidEvent = errors.New("xrpc: invalid event")
 
 // EventSource is the domain journal behind an event stream.
 type EventSource interface {
-	// Subscribe emits every event that follows cursor after, in order, and then
-	// live events, until ctx ends or the source has nothing more to say. An
+	// Subscribe emits bounded groups of already-ready events after cursor, in
+	// order, then live groups until ctx ends or the source has nothing more to
+	// say. It must not wait to fill a group; one ready event is a valid batch. An
 	// empty cursor is a fresh subscription. When the cursor is unknown it
 	// returns ErrCursorGone before emitting anything. Subscribe must return
 	// promptly once ctx ends and must call emit from one goroutine at a time;
 	// an error from emit means the stream is over and must be returned.
-	Subscribe(ctx context.Context, after string, emit func(Event) error) error
+	Subscribe(ctx context.Context, after string, emit func([]Event) error) error
 }
 
 // EventsOptions are plain limits for ServeEvents; zero fields select the default.
@@ -67,7 +68,8 @@ type EventsOptions struct {
 	// SubscribeEvents tell a live stream from a dead one: keep it well below
 	// EventIdleTimeout (default DefaultEventHeartbeat).
 	Heartbeat time.Duration
-	// WriteTimeout bounds each frame write. It is pushed forward on every frame
+	// WriteTimeout bounds each coalesced data write or standalone frame. It is
+	// pushed forward on every write
 	// with http.ResponseController, so a stream outlives the server's
 	// WriteTimeout and ends when one write stalls this long (default
 	// DefaultEventWriteTimeout).
@@ -119,7 +121,7 @@ func ValidCursor(cursor string) bool {
 // from Last-Event-ID (or ?after= where a header is impossible; the header wins)
 // and EventReset when the source does not know the cursor. When the serving
 // Host drains it sends EventClosing and returns, so a graceful shutdown never
-// waits for a stream. Every frame extends the write deadline, so a stream
+// waits for a stream. Every data/control write extends the write deadline, so a stream
 // lives as long as the client and the source do.
 //
 // It is meant for edge hosts (ServeEdge, RunEdge) or any net/http server: an
@@ -200,8 +202,8 @@ func ServeEvents(w http.ResponseWriter, r *http.Request, source EventSource, opt
 		}
 	}()
 
-	emit := func(event Event) error {
-		if err := stream.event(event); err != nil {
+	emit := func(events []Event) error {
+		if err := stream.events(ctx, events); err != nil {
 			cancel(err)
 			return err
 		}
@@ -259,8 +261,8 @@ func acceptsEventStream(accept string) bool {
 	return false
 }
 
-// eventWriter serializes frames from the source and the heartbeat and pushes
-// the write deadline forward before each of them.
+// eventWriter serializes bounded source writes and heartbeat frames, pushing
+// the write deadline forward before each write.
 type eventWriter struct {
 	w          http.ResponseWriter
 	controller *http.ResponseController
@@ -269,6 +271,10 @@ type eventWriter struct {
 	mu     sync.Mutex
 	failed bool
 	done   bool
+
+	// Only the serial source callback uses this reusable buffer. Heartbeats
+	// use frame/write directly and never retain event payloads.
+	batchBuffer []byte
 }
 
 func (s *eventWriter) header() {
@@ -280,14 +286,19 @@ func (s *eventWriter) header() {
 	_ = s.controller.Flush()
 }
 
-func (s *eventWriter) frame(text string) error {
+func (s *eventWriter) frame(text string) error { return s.write(context.Background(), []byte(text)) }
+
+func (s *eventWriter) write(ctx context.Context, frame []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.done || s.failed {
 		return errors.New("xrpc: event stream closed")
 	}
 	_ = s.controller.SetWriteDeadline(time.Now().Add(s.timeout))
-	if _, err := s.w.Write([]byte(text)); err != nil {
+	if _, err := s.w.Write(frame); err != nil {
 		s.failed = true
 		return err
 	}
@@ -300,12 +311,113 @@ func (s *eventWriter) frame(text string) error {
 
 func (s *eventWriter) comment(text string) error { return s.frame(": " + text + "\n\n") }
 
-func (s *eventWriter) event(event Event) error {
-	frame, err := formatEvent(event)
-	if err != nil {
+// eventBatchBytes bounds coalescing, not the size of an individual event.
+const eventBatchBytes = 64 << 10
+
+func (s *eventWriter) events(ctx context.Context, events []Event) error {
+	// Validate the complete batch before writing any of it. This checks only
+	// the existing frame metadata rules; payloads remain opaque bytes.
+	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := validateEvent(event); err != nil {
+			return err
+		}
+	}
+	buffer := s.batchBuffer[:0]
+	defer func() { s.batchBuffer = buffer[:0] }()
+	flush := func() error {
+		if len(buffer) == 0 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := s.write(ctx, buffer)
+		buffer = buffer[:0]
 		return err
 	}
-	return s.frame(frame)
+	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		size := eventFrameSize(event)
+		if size > eventBatchBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+			// Preserve the existing standalone frame path for large events;
+			// never retain a large frame in the reusable coalescing buffer.
+			if err := s.write(ctx, []byte(formatValidatedEvent(event))); err != nil {
+				return err
+			}
+			continue
+		}
+		if len(buffer)+size > eventBatchBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		if cap(buffer) == 0 {
+			buffer = make([]byte, 0, eventBatchBytes)
+		}
+		buffer = appendEventFrame(buffer, event)
+	}
+	return flush()
+}
+
+// eventFrameSize counts framing and CR/CRLF normalization without encoding or
+// copying the payload. A complete normal frame fits the bounded buffer.
+func eventFrameSize(event Event) int {
+	size := len(event.Data) + 8 // data prefix, line ending and blank line
+	if event.ID != "" {
+		size += len(event.ID) + 5
+	}
+	if event.Type != "" {
+		size += len(event.Type) + 8
+	}
+	for i := 0; i < len(event.Data); i++ {
+		switch event.Data[i] {
+		case '\r':
+			size += 6 // another data prefix after the normalized newline
+			if i+1 < len(event.Data) && event.Data[i+1] == '\n' {
+				size--
+				i++
+			}
+		case '\n':
+			size += 6
+		}
+	}
+	return size
+}
+
+func appendEventFrame(dst []byte, event Event) []byte {
+	if event.ID != "" {
+		dst = append(dst, "id: "...)
+		dst = append(dst, event.ID...)
+		dst = append(dst, '\n')
+	}
+	if event.Type != "" {
+		dst = append(dst, "event: "...)
+		dst = append(dst, event.Type...)
+		dst = append(dst, '\n')
+	}
+	dst = append(dst, "data: "...)
+	start := 0
+	for i := 0; i < len(event.Data); i++ {
+		if event.Data[i] != '\r' && event.Data[i] != '\n' {
+			continue
+		}
+		dst = append(dst, event.Data[start:i]...)
+		dst = append(dst, "\ndata: "...)
+		if event.Data[i] == '\r' && i+1 < len(event.Data) && event.Data[i+1] == '\n' {
+			i++
+		}
+		start = i + 1
+	}
+	dst = append(dst, event.Data[start:]...)
+	return append(dst, '\n', '\n')
 }
 
 func (s *eventWriter) broken() bool {
@@ -321,10 +433,14 @@ func (s *eventWriter) finish() {
 	s.mu.Unlock()
 }
 
-func formatEvent(event Event) (string, error) {
+func validateEvent(event Event) error {
 	if len(event.Data) == 0 || !ValidCursor(event.ID) || strings.ContainsAny(event.Type, "\r\n") || event.Type == EventReset || event.Type == EventClosing {
-		return "", fmt.Errorf("%w: id %q type %q with %d data bytes", ErrInvalidEvent, truncate(event.ID), truncate(event.Type), len(event.Data))
+		return fmt.Errorf("%w: id %q type %q with %d data bytes", ErrInvalidEvent, truncate(event.ID), truncate(event.Type), len(event.Data))
 	}
+	return nil
+}
+
+func formatValidatedEvent(event Event) string {
 	var frame strings.Builder
 	if event.ID != "" {
 		frame.WriteString("id: " + event.ID + "\n")
@@ -339,7 +455,7 @@ func formatEvent(event Event) (string, error) {
 		frame.WriteString("\n")
 	}
 	frame.WriteString("\n")
-	return frame.String(), nil
+	return frame.String()
 }
 
 func truncate(s string) string {

@@ -237,9 +237,15 @@ a domain `EventSource`:
 
 ```go
 type EventSource interface {
-	Subscribe(ctx context.Context, after string, emit func(Event) error) error
+	Subscribe(ctx context.Context, after string, emit func([]Event) error) error
 }
 ```
+
+The source emits bounded groups of already-ready events in order; it never waits
+to fill a group. Each batch is validated before any of it is written, then
+coalesced into bounded writes. An individual large event is written alone.
+These are transport flush boundaries, not wire batch envelopes or application
+acknowledgements; clients may receive different byte chunks.
 
 The cursor `after` is checked with `ValidCursor` (at most 1024 bytes; each byte
 is tab, 0x20–0x7E, or 0x80–0xFF). An SSE `id` field that contains NUL is ignored
