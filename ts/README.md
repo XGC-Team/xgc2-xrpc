@@ -90,6 +90,12 @@ has a cursor, `Last-Event-ID`. It returns a promise that resolves when
   ends, a leading BOM, and chunks split anywhere, even inside a UTF-8 sequence
   or a CRLF pair. `event` defaults to `"message"`. A frame with an `event:`
   but no `data:` is still delivered (control frames); `retry:` is ignored.
+* **Optional batching.** `onEvents` receives ordered groups bounded by
+  `maxEventsPerBatch` (128) and `maxBatchChars` (65536 UTF-16 characters).
+  By default each reader chunk is flushed. Opt-in `maxBatchWaitMs` combines
+  chunks until the first pending event's deadline, a size boundary, EOF or a
+  dedicated reset/closing barrier. There is at most one pending read and one
+  application callback; delivery and cursor commit still await that callback.
 * **Resume.** The cursor is the `id:` of the last frame (an empty `id:` clears
   it) and starts at `options.after`. Every reconnect sends it as
   `Last-Event-ID`; each event is delivered once, in order. Callbacks are awaited

@@ -708,3 +708,277 @@ test("cancellation during batch collection discards pending frames before the fi
   });
   assert.equal(callbacks, 0);
 });
+
+
+function fragmentedResponse(chunks, state = {}) {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    pull(controller) {
+      state.reads = (state.reads ?? 0) + 1;
+      if (chunks.length) controller.enqueue(encoder.encode(chunks.shift()));
+      else if (!state.holdOpen) { state.eof = true; controller.close(); }
+    },
+    cancel() { state.canceled = true; },
+  }, { highWaterMark: 0 }), { headers: { "Content-Type": "text/event-stream" } });
+}
+
+test("timed batches combine 100 single-event chunks without concurrent callbacks", async t => {
+  t.mock.method(performance, "now", () => 0);
+  const abort = new AbortController();
+  const state = {};
+  const batches = [];
+  let active = 0;
+  await events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16,
+    fetch: async () => fragmentedResponse(Array.from({ length: 100 }, (_, index) => frame({ id: String(index), data: String(index) })), state),
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: async batch => {
+      assert.equal(active++, 0);
+      batches.push(batch.map(item => item.id));
+      await Promise.resolve();
+      active--;
+      if (batch.at(-1).id === "99") abort.abort();
+    },
+  });
+  assert.deepEqual(batches.flat(), Array.from({ length: 100 }, (_, index) => String(index)));
+  assert.equal(batches.length, 1, "EOF flushes one bounded group rather than 100 chunk ACKs");
+  assert.equal(state.eof, true);
+});
+
+test("timed low-volume batch flushes at its first deadline with only one pending read", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const abort = new AbortController();
+  const state = { holdOpen: true };
+  const batches = [];
+  const done = events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16,
+    fetch: async () => fragmentedResponse([frame({ id: "one", data: "one" })], state),
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: batch => { batches.push(batch.map(item => item.id)); abort.abort(); },
+  });
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.equal(state.reads, 2);
+  assert.deepEqual(batches, []);
+  t.mock.timers.tick(15);
+  await Promise.resolve();
+  assert.deepEqual(batches, []);
+  t.mock.timers.tick(1);
+  await done;
+  assert.deepEqual(batches, [["one"]]);
+  assert.equal(state.reads, 2, "deadline reuses the one pending read");
+});
+
+test("timed cross-chunk batches retain count, char and control barriers", async () => {
+  const abort = new AbortController();
+  const seen = [];
+  const chunks = [frame({ id: "1", event: "x", data: "a" }), frame({ id: "2", event: "x", data: "b" }),
+    frame({ id: "3", event: "reset", data: "{}" }), frame({ id: "4", event: "x", data: "c".repeat(30) }),
+    frame({ id: "5", event: "closing", data: "{}" }), frame({ id: "6", event: "x", data: "end" })];
+  await events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16, maxEventsPerBatch: 2, maxBatchChars: 10,
+    fetch: async () => fragmentedResponse(chunks),
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: batch => { seen.push(batch.map(item => item.id)); if (batch.at(-1).id === "6") abort.abort(); },
+    onReset: event => seen.push(`reset:${event.id}`),
+    onClosing: event => seen.push(`closing:${event.id}`),
+  });
+  assert.deepEqual(seen, [["1", "2"], "reset:3", ["4"], "closing:5", ["6"]]);
+});
+
+test("timed count limit stops reads until ACK, then resumes the exact EOF cursor", async () => {
+  const abort = new AbortController();
+  const state = {};
+  let release;
+  const ack = new Promise(resolve => { release = resolve; });
+  const requests = [];
+  const seen = [];
+  const done = events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16, maxEventsPerBatch: 2, backoff: FAST,
+    fetch: async (_url, init) => {
+      requests.push(new Headers(init.headers).get("Last-Event-ID"));
+      if (requests.length === 2) { abort.abort(); throw new Error("done"); }
+      return fragmentedResponse([frame({ id: "1", data: "a" }), frame({ id: "2", data: "b" }), frame({ id: "3", data: "c" })], state);
+    },
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: async batch => { seen.push(batch.map(item => item.id)); if (seen.length === 1) await ack; },
+  });
+  await until(() => seen.length === 1);
+  assert.equal(state.reads, 2);
+  assert.deepEqual(requests, [null]);
+  release();
+  await done;
+  assert.deepEqual(seen, [["1", "2"], ["3"]]);
+  assert.deepEqual(requests, [null, "3"]);
+});
+
+test("timed callback failure never consumes the suffix or reconnects", async () => {
+  const failure = new Error("partial application failed");
+  const state = {};
+  let calls = 0;
+  await assert.rejects(events("https://example.test/events", {
+    maxBatchWaitMs: 16, maxEventsPerBatch: 2,
+    fetch: async () => fragmentedResponse([frame({ id: "1", data: "a" }), frame({ id: "2", data: "b" }), frame({ id: "3", data: "c" })], state),
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: batch => { calls++; assert.deepEqual(batch.map(item => item.id), ["1", "2"]); throw failure; },
+  }), error => error === failure);
+  assert.equal(calls, 1);
+  assert.equal(state.reads, 2);
+  assert.equal(state.canceled, true);
+});
+
+test("timed abort before deadline discards the unacknowledged pending batch", async () => {
+  const abort = new AbortController();
+  let controller;
+  let calls = 0;
+  const done = events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16,
+    fetch: async (_url, init) => new Response(new ReadableStream({
+      start(value) {
+        controller = value;
+        value.enqueue(new TextEncoder().encode(frame({ id: "1", data: "a" })));
+        init.signal.addEventListener("abort", () => { try { controller.close(); } catch {} }, { once: true });
+      },
+    }), { headers: { "Content-Type": "text/event-stream" } }),
+    onEvent: () => assert.fail("batch path only"), onEvents: () => { calls++; },
+  });
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  abort.abort();
+  await done;
+  assert.equal(calls, 0);
+});
+
+test("timed batches enforce the real 128-event and 64KiB budgets across chunks", async t => {
+  t.mock.method(performance, "now", () => 0);
+  for (const [payloads, sizes] of [
+    [Array.from({ length: 130 }, () => "x"), [128, 2]],
+    [["x".repeat(32760), "y".repeat(32760), "z".repeat(32760)], [2, 1]],
+  ]) {
+    const abort = new AbortController();
+    const batches = [];
+    await events("https://example.test/events", {
+      signal: abort.signal, maxBatchWaitMs: 16,
+      fetch: async () => fragmentedResponse(payloads.map((data, index) => frame({ id: String(index), event: "x", data }))),
+      onEvent: () => assert.fail("batch path only"),
+      onEvents: batch => {
+        batches.push(batch);
+        assert.ok(batch.length <= 128);
+        assert.ok(batch.reduce((sum, event) => sum + event.data.length + event.event.length + (event.id?.length ?? 0), 0) <= 65536);
+        if (batch.at(-1).id === String(payloads.length - 1)) abort.abort();
+      },
+    });
+    assert.deepEqual(batches.map(batch => batch.length), sizes);
+    assert.deepEqual(batches.flat().map(event => event.data), payloads);
+  }
+});
+
+test("timed deadline keeps one pending read across a held ACK and does not extend on a later chunk", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const abort = new AbortController();
+  const encoder = new TextEncoder();
+  let controller;
+  let release;
+  const ack = new Promise(resolve => { release = resolve; });
+  const seen = [];
+  let reads = 0;
+  const done = events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16,
+    fetch: async () => new Response(new ReadableStream({
+      start(value) { controller = value; value.enqueue(encoder.encode(frame({ id: "1", data: "a" }))); },
+      pull() { reads++; },
+    }, { highWaterMark: 0 }), { headers: { "Content-Type": "text/event-stream" } }),
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: async batch => {
+      seen.push(batch.map(event => event.id));
+      if (seen.length === 1) await ack;
+      else abort.abort();
+    },
+  });
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  now = 8;t.mock.timers.tick(8);
+  controller.enqueue(encoder.encode(frame({ id: "2", data: "b" })));
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  now = 15;t.mock.timers.tick(7);
+  await Promise.resolve();
+  assert.deepEqual(seen, []);
+  now = 16;t.mock.timers.tick(1);
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.deepEqual(seen, [["1", "2"]]);
+  const atAck = reads;
+  controller.enqueue(encoder.encode(frame({ id: "3", data: "c" })));
+  controller.close();
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.deepEqual(seen, [["1", "2"]]);
+  assert.equal(reads, atAck);
+  release();
+  await done;
+  assert.deepEqual(seen, [["1", "2"], ["3"]]);
+});
+
+test("timed EOF commits cursor-only, empty id and fallback reset in order", async () => {
+  const abort = new AbortController();
+  const requests = [];
+  const seen = [];
+  await events("https://example.test/events", {
+    signal: abort.signal, after: "old:8", maxBatchWaitMs: 16, backoff: FAST,
+    fetch: async (_url, init) => {
+      requests.push(new Headers(init.headers).get("Last-Event-ID"));
+      if (requests.length === 2) { abort.abort(); throw new Error("done"); }
+      return fragmentedResponse(["id: prefix:9\n\n", "id:\n\n", "event: reset\ndata: {}\n\n"]);
+    },
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: batch => { seen.push(...batch); },
+  });
+  assert.deepEqual(requests, ["old:8", null]);
+  assert.deepEqual(seen.map(event => [event.event, event.id]), [["message", "prefix:9"], ["message", ""], ["reset", undefined]]);
+});
+
+test("maxBatchWaitMs requires a positive integer and an ordered batch callback", async () => {
+  for (const maxBatchWaitMs of [0, -1, 1.5, NaN, Infinity]) {
+    await assert.rejects(events("https://example.test/events", {
+      maxBatchWaitMs, onEvent: () => {}, onEvents: () => {}, fetch: () => assert.fail("invalid options must not fetch"),
+    }), error => error.code === "invalid_argument");
+  }
+  await assert.rejects(events("https://example.test/events", {
+    maxBatchWaitMs: 16, onEvent: () => {}, fetch: () => assert.fail("invalid options must not fetch"),
+  }), error => error.code === "invalid_argument");
+});
+
+test("timed silent-tail deadline callback failure is delivered once and never retried", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const state = { holdOpen: true };
+  const failure = new Error("deadline application failure");
+  let calls = 0;
+  let fetches = 0;
+  const done = events("https://example.test/events", {
+    maxBatchWaitMs: 16,
+    fetch: async () => { fetches++; return fragmentedResponse([frame({ id: "uncommitted:1", data: "one" })], state); },
+    onEvent: () => assert.fail("batch path only"),
+    onEvents: batch => { calls++; assert.deepEqual(batch.map(event => event.id), ["uncommitted:1"]); throw failure; },
+  });
+  const rejected = assert.rejects(done, error => error === failure);
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  t.mock.timers.tick(16);
+  await rejected;
+  assert.equal(calls, 1);
+  assert.equal(fetches, 1);
+  assert.equal(state.reads, 2, "only the initial chunk and one pending read");
+  assert.equal(state.canceled, true);
+});
+
+
+test("timed reset and closing without dedicated handlers still flush as ordered control barriers", async () => {
+  const abort = new AbortController();
+  const seen = [];
+  await events("https://example.test/events", {
+    signal: abort.signal, maxBatchWaitMs: 16,
+    fetch: async () => fragmentedResponse([
+      frame({ id: "1", data: "one" }), frame({ event: "reset", data: "{}" }),
+      frame({ id: "2", data: "two" }), frame({ event: "closing", data: "{}" }),
+    ]),
+    onEvent: () => assert.fail("control fallback must remain onEvents"),
+    onEvents: batch => { seen.push(batch.map(event => event.event)); if (batch[0].event === "closing") abort.abort(); },
+  });
+  assert.deepEqual(seen, [["message"], ["reset"], ["message"], ["closing"]]);
+});
