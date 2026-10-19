@@ -63,7 +63,8 @@ type connection struct {
 }
 
 func (c *connection) Close() error {
-	err := c.Conn.Close()
+	// Untrack before the inner Close releases its admission permit, allowing a
+	// replacement Accept. The socket close itself does not hold the owner lock.
 	c.once.Do(func() { c.owner.mu.Lock(); delete(c.owner.connections, c); c.owner.mu.Unlock() })
-	return err
+	return c.Conn.Close()
 }
