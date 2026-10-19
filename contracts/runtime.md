@@ -337,7 +337,7 @@ README lists its fields.
 
 ## Language packages
 
-All packages carry one product version (0.2.0). Go: `go/`, module
+All packages carry one product version (0.2.1). Go: `go/`, module
 `github.com/XGC-Team/xgc2-xrpc/go`, Go 1.24, native `net/http` and gRPC, no cgo. C++: `cpp/`,
 namespace `xgc2::xrpc`, C++17, one shared library per component selected with
 `XGC2_XRPC_COMPONENTS` (`unix diagnostics bootstrap http json_http grpc udp`), GNU 7.5 for

@@ -10,9 +10,9 @@ and installation checks run offline with at most two native build jobs.
 revisions. `packaging/runtime-abi.json` owns the per-distribution package set (languages and
 C++ components), the glibc ceiling and the SOVERSION generation of each library. Language
 versions, dependencies and public APIs remain in their language manifests. One product
-version (0.2.0) is the version of the CMake project, the Python wheel, the Rust crate, both
-npm packages and every Debian package (`0.2.0-2~<dist>`); the Go module is versioned by the
-tag `go/v0.2.0` of this repository (the module lives in `go/`).
+version (0.2.1) is the version of the CMake project, the Python wheel, the Rust crate, both
+npm packages and every Debian package (`0.2.1-1~<dist>`). The Go module lives in `go/`;
+consumers pin a published source revision through the native Go module version.
 
 ## Distributions
 

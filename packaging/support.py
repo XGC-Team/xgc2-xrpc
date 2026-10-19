@@ -73,7 +73,7 @@ CPP_PACKAGES = (
 # What a component links against (cpp/CMakeLists.txt pulls these in itself; a package
 # selection must name them, because each of them is shipped by a package).
 CPP_DEPENDENCIES = {"bootstrap": ("unix",), "http": ("unix", "diagnostics", "bootstrap"),
-                    "json_http": ("http",), "grpc": ("unix", "diagnostics")}
+                    "json_http": ("http",), "grpc": ("unix", "diagnostics", "bootstrap")}
 
 
 def cpp_package_set(components):

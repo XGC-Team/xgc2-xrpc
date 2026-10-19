@@ -381,7 +381,7 @@ func TestCallPreconditionsAreNotSent(t *testing.T) {
 		"method with space": {within(t, time.Second), ref(address), "test.v1/E cho", "invalid_argument"},
 		"http profile":      {within(t, time.Second), xrpc.ServiceRef{TargetID: "t", Service: "s", APIVersion: "v", Profile: xrpc.HTTP, Endpoint: xrpc.Endpoint{Kind: "unix", Address: "/run/x.sock"}}, "test.v1/Echo", "invalid_argument"},
 		"invalid endpoint":  {within(t, time.Second), ref("no-port"), "test.v1/Echo", "invalid_argument"},
-		"unresolvable host": {within(t, time.Second), ref("256.1.1.1:9"), "test.v1/Echo", "unavailable"},
+		"unresolvable host": {within(t, time.Second), ref("invalid..host:9"), "test.v1/Echo", "unavailable"},
 	}
 	for name, c := range cases {
 		_, err := client.Call(c.ctx, c.target, c.method, nil)

@@ -125,7 +125,10 @@ func TestRelaysBothDirectionsPerClient(t *testing.T) {
 	if len(distinct) != 2 {
 		t.Fatalf("the server must see one source per client, saw %d", len(distinct))
 	}
-	settle(t, "counters", func() bool { return proxy.Stats().Replies.Delivered == 2 })
+	settle(t, "counters", func() bool {
+		s := proxy.Stats()
+		return s.Requests.Delivered == 2 && s.Replies.Delivered == 2
+	})
 	if s := proxy.Stats(); s.Requests.Seen != 2 || s.Requests.Delivered != 2 || s.Replies.Seen != 2 || s.Requests.Dropped != 0 {
 		t.Fatalf("stats %+v", s)
 	}

@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-xrpc
 name: XGC2 XRPC SDKs
-version: 0.2.0-2
+version: 0.2.1-1
 kind: toolchain-apt
 summary: Bounded http.v1, grpc.v1 and udp.v1 transport SDKs. Ubuntu 18.04 (bionic) gets the udp.v1 C++ library only; focal, jammy and noble get every C++ component and the Node and TypeScript libraries.
 apt:
@@ -63,7 +63,7 @@ apt:
 usage:
   install: sudo apt install libxgc2-xrpc-udp-dev libxgc2-xrpc-dev libxgc2-xrpc-grpc-dev node-xgc2-xrpc node-xgc2-xrpc-client
   smoke_test: cmake --find-package -DNAME=XgcXrpc -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=EXIST
-  notes: C++ is C++17 and one shared library per component, found with find_package(XgcXrpc COMPONENTS ...). libxgc2-xrpc-udp-dev is the root development package (CMake package files, the udp.v1 library and the header-only method router) and is the only C++ package on Ubuntu 18.04; XgcXrpc::json_http, XgcXrpc::http and XgcXrpc::grpc come with libxgc2-xrpc-dev and libxgc2-xrpc-grpc-dev on focal, jammy and noble. The runtime packages carry the SOVERSION generation (libxgc2-xrpc-udp1, libxgc2-xrpc2, libxgc2-xrpc-grpc2). Python wheel, Go source archive, Rust crate and the Node and TypeScript npm tarballs install through their native package managers and all carry the product version (0.2.0). Python uses an explicitly selected interpreter >=3.8. The Architecture all packages node-xgc2-xrpc and node-xgc2-xrpc-client install the same Node libraries (the first with a private pinned ws, the second without dependencies); consumers provide an explicitly selected Node >=20 runtime. Their installation identities are recorded in /usr/share/xgc2/xrpc/node/install-identity.json and /usr/share/xgc2/xrpc/ts/install-identity.json.
+  notes: C++ is C++17 and one shared library per component, found with find_package(XgcXrpc COMPONENTS ...). libxgc2-xrpc-udp-dev is the root development package (CMake package files, the udp.v1 library and the header-only method router) and is the only C++ package on Ubuntu 18.04; XgcXrpc::json_http, XgcXrpc::http and XgcXrpc::grpc come with libxgc2-xrpc-dev and libxgc2-xrpc-grpc-dev on focal, jammy and noble. The runtime packages carry the SOVERSION generation (libxgc2-xrpc-udp1, libxgc2-xrpc2, libxgc2-xrpc-grpc2). Python wheel, Go source archive, Rust crate and the Node and TypeScript npm tarballs install through their native package managers and all carry the product version (0.2.1). Python uses an explicitly selected interpreter >=3.8. The Architecture all packages node-xgc2-xrpc and node-xgc2-xrpc-client install the same Node libraries (the first with a private pinned ws, the second without dependencies); consumers provide an explicitly selected Node >=20 runtime. Their installation identities are recorded in /usr/share/xgc2/xrpc/node/install-identity.json and /usr/share/xgc2/xrpc/ts/install-identity.json.
 ownership:
   paths:
   - /usr/include/xgc2/xrpc
@@ -89,7 +89,7 @@ release:
   requires: []
   dependency_policy: {}
   apt_versions:
-    bionic: 0.2.0-2~bionic
-    focal: 0.2.0-2~focal
-    jammy: 0.2.0-2~jammy
-    noble: 0.2.0-2~noble
+    bionic: 0.2.1-1~bionic
+    focal: 0.2.1-1~focal
+    jammy: 0.2.1-1~jammy
+    noble: 0.2.1-1~noble
