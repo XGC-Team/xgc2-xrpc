@@ -4,16 +4,21 @@
 #include "google/protobuf/duration.pb.h"
 #include "google/rpc/error_details.pb.h"
 #include "google/rpc/status.pb.h"
+#include <openssl/pem.h>
+#include <openssl/x509v3.h>
+#include <arpa/inet.h>
 #include <array>
 #include <cassert>
 #include <condition_variable>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <fcntl.h>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <netinet/in.h>
 #include <optional>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
@@ -977,7 +982,196 @@ void application_error_marker() {
   // A marker from a host with another instance identity never matches.
   assert(host.server.shutdown_until(GrpcClock::now() + 2s));
 }
+struct TlsPem { std::string certificate, key; };
+TlsPem tls_pem(const char* name, const TlsPem* issuer = nullptr) {
+  using Context = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+  using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+  using Certificate = std::unique_ptr<X509, decltype(&X509_free)>;
+  using Bio = std::unique_ptr<BIO, decltype(&BIO_free)>;
+  using Extension = std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)>;
+  Context context(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
+  assert(context && EVP_PKEY_keygen_init(context.get()) == 1);
+  assert(EVP_PKEY_CTX_set_rsa_keygen_bits(context.get(), 2048) == 1);
+  EVP_PKEY* generated = nullptr;
+  assert(EVP_PKEY_keygen(context.get(), &generated) == 1);
+  Key key(generated, EVP_PKEY_free);
+  Certificate certificate(X509_new(), X509_free), parent(nullptr, X509_free);
+  Key parent_key(nullptr, EVP_PKEY_free);
+  assert(certificate && X509_set_version(certificate.get(), 2) == 1);
+  static long serial = 1;
+  assert(ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), serial++) == 1);
+  assert(X509_gmtime_adj(X509_get_notBefore(certificate.get()), -60));
+  assert(X509_gmtime_adj(X509_get_notAfter(certificate.get()), 3600));
+  assert(X509_set_pubkey(certificate.get(), key.get()) == 1);
+  auto* subject = X509_get_subject_name(certificate.get());
+  assert(X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
+      reinterpret_cast<const unsigned char*>(name), -1, -1, 0) == 1);
+  if (issuer) {
+    Bio cert(BIO_new_mem_buf(issuer->certificate.data(), static_cast<int>(issuer->certificate.size())), BIO_free);
+    Bio private_key(BIO_new_mem_buf(issuer->key.data(), static_cast<int>(issuer->key.size())), BIO_free);
+    parent.reset(PEM_read_bio_X509(cert.get(), nullptr, nullptr, nullptr));
+    parent_key.reset(PEM_read_bio_PrivateKey(private_key.get(), nullptr, nullptr, nullptr));
+    assert(parent && parent_key);
+  }
+  assert(X509_set_issuer_name(certificate.get(), parent ? X509_get_subject_name(parent.get()) : subject) == 1);
+  const auto extension = [&](int id, const char* value) {
+    Extension item(X509V3_EXT_conf_nid(nullptr, nullptr, id, const_cast<char*>(value)), X509_EXTENSION_free);
+    assert(item && X509_add_ext(certificate.get(), item.get(), -1) == 1);
+  };
+  extension(NID_basic_constraints, issuer ? "critical,CA:FALSE" : "critical,CA:TRUE");
+  extension(NID_key_usage, issuer ? "critical,digitalSignature,keyEncipherment" : "critical,keyCertSign,cRLSign");
+  if (issuer) {
+    extension(NID_ext_key_usage, "serverAuth,clientAuth");
+    extension(NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1");
+  }
+  assert(X509_sign(certificate.get(), parent_key ? parent_key.get() : key.get(), EVP_sha256()) > 0);
+  Bio cert(BIO_new(BIO_s_mem()), BIO_free), private_key(BIO_new(BIO_s_mem()), BIO_free);
+  assert(cert && private_key);
+  assert(PEM_write_bio_X509(cert.get(), certificate.get()) == 1);
+  assert(PEM_write_bio_PrivateKey(private_key.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) == 1);
+  const auto bytes = [](BIO* bio) {
+    char* data = nullptr; const auto size = BIO_get_mem_data(bio, &data);
+    assert(size > 0); return std::string(data, static_cast<std::size_t>(size));
+  };
+  return {bytes(cert.get()), bytes(private_key.get())};
+}
+void tls_private_file(const std::string& path, const std::string& value) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  assert(fd >= 0);
+  std::size_t offset = 0;
+  while (offset < value.size()) {
+    const auto wrote = ::write(fd, value.data() + offset, value.size() - offset);
+    assert(wrote > 0); offset += static_cast<std::size_t>(wrote);
+  }
+  assert(::close(fd) == 0);
+}
+BootstrapInput tls_input(const Directory& directory, const std::string& name,
+                         const TlsPem& identity, const TlsPem& ca, int port,
+                         const std::string& authentication, BootstrapRole role) {
+  const auto file = [&](const char* suffix, const std::string& value) {
+    const auto path = directory.path + "/" + name + suffix;
+    tls_private_file(path, value); return '"' + path + '"';
+  };
+  const auto cert = file(".crt", identity.certificate), key = file(".key", identity.key);
+  const auto trust = file(".ca", ca.certificate), token = file(".token", "fixture-token");
+  const auto binding = R"({"schema_version":1,"target_id":"robot-host","service":"fixture","api_version":"v1","profile":"grpc.v1","endpoint":{"kind":"tls","address":"127.0.0.1:)" +
+      std::to_string(port) + R"("},"runtime_grant":"owner.runtime","authentication":")" + authentication +
+      R"(","secret_handles":{"tls_identity":"owner.identity","tls_trust":"owner.trust","authorization":"owner.auth"},"storage_grants":[]})";
+  const auto grants = R"({"owner.identity":{"kind":"tls_identity","cert_file":)" + cert +
+      R"(,"key_file":)" + key + R"(},"owner.trust":{"kind":"tls_trust","ca_file":)" + trust +
+      R"(},"owner.auth":{"kind":"bearer","token_file":)" + token + "}}";
+  const auto path = directory.path + "/" + name + ".json";
+  tls_private_file(path, R"({"schema_version":1,"binding":)" + binding + R"(,"grants":)" + grants + '}');
+  return loadBootstrapInput(path, role);
+}
+int bound_tcp_socket(int& port) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); assert(fd >= 0);
+  sockaddr_in address{}; address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  assert(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+  socklen_t size = sizeof(address);
+  assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+  port = ntohs(address.sin_port); return fd;
+}
+std::shared_ptr<grpc::Channel> tls_channel(const std::string& address,
+                                         const TlsPem& ca, const TlsPem* identity,
+                                         const std::string& expected_name = {}) {
+  grpc::SslCredentialsOptions options;
+  options.pem_root_certs = ca.certificate;
+  if (identity) { options.pem_cert_chain = identity->certificate; options.pem_private_key = identity->key; }
+  grpc::ChannelArguments arguments; arguments.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
+  if (!expected_name.empty()) arguments.SetSslTargetNameOverride(expected_name);
+  return grpc::CreateCustomChannel(address, grpc::SslCredentials(options), arguments);
+}
+grpc::Status tls_echo(Fixture::Stub& stub, std::initializer_list<const char*> tokens) {
+  grpc::ClientContext context;
+  for (const auto* token : tokens) context.AddMetadata("authorization", token);
+  GrpcClientCall call(context, "tls-instance", GrpcClock::now() + 2s);
+  Packet input, output; input.set_value("remote");
+  auto status = call.invoke([&] { return stub.Echo(&context, input, &output); });
+  if (status.ok()) assert(output.value() == input.value());
+  return status;
+}
+void authenticated_tls_and_local_host() {
+  const auto ca = tls_pem("fixture CA"), other_ca = tls_pem("other CA");
+  const auto server_identity = tls_pem("localhost", &ca);
+  const auto client_identity = tls_pem("fixture client", &ca);
+  const auto untrusted_client = tls_pem("untrusted client", &other_ca);
+  for (const std::string authentication : {"server_tls", "mutual_tls"}) {
+    Directory directory;
+    int port = 0; const int reserved = bound_tcp_socket(port); assert(::close(reserved) == 0);
+    auto bootstrap = tls_input(directory, "server", server_identity, ca, port, authentication, BootstrapRole::Server);
+    GrpcLimits limits; limits.inflight = 1;
+    GrpcAdmission admission("tls-instance", limits);
+    Service service(admission);
+    GrpcUnixServer host(UnixOptions{directory.socket()}, admission, {&service}, bootstrap);
+    assert(host.tls_endpoint() && host.tls_endpoint()->kind == "tls");
+    assert(host.tls_endpoint()->address == bootstrap.binding().endpoint().address);
+    auto local = Fixture::NewStub(make_grpc_unix_channel(directory.socket()));
+    // UDS retains local permissions; TLS bearer policy does not leak onto it.
+    assert(tls_echo(*local, {}).ok());
+    auto remote = Fixture::NewStub(tls_channel(host.tls_endpoint()->address, ca, &client_identity));
+    const auto before = admission.stats().admitted_calls;
+    for (auto tokens : {std::initializer_list<const char*>{}, {"Bearer wrong"},
+                        {"Bearer fixture-token", "Bearer fixture-token"}})
+      assert(tls_echo(*remote, tokens).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+    assert(admission.stats().admitted_calls == before);
+    assert(tls_echo(*remote, {"Bearer fixture-token"}).ok());
+    auto anonymous = Fixture::NewStub(tls_channel(host.tls_endpoint()->address, ca, nullptr));
+    assert(tls_echo(*anonymous, {"Bearer fixture-token"}).ok() == (authentication == "server_tls"));
+    auto distrustful = Fixture::NewStub(tls_channel(host.tls_endpoint()->address, other_ca, &client_identity));
+    assert(!tls_echo(*distrustful, {"Bearer fixture-token"}).ok());
+    auto wrong_name = Fixture::NewStub(tls_channel(host.tls_endpoint()->address, ca, &client_identity, "wrong.robot.invalid"));
+    assert(!tls_echo(*wrong_name, {"Bearer fixture-token"}).ok());
+    if (authentication == "mutual_tls") {
+      auto untrusted = Fixture::NewStub(tls_channel(host.tls_endpoint()->address, ca, &untrusted_client));
+      assert(!tls_echo(*untrusted, {"Bearer fixture-token"}).ok());
+    }
+    for (unsigned i = 0; i < 100; ++i) assert(tls_echo(*remote, {"Bearer fixture-token"}).ok());
+    const auto fds = directory_count("/proc/self/fd");
+    const auto started = GrpcClock::now();
+    for (unsigned i = 0; i < 1000; ++i) assert(tls_echo(*remote, {"Bearer fixture-token"}).ok());
+    const auto after = directory_count("/proc/self/fd");
+    assert(after <= fds + 1);
+    std::cout << authentication << " 1000 reused-channel calls: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(GrpcClock::now() - started).count()
+              << "ms, FD " << fds << " -> " << after << '\n';
+    grpc::Status held;
+    std::thread local_call([&] {
+      grpc::ClientContext context;
+      GrpcClientCall call(context, "tls-instance", GrpcClock::now() + 2s);
+      Packet input, output; input.set_value("hold");
+      held = call.invoke([&] { return local->Echo(&context, input, &output); });
+    });
+    service.wait_entered();
+    assert(tls_echo(*remote, {"Bearer fixture-token"}).error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
+    service.release_handler(); local_call.join(); assert(held.ok());
+    // Streaming uses the same credentials, instance fence and fixed admission.
+    grpc::ClientContext context; context.AddMetadata("authorization", "Bearer fixture-token");
+    GrpcClientCall call(context, "tls-instance", GrpcClock::now() + 2s);
+    assert(call.mark_dispatched().ok());
+    Packet input, output; input.set_value("stream");
+    auto stream = remote->Watch(&context, input);
+    assert(call.receive_initial_metadata(*stream).ok());
+    unsigned count = 0;
+    while (stream->Read(&output)) { assert(output.value() == "stream"); ++count; }
+    assert(count == 4 && call.verify(stream->Finish()).ok());
+    assert(service.stream_entries == 1);
+    assert(host.drain_until(GrpcClock::now() + 2s));
+    assert(::access(directory.socket().c_str(), F_OK) != 0);
+  }
+  // A TLS bind failure must not publish a ready UDS endpoint or retain its lease.
+  Directory directory;
+  int port = 0; const int occupied = bound_tcp_socket(port); assert(::listen(occupied, 1) == 0);
+  auto input = tls_input(directory, "busy", server_identity, ca, port, "mutual_tls", BootstrapRole::Server);
+  GrpcAdmission admission("tls-instance"); Service service(admission);
+  throws([&] { GrpcUnixServer host(UnixOptions{directory.socket()}, admission, {&service}, input); });
+  assert(::access(directory.socket().c_str(), F_OK) != 0);
+  assert(::close(occupied) == 0);
+  std::cout << "authenticated TLS/UDS shared admission, stream and bind-failure passed\n";
+}
 int main() {
+  authenticated_tls_and_local_host();
   application_error_marker();
   multi_service_server_first_reverse_streams(); explicit_unary_discovery(); client_explicit_unary_discovery();
   limits_validation();

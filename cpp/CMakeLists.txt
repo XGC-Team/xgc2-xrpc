@@ -33,7 +33,7 @@ if("http" IN_LIST _xrpc_components)
   list(APPEND _xrpc_components unix diagnostics bootstrap)
 endif()
 if("grpc" IN_LIST _xrpc_components)
-  list(APPEND _xrpc_components unix diagnostics)
+  list(APPEND _xrpc_components unix diagnostics bootstrap)
 endif()
 if("bootstrap" IN_LIST _xrpc_components)
   list(APPEND _xrpc_components unix)
@@ -129,7 +129,7 @@ endif()
 if("grpc" IN_LIST _xrpc_components)
   xgc2_xrpc_component(grpc Grpc SOVERSION 2 SOURCES src/grpc.cpp HEADERS grpc.hpp)
   target_link_libraries(xgc2_xrpc_grpc PUBLIC xgc2_xrpc_unix xgc2_xrpc_diagnostics
-    PkgConfig::XgcXrpcNativeGrpc Threads::Threads)
+    xgc2_xrpc_bootstrap PkgConfig::XgcXrpcNativeGrpc Threads::Threads)
 endif()
 if("udp" IN_LIST _xrpc_components)
   # method.hpp (the router, standard library only) and method_udp.hpp (the router on a
@@ -252,7 +252,7 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/google/rpc/status.proto
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto/google/rpc/error_details.proto
       DEPENDS tests/proto/google/rpc/status.proto tests/proto/google/rpc/error_details.proto VERBATIM)
-    xgc2_xrpc_test(grpc tests/grpc_test.cpp LINK XgcXrpc::grpc protobuf::libprotobuf
+    xgc2_xrpc_test(grpc tests/grpc_test.cpp LINK XgcXrpc::grpc protobuf::libprotobuf OpenSSL::Crypto
       SOURCES
         "${grpc_fixture_dir}/grpc_fixture.pb.cc" "${grpc_fixture_dir}/grpc_fixture.grpc.pb.cc"
         "${grpc_fixture_dir}/google/rpc/status.pb.cc" "${grpc_fixture_dir}/google/rpc/error_details.pb.cc")

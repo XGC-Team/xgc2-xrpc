@@ -3,6 +3,7 @@
 #include <grpc/impl/codegen/grpc_types.h>
 #include <grpcpp/server_posix.h>
 #include <grpcpp/resource_quota.h>
+#include <grpcpp/security/auth_metadata_processor.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <fcntl.h>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <stdexcept>
 #include <string_view>
@@ -309,6 +311,54 @@ void configure_grpc_server(grpc::ServerBuilder& builder, const GrpcLimits& limit
                              static_cast<int>(limits.idle_timeout.count()));
   builder.AddChannelArgument(GRPC_ARG_MAX_METADATA_SIZE, static_cast<int>(limits.header_bytes));
 }
+// Called by native gRPC only for calls on the TLS credentials. Credential
+// verification is bounded in-memory work; a blocking auth worker is unnecessary.
+class TlsAuthorization final : public grpc::AuthMetadataProcessor {
+public:
+  TlsAuthorization(const BootstrapInput& input, std::chrono::milliseconds budget)
+      : input_(input), budget_(budget) {}
+  bool IsBlocking() const override { return false; }
+  grpc::Status Process(const InputMetadata& metadata, grpc::AuthContext*,
+                       OutputMetadata*, OutputMetadata*) override {
+    const auto range = metadata.equal_range(grpc::string_ref("authorization"));
+    std::vector<std::string_view> values;
+    values.reserve(2);
+    for (auto i = range.first; i != range.second; ++i) {
+      if (values.size() == 1)
+        return {grpc::StatusCode::UNAUTHENTICATED, "authorization rejected"};
+      values.emplace_back(i->second.data(), i->second.size());
+    }
+    if (!input_.authorize(values, GrpcClock::now() + budget_))
+      return {grpc::StatusCode::UNAUTHENTICATED, "authorization rejected"};
+    return grpc::Status::OK;
+  }
+private:
+  const BootstrapInput& input_;
+  const std::chrono::milliseconds budget_;
+};
+std::shared_ptr<grpc::ServerCredentials> tls_credentials(
+    const BootstrapInput& input, const GrpcLimits& limits) {
+  const auto& binding = input.binding();
+  if (binding.profile() != "grpc.v1" || binding.endpoint().kind != "tls" ||
+      (binding.authentication() != "server_tls" &&
+       binding.authentication() != "mutual_tls"))
+    throw std::invalid_argument("authenticated gRPC TLS bootstrap required");
+  grpc::SslServerCredentialsOptions options(
+      binding.authentication() == "mutual_tls"
+          ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
+          : GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE);
+  input.consume_tls([&](auto cert, auto key, auto trust) {
+    options.pem_root_certs.assign(trust.data(), trust.size());
+    options.pem_key_cert_pairs.push_back(
+        {std::string(key), std::string(cert)});
+  });
+  auto credentials = grpc::SslServerCredentials(options);
+  if (!credentials)
+    throw std::invalid_argument("gRPC TLS credentials rejected");
+  credentials->SetAuthMetadataProcessor(
+      std::make_shared<TlsAuthorization>(input, limits.call_timeout));
+  return credentials;
+}
 }
 namespace detail {
 struct GrpcAdmissionState {
@@ -529,6 +579,7 @@ public:
   std::unique_ptr<UnixPathLease> lease;
   GrpcAdmission& admission;
   std::unique_ptr<grpc::Server> server;
+  std::optional<Endpoint> tls_endpoint;
   int listener = -1, wake = -1;
   std::vector<pollfd> polls;
   std::thread worker;
@@ -540,7 +591,8 @@ public:
   std::mutex wake_mutex;
   std::condition_variable cv;
   bool done = false, cleaned = false;
-  Impl(UnixOptions options, GrpcAdmission& a, const std::vector<grpc::Service*>& services)
+  Impl(UnixOptions options, GrpcAdmission& a, const std::vector<grpc::Service*>& services,
+       const BootstrapInput* tls = nullptr)
       : path(options.path), lease(std::make_unique<UnixPathLease>(std::move(options))),
         admission(a), polls(a.limits().connections + 2) {
     if (services.empty() || std::any_of(services.begin(), services.end(),
@@ -550,10 +602,20 @@ public:
     grpc::ServerBuilder builder;
     for (auto* service : services) builder.RegisterService(service);
     configure_grpc_server(builder, limits);
+    int tls_port = 0;
+    if (tls) {
+      builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
+      builder.AddListeningPort(tls->binding().endpoint().address,
+                               tls_credentials(*tls, limits), &tls_port);
+    }
     try {
       // No native pathname listener: gRPC must never unlink the leased path.
       server = builder.BuildAndStart();
       if (!server) throw std::runtime_error("native gRPC server failed to start");
+      if (tls) {
+        if (!tls_port) throw std::runtime_error("gRPC TLS endpoint did not bind");
+        tls_endpoint = tls->binding().endpoint();
+      }
       listener = lease->bind_stream(static_cast<int>(limits.connections));
       wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
       if (wake < 0) throw std::runtime_error("gRPC wake descriptor creation failed");
@@ -652,6 +714,10 @@ public:
 GrpcUnixServer::GrpcUnixServer(UnixOptions options, GrpcAdmission& admission,
                               std::vector<grpc::Service*> services)
     : impl_(std::make_unique<Impl>(std::move(options), admission, services)) {}
+GrpcUnixServer::GrpcUnixServer(UnixOptions options, GrpcAdmission& admission,
+                              std::vector<grpc::Service*> services,
+                              const BootstrapInput& tls)
+    : impl_(std::make_unique<Impl>(std::move(options), admission, services, &tls)) {}
 GrpcUnixServer::~GrpcUnixServer() = default;
 void GrpcUnixServer::request_stop() noexcept { impl_->stop(); }
 bool GrpcUnixServer::drain_until(GrpcClock::time_point deadline) { return impl_->shutdown(deadline, true); }
@@ -667,6 +733,9 @@ GrpcStats GrpcUnixServer::stats() const noexcept {
   return stats;
 }
 const std::string& GrpcUnixServer::socket_path() const noexcept { return impl_->path; }
+const Endpoint* GrpcUnixServer::tls_endpoint() const noexcept {
+  return impl_->tls_endpoint ? &*impl_->tls_endpoint : nullptr;
+}
 namespace {
 grpc::ChannelArguments grpc_channel_arguments(const GrpcLimits& limits) {
   validate(limits);

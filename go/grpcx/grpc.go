@@ -36,6 +36,16 @@ type DialOptions struct {
 	LocalTargetID string
 	DialContext   xrpc.DialContext
 	TLSConfig     *tls.Config
+	// CredentialsFor resolves transport credentials and caller metadata for one
+	// exact ServiceRef. Dial calls it once, and only for a tls endpoint, before
+	// the channel exists. Nil keeps the TLSConfig path and does not run for a
+	// Unix dial. The owner supplies credentials it already trusts; Dial does
+	// not read the environment or invent an identity. Returned credentials
+	// must report TLS. Returned metadata is copied, rejected when it uses a
+	// transport-owned key, and rejected when it repeats a key already present
+	// on Metadata. A callback error is returned as-is, with no second attempt
+	// and no fall back to TLSConfig.
+	CredentialsFor func(xrpc.ServiceRef) (credentials.TransportCredentials, metadata.MD, error)
 	// MaxMessageBytes sets both message limits when MaxRequestBytes or
 	// MaxResponseBytes is zero (default xrpc.DefaultMaxMessageBytes).
 	MaxMessageBytes  int
@@ -122,6 +132,10 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 		return nil, errors.New("xrpc: gRPC profile and local target identity required")
 	}
 	options = options.defaults()
+	resolved, err := resolveDialCredentials(ref, &options)
+	if err != nil {
+		return nil, err
+	}
 	if options.MaxInFlight <= 0 {
 		options.MaxInFlight = xrpc.DefaultMaxInFlight
 	}
@@ -155,21 +169,66 @@ func Dial(ref xrpc.ServiceRef, options DialOptions) (*grpc.ClientConn, error) {
 			return dial(ctx, "unix", ref.Endpoint.Address)
 		}))
 	case "tls":
-		config := options.TLSConfig
-		if config == nil {
-			config = &tls.Config{MinVersion: tls.VersionTLS12}
+		if resolved == nil {
+			config := options.TLSConfig
+			if config == nil {
+				config = &tls.Config{MinVersion: tls.VersionTLS12}
+			}
+			if config.InsecureSkipVerify {
+				return nil, errors.New("xrpc: authenticated gRPC cannot skip TLS verification")
+			}
+			cloned := config.Clone()
+			cloned.MinVersion = max(cloned.MinVersion, tls.VersionTLS12)
+			resolved = credentials.NewTLS(cloned)
 		}
-		if config.InsecureSkipVerify {
-			return nil, errors.New("xrpc: authenticated gRPC cannot skip TLS verification")
-		}
-		cloned := config.Clone()
-		cloned.MinVersion = max(cloned.MinVersion, tls.VersionTLS12)
-		args = append(args, grpc.WithTransportCredentials(credentials.NewTLS(cloned)))
+		args = append(args, grpc.WithTransportCredentials(resolved))
 		args = append(args, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return dial(ctx, "tcp", ref.Endpoint.Address) }))
 	default:
 		return nil, errors.New("xrpc: unsupported gRPC endpoint")
 	}
 	return grpc.NewClient(target, args...)
+}
+
+// resolveDialCredentials runs CredentialsFor once for a tls endpoint and
+// installs its metadata on options before the channel interceptors close over
+// them. A nil callback, and every non-tls endpoint, leaves the existing path.
+func resolveDialCredentials(ref xrpc.ServiceRef, options *DialOptions) (credentials.TransportCredentials, error) {
+	if ref.Endpoint.Kind != "tls" || options.CredentialsFor == nil {
+		return nil, nil
+	}
+	creds, md, err := options.CredentialsFor(ref)
+	if err != nil {
+		return nil, err
+	}
+	if creds == nil || creds.Info().SecurityProtocol != "tls" {
+		return nil, errors.New("xrpc: tls endpoint requires tls transport credentials")
+	}
+	copied := md.Copy()
+	if err := validateAuthMetadata(copied); err != nil {
+		return nil, err
+	}
+	merged, err := mergeCredentialMetadata(options.Metadata, copied)
+	if err != nil {
+		return nil, err
+	}
+	options.Metadata = merged
+	return creds, nil
+}
+
+func mergeCredentialMetadata(base, extra metadata.MD) (metadata.MD, error) {
+	if len(extra) == 0 {
+		return base, nil
+	}
+	if base == nil {
+		base = metadata.MD{}
+	}
+	for key, values := range extra {
+		if len(base.Get(key)) != 0 {
+			return nil, errors.New("xrpc: credential metadata duplicates " + key)
+		}
+		base[key] = append([]string(nil), values...)
+	}
+	return base, nil
 }
 
 // HostOptions are plain limits. A zero field selects the default named in its

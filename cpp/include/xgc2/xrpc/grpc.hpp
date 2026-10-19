@@ -1,4 +1,5 @@
 #pragma once
+#include "bootstrap.hpp"
 #include "delivery.hpp"
 #include "stop.hpp"
 #include "unix.hpp"
@@ -36,6 +37,8 @@ struct GrpcLimits {
 GrpcClock::time_point grpc_stream_deadline(const GrpcLimits&,
                                           GrpcClock::time_point caller_deadline);
 struct GrpcStats {
+  // Connection counters describe the Unix accepted-fd table only. An optional
+  // native TLS listener shares memory/thread/call limits, not that table.
   std::size_t inflight_calls = 0, active_connections = 0;
   std::uint64_t admitted_calls = 0, rejected_calls = 0,
                 accepted_connections = 0, rejected_connections = 0;
@@ -135,6 +138,16 @@ private:
 class GrpcUnixServer {
 public:
   GrpcUnixServer(UnixOptions, GrpcAdmission&, std::vector<grpc::Service*>);
+  // One native server, services and admission, with an additional authenticated
+  // TCP/TLS listener. The server-role bootstrap must use grpc.v1 and a tls
+  // endpoint; its credentials and authorization apply only to that listener.
+  // BootstrapInput must outlive this host. server_tls requires the bearer grant;
+  // mutual_tls also requires a client certificate verified by its trust grant.
+  // Native TLS connections have no accepted-fd connection-count cap: native
+  // memory/thread/stream/handshake limits and shared call admission still apply.
+  // Both listeners are stopped/drained together by this single owner.
+  GrpcUnixServer(UnixOptions, GrpcAdmission&, std::vector<grpc::Service*>,
+                 const BootstrapInput& tls);
   ~GrpcUnixServer();
   GrpcUnixServer(const GrpcUnixServer&) = delete;
   GrpcUnixServer& operator=(const GrpcUnixServer&) = delete;
@@ -148,6 +161,9 @@ public:
   bool shutdown();
   GrpcStats stats() const noexcept;
   const std::string& socket_path() const noexcept;
+  // Non-null only after the explicitly requested TLS endpoint bound. There is
+  // no separate TLS listener lifetime and no additional service incarnation.
+  const Endpoint* tls_endpoint() const noexcept;
 private:
   class Impl;
   std::unique_ptr<Impl> impl_;
