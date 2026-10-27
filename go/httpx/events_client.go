@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -59,6 +60,22 @@ func SubscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 	return subscribeEvents(ctx, client, ref, path, after, randomBelow, EventIdleTimeout)
 }
 
+// SubscribeHTTPEvents follows an ordinary product HTTP event endpoint using the
+// same framing, resume, cancellation and reconnect rules as SubscribeEvents.
+// origin must be HTTPS or HTTP on a literal loopback IP. Credentials belong in
+// client, not the URL. This does not relax the transport rules of ServiceRef.
+func SubscribeHTTPEvents(ctx context.Context, client *http.Client, origin, path, after string) (<-chan Event, error) {
+	u, err := url.Parse(origin)
+	if err != nil || u.Hostname() == "" || u.User != nil || u.ForceQuery || strings.ContainsAny(origin, "?#") || (u.Path != "" && u.Path != "/") {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: an HTTP event origin is required"))
+	}
+	loopback := net.ParseIP(u.Hostname())
+	if u.Scheme != "https" && (u.Scheme != "http" || loopback == nil || !loopback.IsLoopback()) {
+		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: HTTP event origins require HTTPS or a literal loopback HTTP address"))
+	}
+	return subscribeEventsEndpoint(ctx, client, xrpc.Endpoint{Kind: u.Scheme, Address: origin}, path, after, randomBelow, EventIdleTimeout)
+}
+
 // subscribeEvents is SubscribeEvents with an injectable jitter source and idle
 // timeout.
 func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceRef, path, after string, draw func(bound int64) int64, idle time.Duration) (<-chan Event, error) {
@@ -68,6 +85,10 @@ func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 	if ref.Profile != xrpc.HTTP {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: http.v1 reference required"))
 	}
+	return subscribeEventsEndpoint(ctx, client, ref.Endpoint, path, after, draw, idle)
+}
+
+func subscribeEventsEndpoint(ctx context.Context, client *http.Client, endpoint xrpc.Endpoint, path, after string, draw func(int64) int64, idle time.Duration) (<-chan Event, error) {
 	if err := requestPath(path); err != nil {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
 	}
@@ -78,16 +99,16 @@ func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 		return nil, xrpc.Failure(xrpc.Code(err), xrpc.NotSent, err)
 	}
 	s := &subscription{path: path, cursor: after, out: make(chan Event), draw: draw, idle: idle}
-	switch ref.Endpoint.Kind {
+	switch endpoint.Kind {
 	case "unix":
 		s.base = "http://unix"
-	case "https":
-		s.base = strings.TrimSuffix(ref.Endpoint.Address, "/")
+	case "https", "http":
+		s.base = strings.TrimSuffix(endpoint.Address, "/")
 	default:
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: event streams need a unix or https endpoint"))
 	}
 	if client == nil {
-		s.client, s.owned = defaultEventClient(ref), true
+		s.client, s.owned = defaultEventClient(endpoint), true
 	} else if client.Timeout != 0 {
 		return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: an event stream client must not set Timeout"))
 	} else {
@@ -106,16 +127,16 @@ func subscribeEvents(ctx context.Context, client *http.Client, ref xrpc.ServiceR
 
 // defaultEventClient derives a client from ref. Its timeouts bound connection
 // setup and the wait for response headers, never the stream itself.
-func defaultEventClient(ref xrpc.ServiceRef) *http.Client {
+func defaultEventClient(endpoint xrpc.Endpoint) *http.Client {
 	dialer := &net.Dialer{Timeout: xrpc.DefaultCallTimeout}
 	transport := &http.Transport{
 		Proxy: nil, DisableCompression: true, ForceAttemptHTTP2: false, IdleConnTimeout: 30 * time.Second,
 		DialContext: dialer.DialContext, TLSHandshakeTimeout: xrpc.DefaultHeaderTimeout, ResponseHeaderTimeout: xrpc.DefaultCallTimeout,
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 	}
-	if ref.Endpoint.Kind == "unix" {
+	if endpoint.Kind == "unix" {
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "unix", ref.Endpoint.Address)
+			return dialer.DialContext(ctx, "unix", endpoint.Address)
 		}
 	}
 	return &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
