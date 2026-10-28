@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-xrpc
 name: XGC2 XRPC SDKs
-version: 0.2.1-1
+version: 0.2.1-2
 kind: toolchain-apt
 summary: Bounded http.v1, grpc.v1 and udp.v1 transport SDKs. Ubuntu 18.04 (bionic) gets the udp.v1 C++ library only; focal, jammy and noble get every C++ component and the Node and TypeScript libraries.
 apt:
@@ -89,7 +89,7 @@ release:
   requires: []
   dependency_policy: {}
   apt_versions:
-    bionic: 0.2.1-1~bionic
-    focal: 0.2.1-1~focal
-    jammy: 0.2.1-1~jammy
-    noble: 0.2.1-1~noble
+    bionic: 0.2.1-2~bionic
+    focal: 0.2.1-2~focal
+    jammy: 0.2.1-2~jammy
+    noble: 0.2.1-2~noble

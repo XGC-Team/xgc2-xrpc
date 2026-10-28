@@ -1166,11 +1166,107 @@ void authenticated_tls_and_local_host() {
   auto input = tls_input(directory, "busy", server_identity, ca, port, "mutual_tls", BootstrapRole::Server);
   GrpcAdmission admission("tls-instance"); Service service(admission);
   throws([&] { GrpcUnixServer host(UnixOptions{directory.socket()}, admission, {&service}, input); });
+  std::unique_ptr<grpc::ServerCompletionQueue> failed_queue;
+  throws([&] { GrpcUnixServer host(UnixOptions{directory.socket()}, admission, {&service}, input, failed_queue); });
+  assert(!failed_queue);
   assert(::access(directory.socket().c_str(), F_OK) != 0);
   assert(::close(occupied) == 0);
   std::cout << "authenticated TLS/UDS shared admission, stream and bind-failure passed\n";
 }
-int main() {
+// A mixed synchronous/asynchronous service shares the real Unix host and
+// admission. Cancellation is delivered by the native completion queue, not by
+// a domain timer or a polling thread.
+void async_stream_cancellation_completion() {
+  Directory directory;
+  GrpcAdmission admission("async-instance");
+  using AsyncService = Fixture::WithAsyncMethod_Watch<Fixture::Service>;
+  AsyncService service;
+  std::unique_ptr<grpc::ServerCompletionQueue> queue;
+  auto host = std::make_unique<GrpcUnixServer>(UnixOptions{directory.socket()}, admission,
+                                               std::vector<grpc::Service*>{&service}, queue);
+  {
+    Directory other;
+    GrpcAdmission other_admission("other-instance");
+    Service other_service(other_admission);
+    auto *const original_queue = queue.get();
+    throws([&] { GrpcUnixServer duplicate(UnixOptions{other.socket()}, other_admission, {&other_service}, queue); });
+    assert(queue.get() == original_queue);
+  }
+  auto server_context = std::make_unique<grpc::ServerContext>();
+  Packet request;
+  auto writer = std::make_unique<grpc::ServerAsyncWriter<Packet>>(server_context.get());
+  int accepted_tag, metadata_tag, done_tag, finish_tag;
+  server_context->AsyncNotifyWhenDone(&done_tag);
+  service.RequestWatch(server_context.get(), &request, writer.get(), queue.get(), queue.get(), &accepted_tag);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool joined = false;
+  std::thread consumer([&] {
+    std::optional<GrpcCallScope> scope;
+    bool done = false, finished = false;
+    void* tag = nullptr; bool ok = false;
+    while (queue->Next(&tag, &ok)) {
+      if (tag == &accepted_tag) {
+        assert(ok);
+        scope.emplace(admission.begin(*server_context, true));
+        assert(*scope);
+        writer->SendInitialMetadata(&metadata_tag);
+      } else if (tag == &metadata_tag) {
+        assert(ok);
+      } else if (tag == &done_tag) {
+        assert(ok && server_context->IsCancelled());
+        done = true;
+        writer->Finish(grpc::Status(grpc::StatusCode::CANCELLED, "cancelled"), &finish_tag);
+      } else if (tag == &finish_tag) {
+        finished = true;
+      } else {
+        assert(false);
+      }
+      if (done && finished && scope) {
+        scope.reset();
+        std::lock_guard lock(mutex); joined = true; changed.notify_all();
+      }
+    }
+  });
+  auto client = Fixture::NewStub(make_grpc_unix_channel(directory.socket()));
+  grpc::ClientContext context;
+  GrpcClientCall call(context, "async-instance", GrpcClock::now() + 3s);
+  assert(call.mark_dispatched().ok());
+  Packet input;
+  auto stream = client->Watch(&context, input);
+  assert(call.receive_initial_metadata(*stream).ok());
+  context.TryCancel();
+  stream->Finish();
+  {
+    std::unique_lock lock(mutex);
+    assert(changed.wait_for(lock, 3s, [&] { return joined; }));
+  }
+  assert(admission.stats().inflight_calls == 0);
+  // Completed calls release their contexts while the host and queue still
+  // keep gRPC initialized, before draining the server's remaining tags.
+  writer.reset();
+  server_context.reset();
+  assert(host->shutdown_until(GrpcClock::now() + 3s));
+  // The native server and its path lease outlive all queued async tags.
+  assert(::access(directory.socket().c_str(), F_OK) == 0);
+  queue->Shutdown();
+  consumer.join();
+  assert(::access(directory.socket().c_str(), F_OK) == 0);
+  host.reset();
+  assert(::access(directory.socket().c_str(), F_OK) != 0);
+  queue.reset();
+}
+
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--async-completion") {
+    async_stream_cancellation_completion();
+    return 0;
+  }
+  if (argc == 2 && std::string(argv[1]) == "--sync-cleanup") {
+    unary_metadata_and_limits();
+    return 0;
+  }
+  async_stream_cancellation_completion();
   authenticated_tls_and_local_host();
   application_error_marker();
   multi_service_server_first_reverse_streams(); explicit_unary_discovery(); client_explicit_unary_discovery();

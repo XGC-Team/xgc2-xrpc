@@ -138,6 +138,14 @@ private:
 class GrpcUnixServer {
 public:
   GrpcUnixServer(UnixOptions, GrpcAdmission&, std::vector<grpc::Service*>);
+  // A domain using an asynchronous generated method owns and drains this
+  // completion queue. It must keep the queue consumer running until server
+  // shutdown has canceled and joined all native calls, then shut down and
+  // drain the queue before destroying it or the host. A successful shutdown
+  // stops the listeners but keeps the native server and socket lease until
+  // host destruction, after the external completion queue is drained.
+  GrpcUnixServer(UnixOptions, GrpcAdmission&, std::vector<grpc::Service*>,
+                 std::unique_ptr<grpc::ServerCompletionQueue>&);
   // One native server, services and admission, with an additional authenticated
   // TCP/TLS listener. The server-role bootstrap must use grpc.v1 and a tls
   // endpoint; its credentials and authorization apply only to that listener.
@@ -148,6 +156,9 @@ public:
   // Both listeners are stopped/drained together by this single owner.
   GrpcUnixServer(UnixOptions, GrpcAdmission&, std::vector<grpc::Service*>,
                  const BootstrapInput& tls);
+  GrpcUnixServer(UnixOptions, GrpcAdmission&, std::vector<grpc::Service*>,
+                 const BootstrapInput& tls,
+                 std::unique_ptr<grpc::ServerCompletionQueue>&);
   ~GrpcUnixServer();
   GrpcUnixServer(const GrpcUnixServer&) = delete;
   GrpcUnixServer& operator=(const GrpcUnixServer&) = delete;

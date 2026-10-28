@@ -42,6 +42,17 @@ MyService service(admission);
 xgc2::xrpc::GrpcUnixServer host(unix_options, admission, {&service});
 ```
 
+A service with generated asynchronous methods passes an empty
+`std::unique_ptr<grpc::ServerCompletionQueue>` to the corresponding host
+constructor. The domain owns one queue consumer and all call/tag lifetimes.
+Keep it consuming during `shutdown_until`/`drain_until`; once native calls
+have joined, shut down and fully drain the queue, then destroy the host.
+The async host retains the native server and Unix path lease until that last
+destruction. A timed-out shutdown is not a physical join. Constructor failure
+shuts down/drains its newly created queue and leaves the caller's pointer empty.
+The exported gRPC component links both the C++ and core gRPC libraries because
+the public asynchronous queue API uses core symbols directly.
+
 Each bound call requires exactly one valid `x-xrpc-instance-id` and
 `x-request-id`; IDs use the shared 1–128 ASCII identifier grammar. Replies echo
 both. Missing, empty or mismatched instance metadata returns

@@ -590,14 +590,17 @@ public:
   std::mutex mutex;
   std::mutex wake_mutex;
   std::condition_variable cv;
-  bool done = false, cleaned = false;
+  bool done = false, cleaned = false, async_methods = false;
   Impl(UnixOptions options, GrpcAdmission& a, const std::vector<grpc::Service*>& services,
-       const BootstrapInput* tls = nullptr)
+       const BootstrapInput* tls = nullptr,
+       std::unique_ptr<grpc::ServerCompletionQueue>* async_queue = nullptr)
       : path(options.path), lease(std::make_unique<UnixPathLease>(std::move(options))),
-        admission(a), polls(a.limits().connections + 2) {
+        admission(a), polls(a.limits().connections + 2), async_methods(async_queue != nullptr) {
     if (services.empty() || std::any_of(services.begin(), services.end(),
                                      [](auto* service) { return !service; }))
       throw std::invalid_argument("gRPC host requires services");
+    if (async_queue && *async_queue)
+      throw std::invalid_argument("gRPC async queue already exists");
     const auto& limits = admission.limits();
     grpc::ServerBuilder builder;
     for (auto* service : services) builder.RegisterService(service);
@@ -609,6 +612,10 @@ public:
                                tls_credentials(*tls, limits), &tls_port);
     }
     try {
+      if (async_queue) {
+        *async_queue = builder.AddCompletionQueue();
+        if (!*async_queue) throw std::runtime_error("gRPC async queue creation failed");
+      }
       // No native pathname listener: gRPC must never unlink the leased path.
       server = builder.BuildAndStart();
       if (!server) throw std::runtime_error("native gRPC server failed to start");
@@ -625,6 +632,12 @@ public:
     } catch (...) {
       close_fd(listener); close_fd(wake);
       if (server) { server->Shutdown(std::chrono::system_clock::now()); server->Wait(); }
+      if (async_queue && *async_queue) {
+        (*async_queue)->Shutdown();
+        void* tag = nullptr; bool ok = false;
+        while ((*async_queue)->Next(&tag, &ok)) {}
+        async_queue->reset();
+      }
       throw;
     }
   }
@@ -698,7 +711,12 @@ public:
       } }
     if (!admission.wait_until(deadline)) { stop(); return false; }
     if (!cleaned) {
-      worker.join(); server.reset(); lease.reset(); close_wake(); cleaned = true;
+      worker.join();
+      // A stopped server may still have internal async completion tags on the
+      // caller-owned queue. Keep the server and endpoint lease alive until the
+      // domain drains that queue and then destroys this host.
+      if (!async_methods) { server.reset(); lease.reset(); }
+      close_wake(); cleaned = true;
       std::lock_guard lock(admission.state_->mutex);
       admission.state_->emit(DiagnosticCode::DrainCompleted, LogSeverity::Info);
     }
@@ -716,8 +734,17 @@ GrpcUnixServer::GrpcUnixServer(UnixOptions options, GrpcAdmission& admission,
     : impl_(std::make_unique<Impl>(std::move(options), admission, services)) {}
 GrpcUnixServer::GrpcUnixServer(UnixOptions options, GrpcAdmission& admission,
                               std::vector<grpc::Service*> services,
+                              std::unique_ptr<grpc::ServerCompletionQueue>& async_queue)
+    : impl_(std::make_unique<Impl>(std::move(options), admission, services, nullptr, &async_queue)) {}
+GrpcUnixServer::GrpcUnixServer(UnixOptions options, GrpcAdmission& admission,
+                              std::vector<grpc::Service*> services,
                               const BootstrapInput& tls)
     : impl_(std::make_unique<Impl>(std::move(options), admission, services, &tls)) {}
+GrpcUnixServer::GrpcUnixServer(UnixOptions options, GrpcAdmission& admission,
+                              std::vector<grpc::Service*> services,
+                              const BootstrapInput& tls,
+                              std::unique_ptr<grpc::ServerCompletionQueue>& async_queue)
+    : impl_(std::make_unique<Impl>(std::move(options), admission, services, &tls, &async_queue)) {}
 GrpcUnixServer::~GrpcUnixServer() = default;
 void GrpcUnixServer::request_stop() noexcept { impl_->stop(); }
 bool GrpcUnixServer::drain_until(GrpcClock::time_point deadline) { return impl_->shutdown(deadline, true); }

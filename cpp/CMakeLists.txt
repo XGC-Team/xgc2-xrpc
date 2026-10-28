@@ -64,7 +64,7 @@ endif()
 if("grpc" IN_LIST _xrpc_components)
   find_package(Protobuf REQUIRED)
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(XgcXrpcNativeGrpc REQUIRED IMPORTED_TARGET grpc++>=1.16)
+  pkg_check_modules(XgcXrpcNativeGrpc REQUIRED IMPORTED_TARGET grpc++>=1.16 grpc>=1.16)
 endif()
 
 # One shared library per component: target xgc2_xrpc_<component>, alias
