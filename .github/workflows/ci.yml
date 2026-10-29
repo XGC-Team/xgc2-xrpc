@@ -13,7 +13,8 @@ concurrency:
 jobs:
   matrix:
     name: capability matrix
-    runs-on: ubuntu-latest
+    # Keep the supported Python 3.8 floor on its available runner toolchain.
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -131,7 +132,8 @@ jobs:
 
   python:
     name: python 3.8
-    runs-on: ubuntu-latest
+    # Keep the supported Python 3.8 floor on its available runner toolchain.
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
