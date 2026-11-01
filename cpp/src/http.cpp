@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <sys/eventfd.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace xgc2 {
@@ -703,6 +704,15 @@ void HttpServer::poll(std::chrono::milliseconds wait) {
   else
     for (unsigned i = 0; i < 64 && impl_->io.poll_one(); ++i) {
     }
+}
+bool HttpServer::poll_one_for(std::chrono::nanoseconds wait) {
+  impl_->io.restart();
+  return wait > std::chrono::nanoseconds::zero()
+             ? impl_->io.run_one_for(wait) != 0
+             : impl_->io.poll_one() != 0;
+}
+int HttpServer::duplicate_signal_wake_fd() const noexcept {
+  return ::fcntl(impl_->notification.native_handle(), F_DUPFD_CLOEXEC, 0);
 }
 void HttpServer::set_wakeup_handler(std::function<void()> handler) {
   impl_->wakeup_handler = std::move(handler);

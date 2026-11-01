@@ -49,6 +49,40 @@ HttpRequest request(const std::string &path) {
   r.target = path;
   return r;
 }
+void one_event_wait_observes_wakes_and_deadline() {
+  Directory dir;
+  UnixOptions options;
+  options.path = dir.path + "/wait.sock";
+  HttpServer server(options, [](HttpRequest, HttpReply) {});
+  std::atomic<unsigned> wakes{0};
+  server.set_wakeup_handler([&] { ++wakes; });
+  server.wake(); // a producer may notify just before the owner waits
+  assert(server.poll_one_for(seconds(1)));
+  assert(wakes == 1);
+  const auto timeout_start = Clock::now();
+  assert(!server.poll_one_for(milliseconds(25)));
+  assert(Clock::now() - timeout_start >= milliseconds(15));
+  std::thread producer([&] {
+    std::this_thread::sleep_for(milliseconds(30));
+    server.wake();
+  });
+  const auto began = Clock::now();
+  assert(server.poll_one_for(seconds(1)));
+  assert(Clock::now() - began < milliseconds(500));
+  producer.join();
+  assert(wakes == 2);
+  // This write models the only operation permitted in a signal handler. It
+  // must release the owner even without setting wake_requested.
+  const int signal_fd = server.duplicate_signal_wake_fd();
+  assert(signal_fd >= 0);
+  const std::uint64_t one = 1;
+  assert(::write(signal_fd, &one, sizeof(one)) == sizeof(one));
+  assert(server.poll_one_for(seconds(1)));
+  assert(wakes == 2);
+  assert(!server.poll_one_for(nanoseconds(0)));
+  ::close(signal_fd);
+}
+
 void request_validation_and_deadlines() {
   Directory dir;
   UnixOptions options;
@@ -486,6 +520,7 @@ void operator delete(void *pointer, std::size_t) noexcept {
   std::free(pointer);
 }
 int main() {
+  one_event_wait_observes_wakes_and_deadline();
   request_validation_and_deadlines();
   client_dispositions();
   graceful_shutdown(true);

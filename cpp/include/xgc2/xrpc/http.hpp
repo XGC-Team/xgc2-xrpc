@@ -98,6 +98,16 @@ public:
   void run();
   void poll(std::chrono::milliseconds maximum_wait = std::chrono::milliseconds{
                 0});
+  // Dispatch at most one ready IO completion, or return at maximum_wait.
+  // Unlike poll(), this returns as soon as one completion has run, so an
+  // embedding owner can recompute its own deadlines after a wake.
+  bool poll_one_for(std::chrono::nanoseconds maximum_wait);
+  // Duplicate the owner's eventfd for async-signal-safe stop notification.
+  // A signal handler may write one uint64_t value of 1; the owner is then
+  // released from poll_one_for. The caller owns the returned descriptor and
+  // must keep it valid until signal producers can no longer use it. Returns
+  // -1 on failure, preserving the fcntl error in errno.
+  int duplicate_signal_wake_fd() const noexcept;
   // Configure once on the owner before run. wake() coalesces notifications,
   // performs no allocation or waiting, and is safe from a realtime producer.
   // Producers must stop before destruction. The callback runs on the owner.
