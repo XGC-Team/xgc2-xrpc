@@ -257,9 +257,12 @@ type HostOptions struct {
 	// DiscoveryMethods names exact unary description methods. Only an absent
 	// instance is unbound; supplied empty or mismatched instances stay rejected.
 	DiscoveryMethods []string
-	Diagnostics      *xrpc.Diagnostics
-	Metrics          *xrpc.Metrics
-	Service          string
+	// SubscriptionMethods opt exact server streams into connection-owned
+	// cancellation after finite client establishment. Unary calls stay bounded.
+	SubscriptionMethods []string
+	Diagnostics         *xrpc.Diagnostics
+	Metrics             *xrpc.Metrics
+	Service             string
 }
 
 func (o HostOptions) defaults() HostOptions {
@@ -378,6 +381,15 @@ func ServeWithOptions(listener net.Listener, lease *unixlease.Lease, register fu
 		}
 		discovery[method] = true
 	}
+	limits.SubscriptionMethods = append([]string(nil), limits.SubscriptionMethods...)
+	subscriptions := make(map[string]bool, len(limits.SubscriptionMethods))
+	for _, method := range limits.SubscriptionMethods {
+		parts := strings.Split(method, "/")
+		if len(parts) != 3 || parts[0] != "" || parts[1] == "" || parts[2] == "" || subscriptions[method] || discovery[method] {
+			return nil, errors.New("xrpc: unique exact subscription method paths required")
+		}
+		subscriptions[method] = true
+	}
 	host := newHost(listener, lease, limits)
 	slots := make(chan struct{}, limits.MaxInFlight)
 	admit := func(ctx context.Context, method string, stream bool) (func(), error) {
@@ -387,9 +399,15 @@ func ServeWithOptions(listener net.Listener, lease *unixlease.Lease, register fu
 		if err := validateRequestMetadataFor(ctx, limits.InstanceID, discovery[method]); err != nil {
 			return nil, err
 		}
-		remaining, err := xrpc.Remaining(ctx)
-		if err != nil || stream && remaining > limits.MaxCallTime {
-			return nil, status.Error(codes.InvalidArgument, "finite native caller deadline within host maximum required")
+		if subscriptions[method] {
+			if !stream || ctx.Err() != nil {
+				return nil, status.Error(codes.InvalidArgument, "subscription requires a live server stream")
+			}
+		} else {
+			remaining, err := xrpc.Remaining(ctx)
+			if err != nil || stream && remaining > limits.MaxCallTime {
+				return nil, status.Error(codes.InvalidArgument, "finite native caller deadline within host maximum required")
+			}
 		}
 		return host.admit(ctx, slots)
 	}
@@ -414,6 +432,9 @@ func ServeWithOptions(listener net.Listener, lease *unixlease.Lease, register fu
 			return result, err
 		}),
 		grpc.StreamInterceptor(func(server any, stream grpc.ServerStream, info *grpc.StreamServerInfo, next grpc.StreamHandler) error {
+			if subscriptions[info.FullMethod] && (!info.IsServerStream || info.IsClientStream) {
+				return status.Error(codes.InvalidArgument, "subscription requires a server-only stream")
+			}
 			release, err := admit(stream.Context(), info.FullMethod, true)
 			if err != nil {
 				return err
@@ -557,8 +578,14 @@ func NewProfile(options DialOptions, files *protoregistry.Files) *Profile {
 	return &Profile{options: options, files: files, connections: refpool.New[xrpc.ServiceRef, *grpc.ClientConn](options.MaxReferences, options.ReferenceIdleTimeout, func(c *grpc.ClientConn) { _ = c.Close() })}
 }
 func (p *Profile) prepare(ctx context.Context, call xrpc.Call) (context.Context, *grpc.ClientConn, protoreflect.MethodDescriptor, *dynamicpb.Message, func(), error) {
-	if _, err := xrpc.Remaining(ctx); err != nil {
-		return ctx, nil, nil, nil, nil, xrpc.Failure(xrpc.Code(err), xrpc.NotSent, err)
+	var subscription bool
+	if ctx != nil {
+		subscription, _ = ctx.Value(subscriptionContextKey{}).(bool)
+	}
+	if !subscription {
+		if _, err := xrpc.Remaining(ctx); err != nil {
+			return ctx, nil, nil, nil, nil, xrpc.Failure(xrpc.Code(err), xrpc.NotSent, err)
+		}
 	}
 	if err := call.Service.ValidateInternal(); err != nil {
 		return ctx, nil, nil, nil, nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
@@ -664,6 +691,36 @@ func (p *Profile) Call(ctx context.Context, call xrpc.Call) (xrpc.Result, error)
 	return xrpc.Result{Payload: raw, InstanceID: instance}, err
 }
 func (p *Profile) Observe(ctx context.Context, call xrpc.Call, emit func(xrpc.Result) error) error {
+	return p.observe(ctx, call, emit, false)
+}
+
+// Subscribe bounds setup through the first accepted frame while the stream
+// lifetime follows its cancellable owner rather than the unary call budget.
+func (p *Profile) Subscribe(ctx context.Context, call xrpc.Call, emit func(xrpc.Result) error) error {
+	if ctx == nil || ctx.Done() == nil {
+		return xrpc.Failure("invalid_argument", xrpc.NotSent, errors.New("xrpc: cancellable subscription context required"))
+	}
+	return p.observe(ctx, call, emit, true)
+}
+
+func (p *Profile) observe(ctx context.Context, call xrpc.Call, emit func(xrpc.Result) error, subscription bool) error {
+	var setupTimer *time.Timer
+	var setupMu sync.Mutex
+	established := false
+	if subscription {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		setupTimer = time.AfterFunc(p.options.MaxCallTime, func() {
+			setupMu.Lock()
+			defer setupMu.Unlock()
+			if !established {
+				cancel()
+			}
+		})
+		defer setupTimer.Stop()
+		ctx = context.WithValue(ctx, subscriptionContextKey{}, true)
+	}
 	ctx, connection, method, input, release, err := p.prepare(ctx, call)
 	if err != nil {
 		return err
@@ -702,6 +759,13 @@ func (p *Profile) Observe(ctx context.Context, call xrpc.Call, emit func(xrpc.Re
 		}
 		if err = emit(xrpc.Result{Payload: raw}); err != nil {
 			return err
+		}
+		if setupTimer != nil {
+			setupMu.Lock()
+			established = true
+			setupMu.Unlock()
+			setupTimer.Stop()
+			setupTimer = nil
 		}
 	}
 }

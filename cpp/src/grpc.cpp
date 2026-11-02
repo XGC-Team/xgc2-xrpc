@@ -502,6 +502,13 @@ void GrpcAdmission::set_diagnostics(Diagnostics* diagnostics, std::string servic
 }
 GrpcCallScope GrpcAdmission::begin(grpc::ServerContext& context, bool streaming,
                                   bool discovery) {
+  return begin_impl(context, streaming, discovery, false);
+}
+GrpcCallScope GrpcAdmission::begin_subscription(grpc::ServerContext& context) {
+  return begin_impl(context, true, false, true);
+}
+GrpcCallScope GrpcAdmission::begin_impl(grpc::ServerContext& context, bool streaming,
+                                       bool discovery, bool subscription) {
   GrpcCallScope call;
   // Native metadata is already parsed by gRPC. Message/metadata transport caps
   // constrain allocation before this application admission stage.
@@ -525,16 +532,19 @@ GrpcCallScope GrpcAdmission::begin(grpc::ServerContext& context, bool streaming,
     const auto now = std::chrono::system_clock::now();
     const auto native_deadline = context.deadline();
     const auto remaining = native_deadline - now;
-    if (native_deadline == std::chrono::system_clock::time_point::max()) {
+    if (!subscription && native_deadline == std::chrono::system_clock::time_point::max()) {
       call.status_ = error(grpc::StatusCode::INVALID_ARGUMENT, "finite caller deadline required");
     } else if (remaining <= std::chrono::system_clock::duration::zero()) {
       call.status_ = error(grpc::StatusCode::DEADLINE_EXCEEDED, "caller deadline expired");
-    } else if (streaming && remaining > state_->limits.call_timeout) {
+    } else if (!subscription && streaming && remaining > state_->limits.call_timeout) {
       call.status_ = error(grpc::StatusCode::INVALID_ARGUMENT, "stream deadline exceeds host budget");
     } else {
-      call.deadline_ = GrpcClock::now() + std::min(
-          std::chrono::duration_cast<GrpcClock::duration>(remaining),
-          std::chrono::duration_cast<GrpcClock::duration>(state_->limits.call_timeout));
+      call.deadline_ = subscription && native_deadline == std::chrono::system_clock::time_point::max()
+          ? GrpcClock::time_point::max()
+          : GrpcClock::now() + (subscription
+              ? std::chrono::duration_cast<GrpcClock::duration>(remaining)
+              : std::min(std::chrono::duration_cast<GrpcClock::duration>(remaining),
+                         std::chrono::duration_cast<GrpcClock::duration>(state_->limits.call_timeout)));
       std::lock_guard lock(state_->mutex);
       if (state_->stopping) {
         call.status_ = error(grpc::StatusCode::UNAVAILABLE, "host stopping");

@@ -114,6 +114,9 @@ public:
   // use discovery. Request identity, budget and admission always apply.
   GrpcCallScope begin(grpc::ServerContext&, bool streaming = false,
                       bool discovery = false);
+  // Explicit server-streaming subscription: its finite setup is owned by the
+  // client; after admission its lifetime follows connection/cancellation.
+  GrpcCallScope begin_subscription(grpc::ServerContext&);
   template<class NativeServerStream>
   GrpcCallScope begin_stream(grpc::ServerContext& context, NativeServerStream& stream) {
     auto call = begin(context, true);
@@ -127,6 +130,8 @@ public:
   const GrpcLimits& limits() const noexcept;
   const std::string& instance_id() const noexcept;
 private:
+  GrpcCallScope begin_impl(grpc::ServerContext&, bool streaming, bool discovery,
+                           bool subscription);
   friend class GrpcUnixServer;
   std::shared_ptr<detail::GrpcAdmissionState> state_;
 };

@@ -209,6 +209,12 @@ type Observer interface {
 	Observe(context.Context, Call, func(Result) error) error
 }
 
+// Subscriber owns a cancellable server stream beyond the finite setup phase.
+// The transport bounds establishment and releases the stream on cancellation.
+type Subscriber interface {
+	Subscribe(context.Context, Call, func(Result) error) error
+}
+
 // Dispatcher is immutable local composition, not a registry or discovery API.
 // It composes one Caller per profile: httpx.Profile for http.v1,
 // grpcx.Profile for grpc.v1 and udpx.Profile for udp.v1.
@@ -227,8 +233,15 @@ func NewDispatcher(profiles map[string]Caller) (*Dispatcher, error) {
 
 // caller validates call, gives it a fresh request identity when it has none and
 // returns the Caller of its profile.
-func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, Call, error) {
-	if _, err := Remaining(ctx); err != nil {
+func (d *Dispatcher) caller(ctx context.Context, call Call, subscription bool) (Caller, Call, error) {
+	if subscription {
+		if ctx == nil || ctx.Done() == nil {
+			return nil, call, Failure("invalid_argument", NotSent, errors.New("xrpc: cancellable subscription context required"))
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, call, Failure(Code(err), NotSent, err)
+		}
+	} else if _, err := Remaining(ctx); err != nil {
 		return nil, call, Failure(Code(err), NotSent, err)
 	}
 	// A udp.v1 reference comes from configuration and may leave the instance
@@ -257,14 +270,14 @@ func (d *Dispatcher) caller(ctx context.Context, call Call) (Caller, Call, error
 	return d.profiles[call.Service.Profile], call, nil
 }
 func (d *Dispatcher) Call(ctx context.Context, call Call) (Result, error) {
-	caller, call, err := d.caller(ctx, call)
+	caller, call, err := d.caller(ctx, call, false)
 	if err != nil {
 		return Result{}, err
 	}
 	return caller.Call(ctx, call)
 }
 func (d *Dispatcher) Observe(ctx context.Context, call Call, emit func(Result) error) error {
-	caller, call, err := d.caller(ctx, call)
+	caller, call, err := d.caller(ctx, call, false)
 	if err != nil {
 		return err
 	}
@@ -273,4 +286,17 @@ func (d *Dispatcher) Observe(ctx context.Context, call Call, emit func(Result) e
 		return Failure("invalid_argument", NotSent, errors.New("xrpc: profile has no observation implementation"))
 	}
 	return observer.Observe(ctx, call, emit)
+}
+
+// Subscribe is an owner-cancelled logical stream, not a finite RPC retry loop.
+func (d *Dispatcher) Subscribe(ctx context.Context, call Call, emit func(Result) error) error {
+	caller, call, err := d.caller(ctx, call, true)
+	if err != nil {
+		return err
+	}
+	subscriber, ok := caller.(Subscriber)
+	if !ok || emit == nil {
+		return Failure("invalid_argument", NotSent, errors.New("xrpc: profile has no subscription implementation"))
+	}
+	return subscriber.Subscribe(ctx, call, emit)
 }

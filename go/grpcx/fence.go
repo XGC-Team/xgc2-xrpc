@@ -198,12 +198,21 @@ func clientUnary(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, b
 		return checkResponse(ref, outgoingRequestID(ctx), header)
 	}
 }
+
+type subscriptionContextKey struct{}
+
 func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, budget *dialBudget) grpc.StreamClientInterceptor {
 	return func(ctx context.Context, descriptor *grpc.StreamDesc, connection *grpc.ClientConn, method string, next grpc.Streamer, options ...grpc.CallOption) (grpc.ClientStream, error) {
-		if _, err := xrpc.Remaining(ctx); err != nil {
-			return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
+		subscription, _ := ctx.Value(subscriptionContextKey{}).(bool)
+		if !subscription {
+			if _, err := xrpc.Remaining(ctx); err != nil {
+				return nil, xrpc.Failure("invalid_argument", xrpc.NotSent, err)
+			}
 		}
-		ctx, budgetCancel := context.WithTimeout(ctx, limits.MaxCallTime)
+		setupCtx, budgetCancel := context.WithTimeout(ctx, limits.MaxCallTime)
+		if !subscription {
+			ctx = setupCtx
+		}
 		var err error
 		ctx, err = clientMetadata(ctx, ref, limits.Metadata)
 		if err != nil {
@@ -220,7 +229,7 @@ func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, 
 		ctx, cancel := context.WithCancel(ctx)
 		finishMetric := limits.Metrics.Admit()
 		started := time.Now()
-		releaseDial := budget.admit(ctx)
+		releaseDial := budget.admit(setupCtx)
 		var released sync.Once
 		release := func() {
 			released.Do(func() {
@@ -239,7 +248,11 @@ func clientStream(ref xrpc.ServiceRef, slots chan struct{}, limits DialOptions, 
 			finish()
 			return nil, err
 		}
-		return &fencedStream{ClientStream: stream, ref: ref, requestID: outgoingRequestID(ctx), ctx: ctx, cancel: finish}, nil
+		var ready func()
+		if subscription {
+			ready = func() { releaseDial(); budgetCancel() }
+		}
+		return &fencedStream{ClientStream: stream, ref: ref, requestID: outgoingRequestID(ctx), ctx: ctx, cancel: finish, opened: ready}, nil
 	}
 }
 func checkInstance(ref xrpc.ServiceRef, header metadata.MD) error {
@@ -276,6 +289,8 @@ type fencedStream struct {
 	requestID string
 	ctx       context.Context
 	cancel    context.CancelFunc
+	opened    func()
+	openOnce  sync.Once
 }
 
 func (s *fencedStream) Header() (metadata.MD, error) {
@@ -343,5 +358,8 @@ func (s *fencedStream) RecvMsg(value any) error {
 		s.cancel()
 		return err
 	}
-	return err
+	if s.opened != nil {
+		s.openOnce.Do(s.opened)
+	}
+	return nil
 }
