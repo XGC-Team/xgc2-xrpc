@@ -1,0 +1,77 @@
+name: release
+
+# Manual build entry for the central release train. The build and all quality
+# cells stay in ci.yml; this workflow only validates the locked identity and
+# calls the same reusable CI path. It never publishes APT indexes or packages.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: Expected .xgc2/product.yml version
+        required: true
+        type: string
+      expected_source_sha:
+        description: Expected source commit SHA
+        required: true
+        type: string
+      prepare_action:
+        description: Release-train action
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - compatibility-verify
+      apt_overlay_url:
+        description: Optional release-scoped staging APT base URL
+        required: false
+        default: ""
+        type: string
+      dependency_set_digest:
+        description: SHA256 of the resolved release-train dependency set
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  XGC2_APT_OVERLAY_URL: ${{ inputs.apt_overlay_url }}
+  XGC2_DEPENDENCY_SET_DIGEST: ${{ inputs.dependency_set_digest }}
+
+jobs:
+  identity:
+    name: Validate release identity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate central locked preparation identity
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          PREPARE_ACTION: ${{ inputs.prepare_action }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(awk '/^version:/ {print $2; exit}' .xgc2/product.yml)" = "$EXPECTED_VERSION"
+          case "$PREPARE_ACTION" in
+            release|compatibility-verify) ;;
+            *) echo "unsupported prepare_action: $PREPARE_ACTION" >&2; exit 1 ;;
+          esac
+          test -z "$XGC2_DEPENDENCY_SET_DIGEST" || [[ "$XGC2_DEPENDENCY_SET_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          test -z "$XGC2_APT_OVERLAY_URL" || [[ "$XGC2_DEPENDENCY_SET_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+
+  build:
+    name: Build through the shared CI path
+    needs: identity
+    uses: ./.github/workflows/ci.yml
+    with:
+      # compatibility-verify still builds every cell; it only omits the
+      # trusted artifact upload. The release action reuses the same CI.
+      upload: ${{ inputs.prepare_action == 'release' && 'true' || 'false' }}

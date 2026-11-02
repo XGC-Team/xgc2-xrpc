@@ -4,6 +4,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
+    inputs:
+      upload:
+        description: "'false' builds and checks every cell without uploading trusted artifacts (compatibility verification)"
+        type: string
+        default: "true"
 permissions:
   contents: read
   packages: read
@@ -205,6 +211,7 @@ jobs:
       - name: Build and install-check the packages
         run: .xgc2/scripts/in-image.sh "$(.xgc2/scripts/images.sh ${{ matrix.suite }})" bash .xgc2/scripts/build-ci.sh ${{ matrix.suite }}
       - uses: actions/upload-artifact@v4
+        if: ${{ inputs.upload != 'false' }}
         with:
           name: xgc2-xrpc-debs-${{ matrix.suite }}-${{ matrix.arch }}
           path: .ci/artifacts/
