@@ -176,12 +176,28 @@ def build_python_deb(args, wheel, work, out, version):
         "Depends: python3 (>= " + python_version + "), python3 (<< " + next_python + ")\nDescription: XGC2 Python XRPC runtime\n"
         " Private Python SDK and offline dependency closure using the system interpreter.\n")
     deb = out / (name + "_" + version + "_" + args.architecture + ".deb")
-    run(["dpkg-deb", "--root-owner-group", "--build", root, deb])
     installed = json.loads(report.read_text())["install"]
     dependencies = [{"name": item["metadata"]["name"], "version": item["metadata"]["version"],
                      "sha256": item["download_info"]["archive_info"]["hashes"]["sha256"]} for item in installed]
+    # The SDK's one build image already owns this hash lock; do not duplicate it
+    # or install unrelated lock entries into the consumer's private environment.
+    lock = args.wheel_lock.read_text()
+    locked = {}
+    for block in re.split(r"(?m)^(?=[A-Za-z0-9][A-Za-z0-9_.-]*==)", lock):
+        match = re.match(r"([A-Za-z0-9_.-]+)==([^\s\\]+)", block)
+        if match:
+            key = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+            locked[key] = (match.group(2), set(re.findall(r"--hash=sha256:([0-9a-f]{64})", block)))
+    for item in dependencies:
+        key = re.sub(r"[-_.]+", "-", item["name"]).lower()
+        if key == "xgc2-xrpc":
+            if item["sha256"] != digest(wheel):
+                raise ValueError("installed Python SDK differs from its wheel")
+        elif key not in locked or item["version"] != locked[key][0] or item["sha256"] not in locked[key][1]:
+            raise ValueError("Python dependency does not match the build image lock: " + key)
+    run(["dpkg-deb", "--root-owner-group", "--build", root, deb])
     return {"kind": "python-deb", "path": deb.name, "package": name,
-            "wheel_sha256": digest(wheel), "dependencies": dependencies}
+            "wheel_sha256": digest(wheel), "dependency_lock_sha256": digest(args.wheel_lock), "dependencies": dependencies}
 
 
 def main():
@@ -195,6 +211,7 @@ def main():
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--wheelhouse", type=Path, default=Path(os.environ.get("XGC2_WHEELHOUSE", "/opt/xgc2/python-xrpc-wheels")))
+    parser.add_argument("--wheel-lock", type=Path, default=Path(os.environ.get("XGC2_WHEEL_LOCK", "/opt/xgc2/python-xrpc.lock")))
     parser.add_argument("--cmake-prefix", action="append", default=[])
     parser.add_argument("--shlibdeps-package-root", action="append", default=[], help="preprovisioned dependency data + DEBIAN metadata (local isolated validation)")
     parser.add_argument("--shlibdeps-library-path", action="append", default=[])
