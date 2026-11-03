@@ -32,6 +32,7 @@ consumers pin a published source revision through the native Go module version.
 | `libxgc2-xrpc-grpc2` | the optional gRPC shared library, SONAME 2; generated Debian runtime dependencies |
 | `libxgc2-xrpc-grpc-dev` | the gRPC header and CMake component; exact-version dependency on `libxgc2-xrpc-dev` and `libxgc2-xrpc-grpc2`, and the native gRPC and protobuf development packages |
 | Python wheel | an explicitly selected Python >=3.8 virtual environment; offline native dependency wheels, no extras |
+| `python3-xgc2-xrpc` | the same Python wheel and its offline wheelhouse dependency closure in `/usr/lib/xgc2/xrpc/python`; its private environment uses the suite's system Python, with no interpreter download or install-time pip |
 | Go source archive | standalone module `github.com/XGC-Team/xgc2-xrpc/go` with the `httpx`, `grpcx`, `udpx` and `unix` packages |
 | Rust crate | standalone Cargo package with the `http.v1` host and client and the C ABI |
 | Node npm tarball | `@xgc2/xrpc` with the declared `ws` dependency |
@@ -74,6 +75,15 @@ against installed archives only (the Go consumer starts a `udp.v1` server and ca
 downloads missing dependencies or installs toolchains. The TypeScript client is installed from
 its tarball and exercised against a local HTTP server: a call, an error answer and a resumed
 event stream.
+
+The Python Debian package is built offline from that wheel and the pinned build image's
+preprovisioned wheelhouse. It contains the complete native dependency closure for the build
+suite and architecture, records the selected wheel hashes, and is installed by dpkg into a
+private virtual environment whose interpreter is a symlink to the system Python. It retains
+system site packages so ROS consumers can use their existing dependencies. Its extracted
+package is checked independently with a real Unix-socket round trip; a target-image install
+must also exercise the private environment with ROS and prove that the system Python's module
+resolution is unchanged.
 
 The two Node Debs contain the npm-installed SDK, not a language source tree. Their identity
 receipts are `/usr/share/xgc2/xrpc/node/install-identity.json` and

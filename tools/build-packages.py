@@ -143,6 +143,47 @@ def pack_npm(directory, out, name, sdk_version):
     return metadata["filename"]
 
 
+def build_python_deb(args, wheel, work, out, version):
+    """Package the wheel and offline dependencies in a system-Python virtual environment."""
+    name = "python3-xgc2-xrpc"
+    root = work / "deb-roots" / name
+    (root / "DEBIAN").mkdir(parents=True)
+    python_version = run([args.python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], capture=True)
+    private = root / "usr/lib/xgc2/xrpc/python"
+    run([args.python, "-m", "venv", "--system-site-packages", "--without-pip", "--symlinks", private])
+    site = private / "lib" / ("python" + python_version) / "site-packages"
+    # Shell activation embeds the build path and is not a consumer interface.
+    for path in (private / "bin").iterdir():
+        if path.name != "python3":
+            path.unlink()
+    (private / "lib64").unlink(missing_ok=True)
+    # Python >=3.11 can include the build command and path in this file.
+    (private / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = true\nversion = " + python_version + "\n")
+    report = work / "python-deb-install.json"
+    run([args.python, "-m", "pip", "install", "--no-index", "--only-binary=:all:",
+         "--ignore-installed", "--no-compile", "--find-links", args.wheelhouse,
+         "--target", site, "--report", report, wheel],
+        env={"PYTHONPATH": "", "PYTHONNOUSERSITE": "1", "PIP_CONFIG_FILE": "/dev/null"})
+    # The wheel is a build input, not a runtime source-location dependency.
+    for path in site.glob("*.dist-info/direct_url.json"):
+        path.unlink()
+    shutil.rmtree(site / "bin", ignore_errors=True)
+    next_python = python_version.split(".")
+    next_python = next_python[0] + "." + str(int(next_python[1]) + 1)
+    (root / "DEBIAN/control").write_text(
+        "Package: " + name + "\nVersion: " + version + "\nArchitecture: " + args.architecture +
+        "\nSection: python\nPriority: optional\nMaintainer: XGC Team <apt@example.com>\n"
+        "Depends: python3 (>= " + python_version + "), python3 (<< " + next_python + ")\nDescription: XGC2 Python XRPC runtime\n"
+        " Private Python SDK and offline dependency closure using the system interpreter.\n")
+    deb = out / (name + "_" + version + "_" + args.architecture + ".deb")
+    run(["dpkg-deb", "--root-owner-group", "--build", root, deb])
+    installed = json.loads(report.read_text())["install"]
+    dependencies = [{"name": item["metadata"]["name"], "version": item["metadata"]["version"],
+                     "sha256": item["download_info"]["archive_info"]["hashes"]["sha256"]} for item in installed]
+    return {"kind": "python-deb", "path": deb.name, "package": name,
+            "wheel_sha256": digest(wheel), "dependencies": dependencies}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="new directory outside the source checkout")
@@ -153,6 +194,7 @@ def main():
     parser.add_argument("--cpp-components", help="comma-separated C++ components (default: every component of the distribution)")
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--wheelhouse", type=Path, default=Path(os.environ.get("XGC2_WHEELHOUSE", "/opt/xgc2/python-xrpc-wheels")))
     parser.add_argument("--cmake-prefix", action="append", default=[])
     parser.add_argument("--shlibdeps-package-root", action="append", default=[], help="preprovisioned dependency data + DEBIAN metadata (local isolated validation)")
     parser.add_argument("--shlibdeps-library-path", action="append", default=[])
@@ -261,6 +303,7 @@ def main():
             raise ValueError("expected one exact-version Python wheel")
         shutil.copy2(found[0], out / found[0].name)
         evidence["artifacts"].append({"kind": "python", "path": found[0].name})
+        evidence["artifacts"].append(build_python_deb(args, found[0], work, out, version))
     if "go" in languages:
         name = "xgc2-xrpc-go-" + sdk_version + ".tar.gz"
         tar_source(source / "go", out / name, "go", args.source_date_epoch)

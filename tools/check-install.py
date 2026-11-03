@@ -15,7 +15,7 @@ from support import ABI, ROOT, cpp_package_set, digest, elf_info, extract_tar, r
 from node_deb import NODE, SDKS, TS, WS_VERSION, locked_ws_archive, npm_payload, regular_hashes, verify_installed
 
 KIND_LANGUAGE = {"deb": "cpp", "python": "python", "go": "go", "rust": "rust", "node": "node",
-                 "node-deb": "node", "ts": "ts", "ts-deb": "ts"}
+                 "python-deb": "python", "node-deb": "node", "ts": "ts", "ts-deb": "ts"}
 
 
 def expected_failure(args, cwd=None, env=None):
@@ -51,6 +51,12 @@ def validate_artifacts(directory, evidence):
             expected |= {package["runtime"], package["dev"]}
     if set(debs) != expected or len(debs) != len(expected):
         raise ValueError("unexpected or duplicate Debian package set")
+    python_debs = [item for item in evidence["artifacts"] if item["kind"] == "python-deb"]
+    if len(python_debs) != (1 if "python" in kinds else 0):
+        raise ValueError("expected the Python Debian SDK alongside its wheel")
+    if python_debs and (python_debs[0]["package"] != "python3-xgc2-xrpc" or
+                        python_debs[0]["wheel_sha256"] != next(item["sha256"] for item in evidence["artifacts"] if item["kind"] == "python")):
+        raise ValueError("Python Debian SDK is not bound to this wheel")
     for sdk in SDKS.values():
         sdk_debs = [item for item in evidence["artifacts"] if item["kind"] == sdk.language + "-deb"]
         if len(sdk_debs) != (1 if sdk.language in kinds else 0) or any(item["package"] != sdk.deb for item in sdk_debs):
@@ -81,6 +87,8 @@ def validate_deb_paths(file):
                     raise ValueError("unsafe/duplicate Debian member: " + member.name)
                 seen.add(name)
                 if member.issym():
+                    if name == "usr/lib/xgc2/xrpc/python/bin/python3" and member.linkname == "/usr/bin/python3":
+                        continue
                     # Only flat, relative linker/SONAME links are permitted. Directory links are never copied.
                     if not re.fullmatch(r"usr/lib/[^/]+/libxgc2_xrpc_[a-z_]+\.so(?:\.[0-9]+)?", name):
                         raise ValueError("unsupported Debian symlink: " + name)
@@ -214,6 +222,43 @@ def check_cpp(args, directory, evidence, work, checks, sdk_version):
         finally:
             hidden.rename(library)
         checks.append({"negative": "missing native runtime of " + component_of(library), "result": "rejected"})
+
+
+def check_python_deb(args, file, item, work, checks, sdk_version):
+    validate_deb_paths(file)
+    name = run(["dpkg-deb", "-f", file, "Package"], capture=True)
+    arch = run(["dpkg-deb", "-f", file, "Architecture"], capture=True)
+    if name != "python3-xgc2-xrpc" or arch != args.architecture:
+        raise ValueError("incorrect Python Debian package identity")
+    root = work / "python-deb-root"
+    root.mkdir()
+    run(["dpkg-deb", "-x", file, root])
+    version = run([args.python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], capture=True)
+    private = root / "usr/lib/xgc2/xrpc/python"
+    site = private / "lib" / ("python" + version) / "site-packages"
+    if any(private not in path.parents for path in root.rglob("*") if path.is_file() or path.is_symlink()):
+        raise ValueError("Python Debian package modifies paths outside its private environment")
+    probe = '''import importlib.metadata as m, os, pathlib, sys, tempfile
+site = pathlib.Path(sys.argv[1]).resolve()
+assert os.path.realpath(sys.executable) == os.path.realpath('/usr/bin/python3')
+import xgc2_xrpc, aiohttp, httpx, httpcore
+from xgc2_xrpc import Endpoint, Fault, Host, Runtime, ServiceRef, Client
+for module in (xgc2_xrpc, aiohttp, httpx, httpcore):
+    pathlib.Path(module.__file__).resolve().relative_to(site)
+assert m.version('xgc2-xrpc') == sys.argv[2]
+assert m.version('aiohttp') == '3.10.11' and m.version('httpx') == '0.28.1' and m.version('httpcore') == '1.0.9'
+with tempfile.TemporaryDirectory() as directory:
+    path = os.path.join(directory, 'rpc.sock')
+    runtime = Runtime(blocking_workers=2, max_connections=8, max_calls=8)
+    try:
+        with Host(path, {('POST', '/echo'): lambda context, request: request}, runtime=runtime) as host, Client(path, runtime=runtime) as client:
+            assert client.json('/echo', {'n': 1}) == {'n': 1}
+    finally:
+        runtime.close()
+'''
+    run([private / "bin/python3", "-I", "-c", probe, site, sdk_version], cwd=work,
+        env={"PYTHONPATH": "", "PYTHONNOUSERSITE": "1"})
+    checks.append({"language": "python", "format": "deb", "wheelSha256": item["wheel_sha256"], "udsRoundTrip": True})
 
 
 def check_python(args, file, work, checks, sdk_version):
@@ -495,6 +540,8 @@ def main():
         file = directory / item["path"]
         if kind == "python":
             check_python(args, file, work, checks, sdk_version)
+        elif kind == "python-deb":
+            check_python_deb(args, file, item, work, checks, sdk_version)
         elif kind == "go":
             check_go(file, work, checks, sdk_version)
         elif kind == "rust":

@@ -85,6 +85,14 @@ def main():
     for language in ("node", "ts"):
         if language in package["languages"]:
             require_npm_installation(package, install, language)
+    if "python" in package["languages"]:
+        wheel = next(item for item in package["artifacts"] if item["kind"] == "python")
+        python_deb = next(item for item in package["artifacts"] if item["kind"] == "python-deb")
+        if python_deb["wheel_sha256"] != wheel["sha256"] or not any(
+                check.get("language") == "python" and check.get("format") == "deb" and
+                check.get("wheelSha256") == wheel["sha256"] and check.get("udsRoundTrip") is True
+                for check in install["checks"]):
+            raise ValueError("Python Debian SDK lacks its wheel-bound installed consumer")
     if run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture=True) != sha or run(["git", "status", "--porcelain"], cwd=ROOT, capture=True):
         raise ValueError("source changed after build/install checks")
     if any(digest(ROOT / name) != value for name, value in package["source_files"].items()):
@@ -94,18 +102,20 @@ def main():
         for item in cpp_package_set(package["cpp_components"]):
             canonical |= {item["runtime"], item["dev"]}
     canonical |= {SDKS[language].deb for language in ("node", "ts") if language in package["languages"]}
+    if "python" in package["languages"]:
+        canonical.add("python3-xgc2-xrpc")
     node_debs = {SDKS[language].deb: language + "-deb" for language in SDKS}
     debs = []
     for artifact in package["artifacts"]:
         file = args.artifacts / artifact["path"]
         if Path(artifact["path"]).name != artifact["path"] or digest(file) != artifact["sha256"]:
             raise ValueError("artifact bytes changed after installation checks")
-        if artifact["kind"] not in ("deb", "node-deb", "ts-deb"):
+        if artifact["kind"] not in ("deb", "node-deb", "ts-deb", "python-deb"):
             continue
         name, version, arch = [run(["dpkg-deb", "-f", file, field], capture=True)
                                for field in ("Package", "Version", "Architecture")]
         expected_arch = "all" if name in node_debs else package["architecture"]
-        expected_kind = node_debs.get(name, "deb")
+        expected_kind = "python-deb" if name == "python3-xgc2-xrpc" else node_debs.get(name, "deb")
         if version != package["version"] + "~" + package["distribution"] or arch != expected_arch or artifact["kind"] != expected_kind:
             raise ValueError("Debian release identity mismatch")
         debs.append({"file": file.name, "package": name, "version": version, "architecture": arch,
