@@ -228,15 +228,22 @@ func (l *Lease) ValidateListener(listener net.Listener) error {
 }
 
 func (l *Lease) recordBound() error {
-	st, err := l.stat()
+	fd, err := sys.Openat(l.parent, l.name, sys.O_PATH|sys.O_NOFOLLOW|sys.O_CLOEXEC, 0)
 	if err != nil {
+		return err
+	}
+	defer sys.Close(fd)
+	var st sys.Stat_t
+	if err = sys.Fstat(fd, &st); err != nil {
 		return err
 	}
 	if st.Mode&sys.S_IFMT != sys.S_IFSOCK || st.Uid != uint32(os.Geteuid()) {
 		return errors.New("xrpc: binder did not create an owned socket")
 	}
-	l.bound = st
-	return sys.Fchmodat(l.parent, l.name, uint32(l.mode), sys.AT_SYMLINK_NOFOLLOW)
+	l.bound = &st
+	// O_PATH pins the checked inode; chmod through procfs cannot follow a
+	// replacement endpoint and does not require the newer fchmodat2 syscall.
+	return sys.Chmod(fmt.Sprintf("/proc/self/fd/%d", fd), uint32(l.mode))
 }
 func (l *Lease) RecordBound() error {
 	l.mu.Lock()
